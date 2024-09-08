@@ -1,0 +1,5 @@
+# Don't include the build/ directories in the Docker context. They're mounted into
+# the container at runtime, and they can grow to be huge which will slow down
+# container startup.
+
+build/
