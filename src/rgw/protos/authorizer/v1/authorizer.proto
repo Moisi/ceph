@@ -282,6 +282,8 @@ message AuthorizeV2Question
     // This can either be added unilaterally by the client, or specifically
     // requested by the Authorizer in the AuthorizeResponse.
     optional ExtraData extra_data = 13;
+    // The id of the role that is being authorized, the service in represented here
+    optional string role_arn = 14; // SERVICE CALLING ASSUMEROLE
 }
 
 message AuthorizeV2Request
