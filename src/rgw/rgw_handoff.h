@@ -417,6 +417,7 @@ private:
     std::string user_arn_;
     std::optional<std::string> assuming_user_arn_;
     std::string account_arn_;
+    std::optional<std::string> role_arn_;
   }; // struct AuthenticatorParameters
 
   mutable AuthenticatorParameters authenticator_params_;
@@ -593,16 +594,19 @@ public:
    * @param user_arn Corresponding field in AuthenticateResponse.
    * @param assuming_user_arn Corresponding field in AuthenticateResponse.
    * @param account_arn Corresponding field in AuthenticateResponse.
+   * @param role_arn Corresponding field in AuthenticateResponse.
    */
   void set_authenticator_id_fields(const std::string& canonical_user_id,
       const std::string& user_arn,
       const std::optional<std::string>& assuming_user_arn,
-      const std::string& account_arn) const noexcept
+      const std::string& account_arn,
+      const std::optional<std::string>& role_arn) const noexcept
   {
     authenticator_params_.canonical_user_id_ = canonical_user_id;
     authenticator_params_.user_arn_ = user_arn;
     authenticator_params_.assuming_user_arn_ = assuming_user_arn;
     authenticator_params_.account_arn_ = account_arn;
+    authenticator_params_.role_arn_ = role_arn;
   }
 
   /**
@@ -634,6 +638,16 @@ public:
    * @return std::optional<std::string> The assuming user ARN.
    */
   std::optional<std::string> assuming_user_arn() const noexcept { return authenticator_params_.assuming_user_arn_; }
+
+  /**
+   * @brief Return the role ARN.
+   *
+   * This is another Authenticator AuthenticateRESTResponse field that we reflect
+   * back to the Authorizer.
+   *
+   * @return std::optional<std::string> The role ARN.
+   */
+  std::optional<std::string> role_arn() const noexcept { return authenticator_params_.role_arn_; }
 
   /**
    * @brief Return the account ARN.
