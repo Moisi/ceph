@@ -256,7 +256,7 @@ HandoffAuthResult AuthServiceClient::Auth(const AuthenticateRESTRequest& req, co
       //
       authz_state->set_authenticator_id_fields(
           resp.canonical_user_id(), resp.user_arn(),
-          resp.assuming_user_arn(), resp.account_arn());
+          resp.assuming_user_arn(), resp.account_arn(), resp.role_arn());
     }
     return HandoffAuthResult(resp.canonical_user_id(), status.error_message());
   }
@@ -950,15 +950,21 @@ HandoffAuthResult HandoffHelperImpl::_grpc_auth(
     std::string authz_info;
     if (s->handoff_authz.get()) {
       std::string aua;
+      std::string role_arn;
+      if (s->handoff_authz->role_arn()) {
+        role_arn = s->handoff_authz->role_arn().value();
+      } else {
+        role_arn = "None";
+      }
       if (s->handoff_authz->assuming_user_arn()) {
         aua = s->handoff_authz->assuming_user_arn().value();
       } else {
         aua = "None";
       }
       authz_info = fmt::format(FMT_STRING(" authz (canonical_user_id={}, user_arn={}, "
-                                          "assuming_user_arn={}, account_arn={})"),
-          s->handoff_authz->canonical_user_id(), s->handoff_authz->user_arn(),
-          aua, s->handoff_authz->account_arn());
+                                          "assuming_user_arn={}, account_arn={}, role_arn={})"),
+                               s->handoff_authz->canonical_user_id(), s->handoff_authz->user_arn(),
+                               aua, s->handoff_authz->account_arn(), role_arn);
     }
     ldpp_dout(dpp, 0) << fmt::format(FMT_STRING("success (access_key_id='{}', uid='{}'){}"),
         access_key_id, result.userid(), authz_info)
@@ -1475,6 +1481,9 @@ std::optional<::authorizer::v1::AuthorizeV2Request> PopulateAuthorizeRequest(con
     question->set_user_arn(state->user_arn());
     if (state->assuming_user_arn()) {
       question->set_assuming_user_arn(state->assuming_user_arn().value());
+    }
+    if (state->role_arn()) {
+      question->set_role_arn(state->role_arn().value());
     }
     question->set_account_arn(state->account_arn());
     question->set_bucket_name(state->bucket_name());

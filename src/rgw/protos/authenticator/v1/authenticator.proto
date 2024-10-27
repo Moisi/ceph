@@ -154,6 +154,8 @@ message AuthenticateRESTResponse {
   optional string assuming_user_arn = 4;
   // The ARN of the account of the user to authenticate as.
   string account_arn = 5;
+  // When STS is used, this field consists of the ARN of role. role ARN is asociated with auth-z.
+  optional string role_arn = 6;
 }
 
 // Request message for authenticating Presigned URL S3 requests.
@@ -199,6 +201,8 @@ message AuthenticatePresignedURLResponse {
   optional string assuming_user_arn = 4;
   // The ARN of the account of the user to authenticate as.
   string account_arn = 5;
+  // When STS is used, this field consists of the ARN of role. role ARN is asociated with auth-z.
+  optional string role_arn = 6;
 }
 
 message GetSigningKeyRequest {
