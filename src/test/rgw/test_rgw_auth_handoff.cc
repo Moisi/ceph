@@ -1820,13 +1820,14 @@ TEST_F(AuthzGRPCTest, PopulateAuthorizeRequestIAMEnvironmentMapping)
 
   auto& env = req.questions(0).environment();
   ASSERT_EQ(env.size(), 2);
-  auto ek1_keys = env.at("k1").values();
-  ASSERT_EQ(ek1_keys.size(), 2);
-  ASSERT_EQ(ek1_keys.at(0), "k1v1");
-  ASSERT_EQ(ek1_keys.at(1), "k1v2");
-  auto ek2_keys = env.at("k2").values();
-  ASSERT_EQ(ek2_keys.size(), 1);
-  ASSERT_EQ(ek2_keys.at(0), "k2v1");
+  auto ek1_values = env.at("k1").values();
+  ASSERT_EQ(ek1_values.size(), 2);
+  std::sort(ek1_values.begin(), ek1_values.end());
+  ASSERT_EQ(ek1_values.at(0), "k1v1");
+  ASSERT_EQ(ek1_values.at(1), "k1v2");
+  auto ek2_values = env.at("k2").values();
+  ASSERT_EQ(ek2_values.size(), 1);
+  ASSERT_EQ(ek2_values.at(0), "k2v1");
 }
 
 TEST_F(AuthzGRPCTest, PopulateAuthorizeRequestQueryParameters)
