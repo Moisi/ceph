@@ -743,6 +743,22 @@ int rgw_build_object_policies(const DoutPrefixProvider *dpp, rgw::sal::Driver* d
     }
     if (s->handoff_authz->enabled()) {
       ldpp_dout(dpp, 20) << "handoff authz: rgw_build_object_policies(): Skip read_obj_policy()" << dendl;
+
+      {
+        // HANDOFF: simply skipping would lose object doesn't info. This is crucial for permission evalution.
+        // as object permissions are undefined for a missing object.
+        std::unique_ptr<rgw::sal::Object::ReadOp> read_op = s->object->get_read_op();
+        bufferlist bl;
+        ret = read_op->get_attr(dpp, "X-NOT-AN-ATTR", bl, y);
+        if (ret == -ENOENT) {
+          ret = s->handoff_helper->verify_permission(this, s, rgw::IAM::s3ListBucket, y);
+          if (ret == -EACCES) {
+            return -EACCES;
+          } else {
+            return -ENOENT;
+          }
+        }
+      }
     } else {
       ret = read_obj_policy(dpp, driver, s, s->bucket->get_info(), s->bucket_attrs,
           s->object_acl.get(), nullptr, s->iam_policy, s->bucket.get(),
