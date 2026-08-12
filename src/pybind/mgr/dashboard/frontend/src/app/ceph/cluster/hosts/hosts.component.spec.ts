@@ -1,3 +1,4 @@
+import { HttpHeaders } from '@angular/common/http';
 import { HttpClientTestingModule } from '@angular/common/http/testing';
 import { ComponentFixture, TestBed } from '@angular/core/testing';
 import { BrowserAnimationsModule } from '@angular/platform-browser/animations';
@@ -45,6 +46,7 @@ describe('HostsComponent', () => {
   let hostListSpy: jasmine.Spy;
   let orchService: OrchestratorService;
   let showForceMaintenanceModal: MockShowForceMaintenanceModal;
+  let headers: HttpHeaders;
 
   const fakeAuthStorageService = {
     getPermissions: () => {
@@ -75,6 +77,7 @@ describe('HostsComponent', () => {
     component = fixture.componentInstance;
     hostListSpy = spyOn(TestBed.inject(HostService), 'list');
     orchService = TestBed.inject(OrchestratorService);
+    headers = new HttpHeaders().set('x-total-count', '10');
   });
 
   it('should create', () => {
@@ -100,11 +103,13 @@ describe('HostsComponent', () => {
           }
         ],
         hostname: hostname,
-        labels: ['foo', 'bar']
+        labels: ['foo', 'bar'],
+        headers: headers
       }
     ];
 
     OrchestratorHelper.mockStatus(false);
+    fixture.detectChanges();
     hostListSpy.and.callFake(() => of(payload));
     fixture.detectChanges();
 
@@ -112,62 +117,12 @@ describe('HostsComponent', () => {
     fixture.detectChanges();
 
     const spans = fixture.debugElement.nativeElement.querySelectorAll(
-      '.datatable-body-cell-label span'
+      'table > tbody > tr > td > span'
     );
-    expect(spans[0].textContent).toBe(hostname);
+    expect(spans[0].textContent.trim()).toBe(hostname);
   });
 
-  it('should show the exact count of the repeating daemons', () => {
-    const hostname = 'ceph.dev';
-    const payload = [
-      {
-        services: [
-          {
-            type: 'mgr',
-            id: 'x'
-          },
-          {
-            type: 'mgr',
-            id: 'y'
-          },
-          {
-            type: 'osd',
-            id: '0'
-          },
-          {
-            type: 'osd',
-            id: '1'
-          },
-          {
-            type: 'osd',
-            id: '2'
-          },
-          {
-            type: 'rgw',
-            id: 'rgw'
-          }
-        ],
-        hostname: hostname,
-        labels: ['foo', 'bar']
-      }
-    ];
-
-    OrchestratorHelper.mockStatus(false);
-    hostListSpy.and.callFake(() => of(payload));
-    fixture.detectChanges();
-
-    component.getHosts(new CdTableFetchDataContext(() => undefined));
-    fixture.detectChanges();
-
-    const spans = fixture.debugElement.nativeElement.querySelectorAll(
-      '.datatable-body-cell-label span span.badge.badge-background-primary'
-    );
-    expect(spans[0].textContent).toContain('mgr: 2');
-    expect(spans[1].textContent).toContain('osd: 3');
-    expect(spans[2].textContent).toContain('rgw: 1');
-  });
-
-  it('should test if host facts are tranformed correctly if orch available', () => {
+  it('should test if host facts are transformed correctly if orch available', () => {
     const features = [OrchestratorFeature.HOST_FACTS];
     const payload = [
       {
@@ -185,10 +140,12 @@ describe('HostsComponent', () => {
         hdd_capacity_bytes: 1024,
         flash_count: 4,
         flash_capacity_bytes: 1024,
-        nic_count: 1
+        nic_count: 1,
+        headers: headers
       }
     ];
     OrchestratorHelper.mockStatus(true, features);
+    fixture.detectChanges();
     hostListSpy.and.callFake(() => of(payload));
     fixture.detectChanges();
 
@@ -212,23 +169,23 @@ describe('HostsComponent', () => {
             type: 'osd',
             id: '0'
           }
-        ]
+        ],
+        headers: headers
       }
     ];
     OrchestratorHelper.mockStatus(false);
+    fixture.detectChanges();
     hostListSpy.and.callFake(() => of(payload));
     fixture.detectChanges();
 
     component.getHosts(new CdTableFetchDataContext(() => undefined));
     fixture.detectChanges();
 
-    const spans = fixture.debugElement.nativeElement.querySelectorAll(
-      '.datatable-body-cell-label span'
-    );
-    expect(spans[7].textContent).toBe('N/A');
+    const spans = fixture.debugElement.nativeElement.querySelectorAll('[cdstabledata] span');
+    expect(spans[7].textContent).toBe('-');
   });
 
-  it('should test if host facts are unavailable if get_fatcs orch feature is not available', () => {
+  it('should test if host facts are unavailable if get_facts orch feature is not available', () => {
     const payload = [
       {
         hostname: 'host_test',
@@ -237,20 +194,20 @@ describe('HostsComponent', () => {
             type: 'osd',
             id: '0'
           }
-        ]
+        ],
+        headers: headers
       }
     ];
     OrchestratorHelper.mockStatus(true);
+    fixture.detectChanges();
     hostListSpy.and.callFake(() => of(payload));
     fixture.detectChanges();
 
     component.getHosts(new CdTableFetchDataContext(() => undefined));
     fixture.detectChanges();
 
-    const spans = fixture.debugElement.nativeElement.querySelectorAll(
-      '.datatable-body-cell-label span'
-    );
-    expect(spans[7].textContent).toBe('N/A');
+    const spans = fixture.debugElement.nativeElement.querySelectorAll('[cdstabledata] span');
+    expect(spans[7].textContent).toBe('-');
   });
 
   it('should test if memory/raw capacity columns shows N/A if facts are available but in fetching state', () => {
@@ -272,10 +229,12 @@ describe('HostsComponent', () => {
         hdd_capacity_bytes: undefined,
         flash_count: 4,
         flash_capacity_bytes: undefined,
-        nic_count: 1
+        nic_count: 1,
+        headers: headers
       }
     ];
     OrchestratorHelper.mockStatus(true, features);
+    fixture.detectChanges();
     hostListSpy.and.callFake(() => of(hostPayload));
     fixture.detectChanges();
 
@@ -319,7 +278,10 @@ describe('HostsComponent', () => {
     const fakeHosts = require('./fixtures/host_list_response.json');
 
     beforeEach(() => {
-      hostListSpy.and.callFake(() => of(fakeHosts));
+      let headers = new HttpHeaders().set('x-total-count', '10');
+      headers = headers.set('x-total-count', '10');
+      fakeHosts[0].headers = headers;
+      fakeHosts[1].headers = headers;
     });
 
     const testTableActions = async (
@@ -331,6 +293,10 @@ describe('HostsComponent', () => {
       fixture.detectChanges();
       await fixture.whenStable();
 
+      component.getHosts(new CdTableFetchDataContext(() => undefined));
+      fixture.detectChanges();
+      hostListSpy.and.callFake(() => of(fakeHosts));
+      fixture.detectChanges();
       for (const test of tests) {
         if (test.selectRow) {
           component.selection = new CdTableSelection();

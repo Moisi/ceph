@@ -12,10 +12,12 @@
  *
  */
 
-#include <algorithm>
-#include <cerrno>
-
 #include "Objecter.h"
+#include "Striper.h"
+
+#include <algorithm>
+#include <sstream>
+
 #include "osd/OSDMap.h"
 #include "osd/error_code.h"
 #include "Filer.h"
@@ -58,6 +60,7 @@
 #include "common/async/waiter.h"
 #include "error_code.h"
 
+#include "neorados/RADOSImpl.h"
 
 using std::list;
 using std::make_pair;
@@ -90,11 +93,13 @@ using ceph::timespan;
 using ceph::shunique_lock;
 using ceph::acquire_shared;
 using ceph::acquire_unique;
+using namespace std::literals;
 
 namespace bc = boost::container;
 namespace bs = boost::system;
 namespace ca = ceph::async;
 namespace cb = ceph::buffer;
+namespace asio = boost::asio;
 
 #define dout_subsys ceph_subsys_objecter
 #undef dout_prefix
@@ -179,6 +184,10 @@ enum {
   l_osdc_osdop_omap_rd,
   l_osdc_osdop_omap_del,
 
+  l_osdc_replica_read_sent,
+  l_osdc_replica_read_bounced,
+  l_osdc_replica_read_completed,
+
   l_osdc_last,
 };
 
@@ -213,15 +222,13 @@ std::unique_lock<std::mutex> Objecter::OSDSession::get_lock(object_t& oid)
   return {completion_locks[h % num_locks], std::defer_lock};
 }
 
-const char** Objecter::get_tracked_conf_keys() const
+std::vector<std::string> Objecter::get_tracked_keys() const noexcept
 {
-  static const char *config_keys[] = {
-    "crush_location",
-    "rados_mon_op_timeout",
-    "rados_osd_op_timeout",
-    NULL
+  return {
+    "crush_location"s,
+    "rados_mon_op_timeout"s,
+    "rados_osd_op_timeout"s
   };
-  return config_keys;
 }
 
 
@@ -236,6 +243,13 @@ void Objecter::handle_conf_change(const ConfigProxy& conf,
   }
   if (changed.count("rados_osd_op_timeout")) {
     osd_timeout = conf.get_val<std::chrono::seconds>("rados_osd_op_timeout");
+  }
+
+  auto read_policy = conf.get_val<std::string>("rados_replica_read_policy");
+  if (read_policy == "localize") {
+    extra_read_flags = CEPH_OSD_FLAG_LOCALIZE_READS;
+  } else if (read_policy == "balance") {
+    extra_read_flags = CEPH_OSD_FLAG_BALANCE_READS;
   }
 }
 
@@ -376,6 +390,13 @@ void Objecter::init()
 			"OSD OMAP read operations");
     pcb.add_u64_counter(l_osdc_osdop_omap_del, "omap_del",
 			"OSD OMAP delete operations");
+
+    pcb.add_u64_counter(l_osdc_replica_read_sent, "replica_read_sent",
+			"Operations sent to replica");
+    pcb.add_u64_counter(l_osdc_replica_read_bounced, "replica_read_bounced",
+			"Operations bounced by replica to be resent to primary");
+    pcb.add_u64_counter(l_osdc_replica_read_completed, "replica_read_completed",
+			"Operations completed by replica");
 
     logger = pcb.create_perf_counters();
     cct->get_perfcounters_collection()->add(logger);
@@ -604,14 +625,14 @@ void Objecter::_linger_commit(LingerOp *info, bs::error_code ec,
   std::unique_lock wl(info->watch_lock);
   ldout(cct, 10) << "_linger_commit " << info->linger_id << dendl;
   if (info->on_reg_commit) {
-    info->on_reg_commit->defer(std::move(info->on_reg_commit),
-			       ec, cb::list{});
-    info->on_reg_commit.reset();
+    asio::defer(service.get_executor(),
+		asio::append(std::move(info->on_reg_commit),
+			     ec, cb::list{}));
   }
   if (ec && info->on_notify_finish) {
-    info->on_notify_finish->defer(std::move(info->on_notify_finish),
-				  ec, cb::list{});
-    info->on_notify_finish.reset();
+    asio::defer(service.get_executor(),
+		asio::append(std::move(info->on_notify_finish),
+			     ec, cb::list{}));
   }
 
   // only tell the user the first time we do this
@@ -670,10 +691,10 @@ void Objecter::_linger_reconnect(LingerOp *info, bs::error_code ec)
 		 << " (last_error " << info->last_error << ")" << dendl;
   std::unique_lock wl(info->watch_lock);
   if (ec) {
+    ec = _normalize_watch_error(ec);
     if (!info->last_error) {
-      ec = _normalize_watch_error(ec);
       if (info->handle) {
-	boost::asio::defer(finish_strand, CB_DoWatchError(this, info, ec));
+	asio::defer(finish_strand, CB_DoWatchError(this, info, ec));
       }
     }
   }
@@ -736,7 +757,7 @@ void Objecter::_linger_ping(LingerOp *info, bs::error_code ec, ceph::coarse_mono
       ec = _normalize_watch_error(ec);
       info->last_error = ec;
       if (info->handle) {
-	boost::asio::defer(finish_strand, CB_DoWatchError(this, info, ec));
+	asio::post(finish_strand, CB_DoWatchError(this, info, ec));
       }
     }
   } else {
@@ -924,7 +945,7 @@ void Objecter::handle_watch_notify(MWatchNotify *m)
     if (!info->last_error) {
       info->last_error = bs::error_code(ENOTCONN, osd_category());
       if (info->handle) {
-	boost::asio::defer(finish_strand, CB_DoWatchError(this, info,
+	asio::defer(finish_strand, CB_DoWatchError(this, info,
 							  info->last_error));
       }
     }
@@ -937,16 +958,16 @@ void Objecter::handle_watch_notify(MWatchNotify *m)
       ldout(cct, 10) << __func__ << " reply notify " << m->notify_id
 		     << " != " << info->notify_id << ", ignoring" << dendl;
     } else if (info->on_notify_finish) {
-      info->on_notify_finish->defer(
-	std::move(info->on_notify_finish),
-	osdcode(m->return_code), std::move(m->get_data()));
-
+      asio::defer(service.get_executor(),
+		  asio::append(std::move(info->on_notify_finish),
+			       osdcode(m->return_code),
+			       std::move(m->get_data())));
       // if we race with reconnect we might get a second notify; only
       // notify the caller once!
       info->on_notify_finish = nullptr;
     }
   } else {
-    boost::asio::defer(finish_strand, CB_DoWatchNotify(this, info, m));
+    asio::defer(finish_strand, CB_DoWatchNotify(this, info, m));
   }
 }
 
@@ -980,52 +1001,61 @@ void Objecter::_do_watch_notify(boost::intrusive_ptr<LingerOp> info,
   info->finished_async();
 }
 
-bool Objecter::ms_dispatch(Message *m)
+Dispatcher::dispatch_result_t Objecter::ms_dispatch2(const MessageRef &m)
 {
   ldout(cct, 10) << __func__ << " " << cct << " " << *m << dendl;
   switch (m->get_type()) {
     // these we exlusively handle
   case CEPH_MSG_OSD_OPREPLY:
-    handle_osd_op_reply(static_cast<MOSDOpReply*>(m));
-    return true;
+    m->get(); /* ref to be consumed */
+    handle_osd_op_reply(ref_cast<MOSDOpReply>(m).get());
+    return Dispatcher::HANDLED();
 
   case CEPH_MSG_OSD_BACKOFF:
-    handle_osd_backoff(static_cast<MOSDBackoff*>(m));
-    return true;
+    m->get(); /* ref to be consumed */
+    handle_osd_backoff(ref_cast<MOSDBackoff>(m).get());
+    return Dispatcher::HANDLED();
 
   case CEPH_MSG_WATCH_NOTIFY:
-    handle_watch_notify(static_cast<MWatchNotify*>(m));
-    m->put();
-    return true;
+    /* ref not consumed! */
+    handle_watch_notify(ref_cast<MWatchNotify>(m).get());
+    return Dispatcher::HANDLED();
 
   case MSG_COMMAND_REPLY:
     if (m->get_source().type() == CEPH_ENTITY_TYPE_OSD) {
-      handle_command_reply(static_cast<MCommandReply*>(m));
-      return true;
+      m->get(); /* ref to be consumed */
+      handle_command_reply(ref_cast<MCommandReply>(m).get());
+      return Dispatcher::HANDLED();
     } else {
-      return false;
+      return Dispatcher::UNHANDLED();
     }
 
   case MSG_GETPOOLSTATSREPLY:
-    handle_get_pool_stats_reply(static_cast<MGetPoolStatsReply*>(m));
-    return true;
+    m->get(); /* ref to be consumed */
+    handle_get_pool_stats_reply(ref_cast<MGetPoolStatsReply>(m).get());
+    return Dispatcher::HANDLED();
 
   case CEPH_MSG_POOLOP_REPLY:
-    handle_pool_op_reply(static_cast<MPoolOpReply*>(m));
-    return true;
+    m->get(); /* ref to be consumed */
+    handle_pool_op_reply(ref_cast<MPoolOpReply>(m).get());
+    return Dispatcher::HANDLED();
 
   case CEPH_MSG_STATFS_REPLY:
-    handle_fs_stats_reply(static_cast<MStatfsReply*>(m));
-    return true;
+    m->get(); /* ref to be consumed */
+    handle_fs_stats_reply(ref_cast<MStatfsReply>(m).get());
+    return Dispatcher::HANDLED();
 
     // these we give others a chance to inspect
 
     // MDS, OSD
   case CEPH_MSG_OSD_MAP:
-    handle_osd_map(static_cast<MOSDMap*>(m));
-    return false;
+    /* ref not consumed! */
+    handle_osd_map(ref_cast<MOSDMap>(m).get());
+    return Dispatcher::ACKNOWLEDGED();
+
+  default:
+    return Dispatcher::UNHANDLED();
   }
-  return false;
 }
 
 void Objecter::_scan_requests(
@@ -1224,7 +1254,7 @@ void Objecter::handle_osd_map(MOSDMap *m)
 	  logger->inc(l_osdc_map_full);
 	}
 	else {
-	  if (e >= m->get_oldest()) {
+	  if (e >= m->cluster_osdmap_trim_lower_bound) {
 	    ldout(cct, 3) << "handle_osd_map requesting missing epoch "
 			  << osdmap->get_epoch()+1 << dendl;
 	    _maybe_request_map();
@@ -1232,8 +1262,9 @@ void Objecter::handle_osd_map(MOSDMap *m)
 	  }
 	  ldout(cct, 3) << "handle_osd_map missing epoch "
 			<< osdmap->get_epoch()+1
-			<< ", jumping to " << m->get_oldest() << dendl;
-	  e = m->get_oldest() - 1;
+			<< ", jumping to "
+			<< m->cluster_osdmap_trim_lower_bound << dendl;
+	  e = m->cluster_osdmap_trim_lower_bound - 1;
 	  skipped_map = true;
 	  continue;
 	}
@@ -1378,9 +1409,9 @@ void Objecter::handle_osd_map(MOSDMap *m)
 	 p->first <= osdmap->get_epoch()) {
     //go through the list and call the onfinish methods
     for (auto& [c, ec] : p->second) {
-      ca::post(std::move(c), ec);
+      asio::post(service.get_executor(), asio::append(std::move(c), ec));
     }
-    waiting_for_map.erase(p++);
+    p = waiting_for_map.erase(p);
   }
 
   monc->sub_got("osdmap", osdmap->get_epoch());
@@ -1567,7 +1598,7 @@ void Objecter::_check_op_pool_dne(Op *op, std::unique_lock<std::shared_mutex> *s
 		     << " dne" << dendl;
       if (op->has_completion()) {
 	num_in_flight--;
-	op->complete(osdc_errc::pool_dne, -ENOENT);
+	op->complete(make_error_code(osdc_errc::pool_dne), -ENOENT, service.get_executor());
       }
 
       OSDSession *s = op->session;
@@ -1602,7 +1633,8 @@ void Objecter::_check_op_pool_eio(Op *op, std::unique_lock<std::shared_mutex> *s
 		 << " has eio" << dendl;
   if (op->has_completion()) {
     num_in_flight--;
-    op->complete(osdc_errc::pool_eio, -EIO);
+    op->complete(make_error_code(osdc_errc::pool_eio), -EIO,
+		 service.get_executor());
   }
 
   OSDSession *s = op->session;
@@ -1700,13 +1732,17 @@ void Objecter::_check_linger_pool_dne(LingerOp *op, bool *need_unregister)
     if (osdmap->get_epoch() >= op->map_dne_bound) {
       std::unique_lock wl{op->watch_lock};
       if (op->on_reg_commit) {
-	op->on_reg_commit->defer(std::move(op->on_reg_commit),
-				 osdc_errc::pool_dne, cb::list{});
+	asio::defer(service.get_executor(),
+		    asio::append(std::move(op->on_reg_commit),
+				 make_error_code(osdc_errc::pool_dne),
+				 cb::list{}));
 	op->on_reg_commit = nullptr;
       }
       if (op->on_notify_finish) {
-	op->on_notify_finish->defer(std::move(op->on_notify_finish),
-				    osdc_errc::pool_dne, cb::list{});
+	asio::defer(service.get_executor(),
+		    asio::append(std::move(op->on_notify_finish),
+				 make_error_code(osdc_errc::pool_dne),
+				 cb::list{}));
         op->on_notify_finish = nullptr;
       }
       *need_unregister = true;
@@ -1722,14 +1758,14 @@ void Objecter::_check_linger_pool_eio(LingerOp *op)
 
   std::unique_lock wl{op->watch_lock};
   if (op->on_reg_commit) {
-    op->on_reg_commit->defer(std::move(op->on_reg_commit),
-			     osdc_errc::pool_dne, cb::list{});
-    op->on_reg_commit = nullptr;
+    asio::defer(service.get_executor(),
+		asio::append(std::move(op->on_reg_commit),
+			     make_error_code(osdc_errc::pool_dne), cb::list{}));
   }
   if (op->on_notify_finish) {
-    op->on_notify_finish->defer(std::move(op->on_notify_finish),
-				osdc_errc::pool_dne, cb::list{});
-    op->on_notify_finish = nullptr;
+    asio::defer(service.get_executor(),
+		asio::append(std::move(op->on_notify_finish),
+			     make_error_code(osdc_errc::pool_dne), cb::list{}));
   }
 }
 
@@ -1983,7 +2019,10 @@ void Objecter::wait_for_osd_map(epoch_t e)
   }
 
   ca::waiter<bs::error_code> w;
-  waiting_for_map[e].emplace_back(OpCompletion::create(
+  auto ex = boost::asio::prefer(
+    service.get_executor(),
+    boost::asio::execution::outstanding_work.tracked);
+  waiting_for_map[e].emplace_back(asio::bind_executor(
 				    service.get_executor(),
 				    w.ref()),
 				  bs::error_code{});
@@ -1992,14 +2031,15 @@ void Objecter::wait_for_osd_map(epoch_t e)
 }
 
 void Objecter::_get_latest_version(epoch_t oldest, epoch_t newest,
-				   std::unique_ptr<OpCompletion> fin,
+				   OpCompletion fin,
 				   std::unique_lock<ceph::shared_mutex>&& l)
 {
   ceph_assert(fin);
   if (osdmap->get_epoch() >= newest) {
     ldout(cct, 10) << __func__ << " latest " << newest << ", have it" << dendl;
     l.unlock();
-    ca::defer(std::move(fin), bs::error_code{});
+    asio::defer(service.get_executor(),
+		asio::append(std::move(fin), bs::error_code{}));
   } else {
     ldout(cct, 10) << __func__ << " latest " << newest << ", waiting" << dendl;
     _wait_for_new_map(std::move(fin), newest, bs::error_code{});
@@ -2015,6 +2055,7 @@ void Objecter::maybe_request_map()
 
 void Objecter::_maybe_request_map()
 {
+  last_osdmap_request_time = ceph::coarse_mono_clock::now();
   // rwlock is locked
   int flag = 0;
   if (_osdmap_full_flag()
@@ -2033,7 +2074,7 @@ void Objecter::_maybe_request_map()
   }
 }
 
-void Objecter::_wait_for_new_map(std::unique_ptr<OpCompletion> c, epoch_t epoch,
+void Objecter::_wait_for_new_map(OpCompletion c, epoch_t epoch,
 				 bs::error_code ec)
 {
   // rwlock is locked unique
@@ -2201,8 +2242,20 @@ void Objecter::tick()
     if (found)
       toping.insert(s);
   }
+
   if (num_homeless_ops || !toping.empty()) {
     _maybe_request_map();
+  } else if (last_osdmap_request_time != ceph::coarse_mono_clock::time_point()) {
+    auto now = ceph::coarse_mono_clock::now();
+    auto elapsed = now - last_osdmap_request_time;
+    auto stale_window = ceph::make_timespan(cct->_conf->objecter_tick_interval) * 2;
+    if (elapsed > stale_window) {
+      double elapsed_s = std::chrono::duration<double>(elapsed).count();
+      double thresh_s  = std::chrono::duration<double>(stale_window).count();
+      ldout(cct, 10) << __func__ << ": osdmap stale: " << elapsed_s 
+        << "s > " << thresh_s << "s, maybe requesting map" << dendl;
+      _maybe_request_map();
+    }
   }
 
   logger->set(l_osdc_op_laggy, laggy_ops);
@@ -2320,6 +2373,10 @@ void Objecter::_send_op_account(Op *op)
     ldout(cct, 20) << " note: not requesting reply" << dendl;
   }
 
+  if (op->target.used_replica) {
+    logger->inc(l_osdc_replica_read_sent);
+  }
+
   logger->inc(l_osdc_op_active);
   logger->inc(l_osdc_op);
   logger->inc(l_osdc_oplen_avg, op->ops.size());
@@ -2380,6 +2437,23 @@ void Objecter::_send_op_account(Op *op)
   }
 }
 
+struct op_cancellation {
+  ceph_tid_t tid;
+  Objecter* objecter;
+
+  op_cancellation(ceph_tid_t tid, Objecter* objecter)
+    : tid(tid), objecter(objecter) {}
+
+  void operator ()(asio::cancellation_type_t type) {
+    if (type == asio::cancellation_type::total ||
+	type == asio::cancellation_type::terminal) {
+      // Since nobody can cancel until we return (I hope) we shouldn't
+      // need a mutex or anything.
+      objecter->op_cancel(tid, asio::error::operation_aborted);
+    }
+  }
+};
+
 void Objecter::_op_submit(Op *op, shunique_lock<ceph::shared_mutex>& sul, ceph_tid_t *ptid)
 {
   // rwlock is locked
@@ -2398,7 +2472,8 @@ void Objecter::_op_submit(Op *op, shunique_lock<ceph::shared_mutex>& sul, ceph_t
     break;
   case RECALC_OP_TARGET_POOL_EIO:
     if (op->has_completion()) {
-      op->complete(osdc_errc::pool_eio, -EIO);
+      op->complete(make_error_code(osdc_errc::pool_eio), -EIO,
+		   service.get_executor());
     }
     return;
   }
@@ -2463,6 +2538,16 @@ void Objecter::_op_submit(Op *op, shunique_lock<ceph::shared_mutex>& sul, ceph_t
 
   _session_op_assign(s, op);
 
+
+  auto compptr = std::get_if<Op::OpComp>(&op->onfinish);
+  if (compptr) {
+    // arrange for per-op cancellation
+    auto slot = boost::asio::get_associated_cancellation_slot(*compptr);
+    if (slot.is_connected()) {
+      slot.template emplace<op_cancellation>(op->tid, this);
+    }
+  }
+
   if (need_send) {
     _send_op(op);
   }
@@ -2483,7 +2568,8 @@ void Objecter::_op_submit(Op *op, shunique_lock<ceph::shared_mutex>& sul, ceph_t
   ldout(cct, 5) << num_in_flight << " in flight" << dendl;
 }
 
-int Objecter::op_cancel(OSDSession *s, ceph_tid_t tid, int r)
+int Objecter::op_cancel(OSDSession *s, ceph_tid_t tid, int r,
+			bs::error_code ec)
 {
   ceph_assert(initialized);
 
@@ -2509,13 +2595,65 @@ int Objecter::op_cancel(OSDSession *s, ceph_tid_t tid, int r)
   Op *op = p->second;
   if (op->has_completion()) {
     num_in_flight--;
-    op->complete(osdcode(r), r);
+    op->complete(ec, r, service.get_executor());
   }
   _op_cancel_map_check(op);
   _finish_op(op, r);
   sl.unlock();
 
   return 0;
+}
+
+void Objecter::subsystem_cancel(uint64_t subsystem, bs::error_code ec)
+{
+  unique_lock wl(rwlock);
+
+  ldout(cct, 5) << __func__ << ": cancelling subsystem " << subsystem
+		<< " ec=" << ec.message() << dendl;
+
+  auto next_subsystem_op = [subsystem](const decltype(OSDSession::ops)& ops) {
+    auto i = std::find_if(
+      ops.begin(), ops.end(),
+      [subsystem](const auto& el) -> std::optional<ceph_tid_t> {
+	return el.second->subsystem == subsystem;
+      });
+    if (i != ops.cend()) {
+      return std::make_optional(i->second->tid);
+    }
+    return std::optional<ceph_tid_t>{std::nullopt};
+  };
+
+  // Since we only do this at shutdown, better to have it be slow than
+  // make it fast and introduce another cost per op.
+
+start:
+
+  for (auto siter = osd_sessions.begin();
+       siter != osd_sessions.end(); ++siter) {
+    auto s = siter->second;
+    shared_lock sl(s->lock);
+    while (auto tid = next_subsystem_op(s->ops)) {
+      sl.unlock();
+      auto ret = op_cancel(s, *tid, ceph::from_error_code(ec), ec);
+      if (ret == -ENOENT) {
+	/* oh no! raced, maybe tid moved to another session, restarting */
+	goto start;
+      }
+      sl.lock();
+    }
+  }
+
+  // Handle case where the op is in homeless session
+  shared_lock sl(homeless_session->lock);
+  while (auto tid = next_subsystem_op(homeless_session->ops)) {
+    sl.unlock();
+    auto ret = op_cancel(homeless_session, *tid, ceph::from_error_code(ec), ec);
+    if (ret == -ENOENT) {
+      /* oh no! raced, maybe tid moved to another session, restarting */
+      goto start;
+    }
+  }
+  sl.unlock();
 }
 
 int Objecter::op_cancel(ceph_tid_t tid, int r)
@@ -2553,7 +2691,7 @@ start:
     shared_lock sl(s->lock);
     if (s->ops.find(tid) != s->ops.end()) {
       sl.unlock();
-      ret = op_cancel(s, tid, r);
+      ret = op_cancel(s, tid, r, osdcode(r));
       if (ret == -ENOENT) {
 	/* oh no! raced, maybe tid moved to another session, restarting */
 	goto start;
@@ -2569,7 +2707,7 @@ start:
   shared_lock sl(homeless_session->lock);
   if (homeless_session->ops.find(tid) != homeless_session->ops.end()) {
     sl.unlock();
-    ret = op_cancel(homeless_session, tid, r);
+    ret = op_cancel(homeless_session, tid, r, osdcode(r));
     if (ret == -ENOENT) {
       /* oh no! raced, maybe tid moved to another session, restarting */
       goto start;
@@ -2608,7 +2746,7 @@ epoch_t Objecter::op_cancel_writes(int r, int64_t pool)
     sl.unlock();
 
     for (auto titer = to_cancel.begin(); titer != to_cancel.end(); ++titer) {
-      int cancel_result = op_cancel(s, *titer, r);
+      int cancel_result = op_cancel(s, *titer, r, osdcode(r));
       // We hold rwlock across search and cancellation, so cancels
       // should always succeed
       ceph_assert(cancel_result == 0);
@@ -2894,6 +3032,8 @@ int Objecter::_calc_target(op_target_t *t, Connection *con, bool any_change)
 	pi->peering_crush_bucket_barrier,
 	t->peering_crush_mandatory_member,
 	pi->peering_crush_mandatory_member,
+	t->allows_ecoptimizations,
+	pi->allows_ecoptimizations(),
 	prev_pgid)) {
     force_resend = true;
   }
@@ -2935,9 +3075,17 @@ int Objecter::_calc_target(op_target_t *t, Connection *con, bool any_change)
     t->pg_num_pending = pg_num_pending;
     spg_t spgid(actual_pgid);
     if (pi->is_erasure()) {
+      // Optimized EC pools need to be careful when calculating the shard
+      // because an OSD may have multiple shards and the primary shard
+      // might not be the first one in the acting set. The lookup
+      // therefoere has to be done in primaryfirst order.
+      std::vector<int> pg_temp = t->acting;
+      if (osdmap->has_pgtemp(actual_pgid)) {
+	pg_temp = osdmap->pgtemp_primaryfirst(*pi, t->acting);
+      }
       for (uint8_t i = 0; i < t->acting.size(); ++i) {
-        if (t->acting[i] == acting_primary) {
-          spgid.reset_shard(shard_id_t(i));
+        if (pg_temp[i] == acting_primary) {
+	  spgid.reset_shard(osdmap->pgtemp_undo_primaryfirst(*pi, actual_pgid, shard_id_t(i)));
           break;
         }
       }
@@ -2949,6 +3097,7 @@ int Objecter::_calc_target(op_target_t *t, Connection *con, bool any_change)
     t->peering_crush_bucket_target = pi->peering_crush_bucket_target;
     t->peering_crush_bucket_barrier = pi->peering_crush_bucket_barrier;
     t->peering_crush_mandatory_member = pi->peering_crush_mandatory_member;
+    t->allows_ecoptimizations = pi->allows_ecoptimizations();
     ldout(cct, 10) << __func__ << " "
 		   << " raw pgid " << pgid << " -> actual " << t->actual_pgid
 		   << " acting " << t->acting
@@ -3231,6 +3380,10 @@ Objecter::MOSDOp *Objecter::_prepare_osd_op(Op *op)
     m->set_reqid(op->reqid);
   }
 
+  if (op->otel_trace && op->otel_trace->IsValid()) {
+     m->otel_trace = jspan_context(*op->otel_trace);
+  }
+
   logger->inc(l_osdc_op_send);
   ssize_t sum = 0;
   for (unsigned i = 0; i < m->ops.size(); i++) {
@@ -3465,6 +3618,15 @@ void Objecter::handle_osd_op_reply(MOSDOpReply *m)
     return;
   }
 
+  if (op->target.flags & (CEPH_OSD_FLAG_BALANCE_READS |
+			  CEPH_OSD_FLAG_LOCALIZE_READS)) {
+    if (rc == -EAGAIN) {
+      logger->inc(l_osdc_replica_read_bounced);
+    } else {
+      logger->inc(l_osdc_replica_read_completed);
+    }
+  }
+
   if (rc == -EAGAIN) {
     ldout(cct, 7) << " got -EAGAIN, resubmitting" << dendl;
     if (op->has_completion())
@@ -3536,11 +3698,23 @@ void Objecter::handle_osd_op_reply(MOSDOpReply *m)
   ceph_assert(op->out_bl.size() == op->out_rval.size());
   ceph_assert(op->out_bl.size() == op->out_handler.size());
   auto p = out_ops.begin();
+  // Propagates handler error to Op::completion. In the event of
+  // multiple handler errors, the most recent wins.
+  bs::error_code handler_error;
+  // Holds OSD error code, so handlers downstream of a failing op are
+  // made aware of it.
+  bs::error_code first_osd_error;
   for (unsigned i = 0;
        p != out_ops.end() && pb != op->out_bl.end();
        ++i, ++p, ++pb, ++pr, ++pe, ++ph) {
     ldout(cct, 10) << " op " << i << " rval " << p->rval
 		   << " len " << p->outdata.length() << dendl;
+    // Track when we get an OSD error and supply it to subsequent
+    // handlers so they won't attempt to operate on data that isn't
+    // there.
+    if (!first_osd_error && (p->rval < 0)) {
+      first_osd_error = bs::error_code(-p->rval, osd_category());
+    }
     if (*pb)
       **pb = p->outdata;
     // set rval before running handlers so that handlers
@@ -3551,10 +3725,35 @@ void Objecter::handle_osd_op_reply(MOSDOpReply *m)
       **pe = p->rval < 0 ? bs::error_code(-p->rval, osd_category()) :
 	bs::error_code();
     if (*ph) {
-      std::move((*ph))(p->rval < 0 ?
-		       bs::error_code(-p->rval, osd_category()) :
-		       bs::error_code(),
-		       p->rval, p->outdata);
+      try {
+	bs::error_code e;
+	if (first_osd_error) {
+	  e = first_osd_error;
+	} else if (p->rval < 0) {
+	  e = bs::error_code(-p->rval, osd_category());
+	}
+	std::move((*ph))(e, p->rval, p->outdata);
+      } catch (const bs::system_error& e) {
+	ldout(cct, 10) << "ERROR: tid " << op->tid << ": handler function threw "
+		       << e.what() << dendl;
+	handler_error = e.code();
+	if (*pe) {
+	  **pe = e.code();
+	}
+	if (*pr && **pr == 0) {
+	  **pr = ceph::from_error_code(e.code());
+	}
+      } catch (const std::exception& e) {
+	ldout(cct, 0) << "ERROR: tid " << op->tid << ": handler function threw "
+		      << e.what() << dendl;
+	handler_error = osdc_errc::handler_failed;
+	if (*pe) {
+	  **pe = osdc_errc::handler_failed;
+	}
+	if (*pr && **pr == 0) {
+	  **pr = -EIO;
+	}
+      }
     }
   }
 
@@ -3586,7 +3785,13 @@ void Objecter::handle_osd_op_reply(MOSDOpReply *m)
 
   // do callbacks
   if (Op::has_completion(onfinish)) {
-    Op::complete(std::move(onfinish), osdcode(rc), rc);
+    if (rc == 0 && handler_error) {
+      Op::complete(std::move(onfinish), handler_error, -EIO, service.get_executor());
+    } else if (handler_error) {
+      Op::complete(std::move(onfinish), handler_error, rc, service.get_executor());
+    } else {
+      Op::complete(std::move(onfinish), osdcode(rc), rc, service.get_executor());
+    }
   }
   if (completion_lock.mutex()) {
     completion_lock.unlock();
@@ -3886,12 +4091,15 @@ void Objecter::create_pool_snap(int64_t pool, std::string_view snap_name,
 
   const pg_pool_t *p = osdmap->get_pg_pool(pool);
   if (!p) {
-    onfinish->defer(std::move(onfinish), osdc_errc::pool_dne, cb::list{});
+    asio::defer(service.get_executor(),
+		asio::append(std::move(onfinish),
+			     make_error_code(osdc_errc::pool_dne), cb::list{}));
     return;
   }
   if (p->snap_exists(snap_name)) {
-    onfinish->defer(std::move(onfinish), osdc_errc::snapshot_exists,
-		    cb::list{});
+    asio::defer(service.get_executor(),
+		asio::append(std::move(onfinish), osdc_errc::snapshot_exists,
+			     cb::list{}));
     return;
   }
 
@@ -3907,7 +4115,7 @@ void Objecter::create_pool_snap(int64_t pool, std::string_view snap_name,
 }
 
 struct CB_SelfmanagedSnap {
-  std::unique_ptr<ca::Completion<void(bs::error_code, snapid_t)>> fin;
+  asio::any_completion_handler<void(bs::error_code, snapid_t)> fin;
   CB_SelfmanagedSnap(decltype(fin)&& fin)
     : fin(std::move(fin)) {}
   void operator()(bs::error_code ec, const cb::list& bl) {
@@ -3920,22 +4128,23 @@ struct CB_SelfmanagedSnap {
         ec = e.code();
       }
     }
-    fin->defer(std::move(fin), ec, snapid);
+    asio::dispatch(asio::append(std::move(fin), ec, snapid));
   }
 };
 
 void Objecter::allocate_selfmanaged_snap(
   int64_t pool,
-  std::unique_ptr<ca::Completion<void(bs::error_code, snapid_t)>> onfinish)
+  asio::any_completion_handler<void(bs::error_code, snapid_t)> onfinish)
 {
   unique_lock wl(rwlock);
   ldout(cct, 10) << "allocate_selfmanaged_snap; pool: " << pool << dendl;
   auto op = new PoolOp;
   op->tid = ++last_tid;
   op->pool = pool;
-  op->onfinish = PoolOp::OpComp::create(
+  auto e = boost::asio::prefer(
     service.get_executor(),
-    CB_SelfmanagedSnap(std::move(onfinish)));
+    boost::asio::execution::outstanding_work.tracked);
+  op->onfinish = asio::bind_executor(e, CB_SelfmanagedSnap(std::move(onfinish)));
   op->pool_op = POOL_OP_CREATE_UNMANAGED_SNAP;
   pool_ops[op->tid] = op;
 
@@ -3952,12 +4161,18 @@ void Objecter::delete_pool_snap(
 
   const pg_pool_t *p = osdmap->get_pg_pool(pool);
   if (!p) {
-    onfinish->defer(std::move(onfinish), osdc_errc::pool_dne, cb::list{});
+    asio::defer(service.get_executor(),
+		asio::append(std::move(onfinish),
+			     make_error_code(osdc_errc::pool_dne),
+			     cb::list{}));
     return;
   }
 
   if (!p->snap_exists(snap_name)) {
-    onfinish->defer(std::move(onfinish), osdc_errc::snapshot_dne, cb::list{});
+    asio::defer(service.get_executor(),
+		asio::append(std::move(onfinish),
+			     make_error_code(osdc_errc::snapshot_dne),
+			     cb::list{}));
     return;
   }
 
@@ -3997,7 +4212,10 @@ void Objecter::create_pool(std::string_view name,
   ldout(cct, 10) << "create_pool name=" << name << dendl;
 
   if (osdmap->lookup_pg_pool_name(name) >= 0) {
-    onfinish->defer(std::move(onfinish), osdc_errc::pool_exists, cb::list{});
+    asio::defer(service.get_executor(),
+		asio::append(std::move(onfinish),
+			     make_error_code(osdc_errc::pool_exists),
+			     cb::list{}));
     return;
   }
 
@@ -4020,7 +4238,10 @@ void Objecter::delete_pool(int64_t pool,
   ldout(cct, 10) << "delete_pool " << pool << dendl;
 
   if (!osdmap->have_pg_pool(pool))
-    onfinish->defer(std::move(onfinish), osdc_errc::pool_dne, cb::list{});
+    asio::defer(service.get_executor(),
+		asio::append(std::move(onfinish),
+			     make_error_code(osdc_errc::pool_dne),
+			     cb::list{}));
   else
     _do_delete_pool(pool, std::move(onfinish));
 }
@@ -4034,7 +4255,10 @@ void Objecter::delete_pool(std::string_view pool_name,
   int64_t pool = osdmap->lookup_pg_pool_name(pool_name);
   if (pool < 0)
     // This only returns one error: -ENOENT.
-    onfinish->defer(std::move(onfinish), osdc_errc::pool_dne, cb::list{});
+    asio::defer(service.get_executor(),
+		asio::append(std::move(onfinish),
+			     make_error_code(osdc_errc::pool_dne),
+			     cb::list{}));
   else
     _do_delete_pool(pool, std::move(onfinish));
 }
@@ -4120,12 +4344,16 @@ void Objecter::handle_pool_op_reply(MPoolOpReply *m)
       if (osdmap->get_epoch() < m->epoch) {
 	ldout(cct, 20) << "waiting for client to reach epoch " << m->epoch
 		       << " before calling back" << dendl;
-	_wait_for_new_map(OpCompletion::create(
-			    service.get_executor(),
+	auto e = boost::asio::prefer(
+	  service.get_executor(),
+	  boost::asio::execution::outstanding_work.tracked);
+	_wait_for_new_map(asio::bind_executor(
+			    e,
 			    [o = std::move(op->onfinish),
-			     bl = std::move(bl)](
+			     bl = std::move(bl),
+			     e = service.get_executor()](
 			      bs::error_code ec) mutable {
-			      o->defer(std::move(o), ec, bl);
+			      asio::defer(e, asio::append(std::move(o), ec, bl));
 			    }),
 			  m->epoch,
 			  ec);
@@ -4134,11 +4362,11 @@ void Objecter::handle_pool_op_reply(MPoolOpReply *m)
 	// sneaked in. Do caller-specified callback now or else
 	// we lose it forever.
 	ceph_assert(op->onfinish);
-	op->onfinish->defer(std::move(op->onfinish), ec, std::move(bl));
+	asio::defer(service.get_executor(), asio::append(std::move(op->onfinish), ec, std::move(bl)));
       }
     } else {
       ceph_assert(op->onfinish);
-      op->onfinish->defer(std::move(op->onfinish), ec, std::move(bl));
+      asio::defer(service.get_executor(), asio::append(std::move(op->onfinish), ec, std::move(bl)));
     }
     op->onfinish = nullptr;
     if (!sul.owns_lock()) {
@@ -4177,7 +4405,8 @@ int Objecter::pool_op_cancel(ceph_tid_t tid, int r)
 
   PoolOp *op = it->second;
   if (op->onfinish)
-    op->onfinish->defer(std::move(op->onfinish), osdcode(r), cb::list{});
+    asio::defer(service.get_executor(), asio::append(std::move(op->onfinish),
+						     osdcode(r), cb::list{}));
 
   _finish_pool_op(op, r);
   return 0;
@@ -4198,7 +4427,7 @@ void Objecter::_finish_pool_op(PoolOp *op, int r)
 
 // pool stats
 
-void Objecter::get_pool_stats(
+void Objecter::get_pool_stats_(
   const std::vector<std::string>& pools,
   decltype(PoolStatOp::onfinish)&& onfinish)
 {
@@ -4255,8 +4484,9 @@ void Objecter::handle_get_pool_stats_reply(MGetPoolStatsReply *m)
     if (m->version > last_seen_pgmap_version) {
       last_seen_pgmap_version = m->version;
     }
-    op->onfinish->defer(std::move(op->onfinish), bs::error_code{},
-			std::move(m->pool_stats), m->per_pool);
+    asio::defer(service.get_executor(),
+		asio::append(std::move(op->onfinish), bs::error_code{},
+			     std::move(m->pool_stats), m->per_pool));
     _finish_pool_stat_op(op, 0);
   } else {
     ldout(cct, 10) << "unknown request " << tid << dendl;
@@ -4281,8 +4511,9 @@ int Objecter::pool_stat_op_cancel(ceph_tid_t tid, int r)
 
   auto op = it->second;
   if (op->onfinish)
-    op->onfinish->defer(std::move(op->onfinish), osdcode(r),
-			bc::flat_map<std::string, pool_stat_t>{}, false);
+    asio::defer(service.get_executor(),
+		asio::append(std::move(op->onfinish), osdcode(r),
+			     bc::flat_map<std::string, pool_stat_t>{}, false));
   _finish_pool_stat_op(op, r);
   return 0;
 }
@@ -4300,8 +4531,8 @@ void Objecter::_finish_pool_stat_op(PoolStatOp *op, int r)
   delete op;
 }
 
-void Objecter::get_fs_stats(std::optional<int64_t> poolid,
-			    decltype(StatfsOp::onfinish)&& onfinish)
+void Objecter::get_fs_stats_(std::optional<int64_t> poolid,
+			     decltype(StatfsOp::onfinish)&& onfinish)
 {
   ldout(cct, 10) << "get_fs_stats" << dendl;
   unique_lock l(rwlock);
@@ -4354,7 +4585,8 @@ void Objecter::handle_fs_stats_reply(MStatfsReply *m)
     ldout(cct, 10) << "have request " << tid << " at " << op << dendl;
     if (m->h.version > last_seen_pgmap_version)
       last_seen_pgmap_version = m->h.version;
-    op->onfinish->defer(std::move(op->onfinish), bs::error_code{}, m->h.st);
+    asio::defer(service.get_executor(), asio::append(std::move(op->onfinish),
+						     bs::error_code{}, m->h.st));
     _finish_statfs_op(op, 0);
   } else {
     ldout(cct, 10) << "unknown request " << tid << dendl;
@@ -4379,7 +4611,9 @@ int Objecter::statfs_op_cancel(ceph_tid_t tid, int r)
 
   auto op = it->second;
   if (op->onfinish)
-    op->onfinish->defer(std::move(op->onfinish), osdcode(r), ceph_statfs{});
+    asio::defer(service.get_executor(),
+		asio::append(std::move(op->onfinish),
+			     osdcode(r), ceph_statfs{}));
   _finish_statfs_op(op, r);
   return 0;
 }
@@ -4980,7 +5214,9 @@ void Objecter::_finish_command(CommandOp *c, bs::error_code ec,
 		 << rs << dendl;
 
   if (c->onfinish)
-    c->onfinish->defer(std::move(c->onfinish), ec, std::move(rs), std::move(bl));
+    asio::defer(service.get_executor(),
+		asio::append(std::move(c->onfinish), ec, std::move(rs),
+			     std::move(bl)));
 
   if (c->ontimeout && ec != bs::errc::timed_out)
     timer.cancel_event(c->ontimeout);
@@ -5003,11 +5239,20 @@ Objecter::OSDSession::~OSDSession()
 
 Objecter::Objecter(CephContext *cct,
 		   Messenger *m, MonClient *mc,
-		   boost::asio::io_context& service) :
+		   asio::io_context& service) :
   Dispatcher(cct), messenger(m), monc(mc), service(service)
 {
   mon_timeout = cct->_conf.get_val<std::chrono::seconds>("rados_mon_op_timeout");
   osd_timeout = cct->_conf.get_val<std::chrono::seconds>("rados_osd_op_timeout");
+
+  auto read_policy = cct->_conf.get_val<std::string>("rados_replica_read_policy");
+  if (read_policy == "localize") {
+    ldout(cct, 20) << __func__ << ": read policy: localize" << dendl;
+    extra_read_flags = CEPH_OSD_FLAG_LOCALIZE_READS;
+  } else if (read_policy == "balance") {
+    ldout(cct, 20) << __func__ << ": read policy: balance" << dendl;
+    extra_read_flags = CEPH_OSD_FLAG_BALANCE_READS;
+  }
 }
 
 Objecter::~Objecter()
@@ -5207,9 +5452,12 @@ void Objecter::_issue_enumerate(hobject_t start,
   auto pbl = &on_ack->bl;
 
   // Issue.  See you later in _enumerate_reply
+  auto e = boost::asio::prefer(
+    service.get_executor(),
+    boost::asio::execution::outstanding_work.tracked);
   pg_read(start.get_hash(),
 	  c->oloc, op, pbl, 0,
-	  Op::OpComp::create(service.get_executor(),
+	  asio::bind_executor(e,
 			     [c = std::move(on_ack)]
 			     (bs::error_code ec) mutable {
 			       (*c)(ec);

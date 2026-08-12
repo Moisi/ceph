@@ -13,11 +13,15 @@
  */
 
 #include "MDSTableServer.h"
+#include "MDSContext.h"
 #include "MDSRank.h"
 #include "MDLog.h"
 #include "msg/Messenger.h"
 
 #include "events/ETableServer.h"
+#include "common/debug.h"
+
+#include "messages/MMDSTableRequest.h"
 
 #define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_mds
@@ -25,6 +29,56 @@
 #define dout_prefix *_dout << "mds." << rank << ".tableserver(" << get_mdstable_name(table) << ") "
 
 using namespace std;
+
+struct MDSTableServer::notify_info_t {
+  notify_info_t() {}
+  std::set<mds_rank_t> notify_ack_gather;
+  mds_rank_t mds;
+  ref_t<MMDSTableRequest> reply = NULL;
+  MDSContext *onfinish = nullptr;
+};
+
+MDSTableServer::MDSTableServer(MDSRank *m, int tab) :
+    MDSTable(m, get_mdstable_name(tab), false), table(tab) {}
+
+MDSTableServer::~MDSTableServer() = default;
+
+MDSTableServer::MDSTableServer(const MDSTableServer &) = default;
+MDSTableServer &MDSTableServer::operator=(const MDSTableServer &) = default;
+
+void MDSTableServer::_note_prepare(mds_rank_t mds, uint64_t reqid, bool replay) {
+  version++;
+  if (replay)
+    projected_version = version;
+  pending_for_mds[version].mds = mds;
+  pending_for_mds[version].reqid = reqid;
+  pending_for_mds[version].tid = version;
+}
+
+void MDSTableServer::_note_commit(uint64_t tid, bool replay) {
+  version++;
+  if (replay)
+    projected_version = version;
+  pending_for_mds.erase(tid);
+}
+
+void MDSTableServer::_note_rollback(uint64_t tid, bool replay) {
+  version++;
+  if (replay)
+    projected_version = version;
+  pending_for_mds.erase(tid);
+}
+
+void MDSTableServer::_note_server_update(bufferlist& bl, bool replay) {
+  version++;
+  if (replay)
+    projected_version = version;
+}
+
+void MDSTableServer::reset_state() {
+  pending_for_mds.clear();
+  ++version;
+}
 
 void MDSTableServer::handle_request(const cref_t<MMDSTableRequest> &req)
 {
@@ -64,7 +118,6 @@ void MDSTableServer::handle_prepare(const cref_t<MMDSTableRequest> &req)
 
   ETableServer *le = new ETableServer(table, TABLESERVER_OP_PREPARE, req->reqid, from,
 				      projected_version, projected_version);
-  mds->mdlog->start_entry(le);
   le->mutation = req->bl;
   mds->mdlog->submit_entry(le, new C_Prepare(this, req, projected_version));
   mds->mdlog->flush();
@@ -72,7 +125,7 @@ void MDSTableServer::handle_prepare(const cref_t<MMDSTableRequest> &req)
 
 void MDSTableServer::_prepare_logged(const cref_t<MMDSTableRequest> &req, version_t tid)
 {
-  dout(7) << "_create_logged " << *req << " tid " << tid << dendl;
+  dout(7) << __func__ << ": req=" << *req << " tid " << tid << dendl;
   mds_rank_t from = mds_rank_t(req->get_source().num());
 
   ceph_assert(g_conf()->mds_kill_mdstable_at != 2);
@@ -115,6 +168,8 @@ void MDSTableServer::handle_notify_ack(const cref_t<MMDSTableRequest> &m)
       dout(0) << "got unexpected notify ack for tid " <<  tid << " from mds." << from << dendl;
     }
   } else {
+    dout(0) << __func__ << ": tid=" << tid << " from mds." << from
+	    << " not tracked in pending notifies" << dendl;
   }
 }
 
@@ -148,7 +203,7 @@ void MDSTableServer::handle_commit(const cref_t<MMDSTableRequest> &req)
     projected_version++;
     committing_tids.insert(tid);
 
-    mds->mdlog->start_submit_entry(new ETableServer(table, TABLESERVER_OP_COMMIT, 0, MDS_RANK_NONE, 
+    mds->mdlog->submit_entry(new ETableServer(table, TABLESERVER_OP_COMMIT, 0, MDS_RANK_NONE, 
 						    tid, projected_version),
 				   new C_Commit(this, req));
   }
@@ -206,7 +261,7 @@ void MDSTableServer::handle_rollback(const cref_t<MMDSTableRequest> &req)
   projected_version++;
   committing_tids.insert(tid);
 
-  mds->mdlog->start_submit_entry(new ETableServer(table, TABLESERVER_OP_ROLLBACK, 0, MDS_RANK_NONE,
+  mds->mdlog->submit_entry(new ETableServer(table, TABLESERVER_OP_ROLLBACK, 0, MDS_RANK_NONE,
 						  tid, projected_version),
 				 new C_Rollback(this, req));
 }
@@ -245,7 +300,6 @@ void MDSTableServer::do_server_update(bufferlist& bl)
   projected_version++;
 
   ETableServer *le = new ETableServer(table, TABLESERVER_OP_SERVER_UPDATE, 0, MDS_RANK_NONE, 0, projected_version);
-  mds->mdlog->start_entry(le);
   le->mutation = bl;
   mds->mdlog->submit_entry(le, new C_ServerUpdate(this, bl));
 }
@@ -293,6 +347,16 @@ void MDSTableServer::_do_server_recovery()
     mds->send_message_mds(reply, p);
   }
   recovered = true;
+}
+
+void MDSTableServer::encode_state(bufferlist& bl) const {
+  encode_server_state(bl);
+  encode(pending_for_mds, bl);
+}
+
+void MDSTableServer::decode_state(bufferlist::const_iterator& bl) {
+  decode_server_state(bl);
+  decode(pending_for_mds, bl);
 }
 
 void MDSTableServer::finish_recovery(set<mds_rank_t>& active)

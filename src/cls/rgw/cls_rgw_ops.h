@@ -7,9 +7,7 @@
 
 struct rgw_cls_tag_timeout_op
 {
-  uint64_t tag_timeout;
-
-  rgw_cls_tag_timeout_op() : tag_timeout(0) {}
+  uint64_t tag_timeout = 0;
 
   void encode(ceph::buffer::list &bl) const {
     ENCODE_START(1, 1, bl);
@@ -22,7 +20,7 @@ struct rgw_cls_tag_timeout_op
     DECODE_FINISH(bl);
   }
   void dump(ceph::Formatter *f) const;
-  static void generate_test_instances(std::list<rgw_cls_tag_timeout_op*>& ls);
+  static std::list<rgw_cls_tag_timeout_op> generate_test_instances();
 };
 WRITE_CLASS_ENCODER(rgw_cls_tag_timeout_op)
 
@@ -32,11 +30,11 @@ struct rgw_cls_obj_prepare_op
   cls_rgw_obj_key key;
   std::string tag;
   std::string locator;
-  bool log_op;
-  uint16_t bilog_flags;
-  rgw_zone_set zones_trace;
+  bool log_op{false}; // i'm useless, but i'm here for compatibility
+  uint16_t bilog_flags{0}; // i'm useless, but i'm here for compatibility
+  rgw_zone_set zones_trace; // i'm useless, but i'm here for compatibility
 
-  rgw_cls_obj_prepare_op() : op(CLS_RGW_OP_UNKNOWN), log_op(false), bilog_flags(0) {}
+  rgw_cls_obj_prepare_op() : op(CLS_RGW_OP_UNKNOWN) {}
 
   void encode(ceph::buffer::list &bl) const {
     ENCODE_START(7, 5, bl);
@@ -77,7 +75,7 @@ struct rgw_cls_obj_prepare_op
     DECODE_FINISH(bl);
   }
   void dump(ceph::Formatter *f) const;
-  static void generate_test_instances(std::list<rgw_cls_obj_prepare_op*>& o);
+  static std::list<rgw_cls_obj_prepare_op> generate_test_instances();
 };
 WRITE_CLASS_ENCODER(rgw_cls_obj_prepare_op)
 
@@ -160,7 +158,7 @@ struct rgw_cls_obj_complete_op
     DECODE_FINISH(bl);
   }
   void dump(ceph::Formatter *f) const;
-  static void generate_test_instances(std::list<rgw_cls_obj_complete_op*>& o);
+  static std::list<rgw_cls_obj_complete_op> generate_test_instances();
 };
 WRITE_CLASS_ENCODER(rgw_cls_obj_complete_op)
 
@@ -226,7 +224,7 @@ struct rgw_cls_link_olh_op {
     DECODE_FINISH(bl);
   }
 
-  static void generate_test_instances(std::list<rgw_cls_link_olh_op *>& o);
+  static std::list<rgw_cls_link_olh_op> generate_test_instances();
   void dump(ceph::Formatter *f) const;
 };
 WRITE_CLASS_ENCODER(rgw_cls_link_olh_op)
@@ -234,9 +232,16 @@ WRITE_CLASS_ENCODER(rgw_cls_link_olh_op)
 struct rgw_cls_unlink_instance_op {
   cls_rgw_obj_key key;
   std::string op_tag;
+  // this represents a remote epoch during multisite sync
   uint64_t olh_epoch;
   bool log_op;
   uint16_t bilog_flags;
+  // cls ops include olh_tag so the OLH class code can guard sensitive updates—only proceed if op.olh_tag equals
+  // the OLH’s stored tag. If it doesn’t, the op fails and the caller refreshes state/retries.
+  // for context: in real clusters, out‑of‑order replication or topology changes can recreate/move an OLH
+  // (eg, resharding or certain multisite flows). The tag changes with that new OLH “generation,” so stale
+  // writers carrying the old tag get refused instead of overwriting the new state. A concrete example of failures
+  // tied to OLH attributes shows how wrong attributes/tags cause bad GET behavior, which is why the guard exists.
   std::string olh_tag;
   rgw_zone_set zones_trace;
 
@@ -270,7 +275,7 @@ struct rgw_cls_unlink_instance_op {
     DECODE_FINISH(bl);
   }
 
-  static void generate_test_instances(std::list<rgw_cls_unlink_instance_op *>& o);
+  static std::list<rgw_cls_unlink_instance_op> generate_test_instances();
   void dump(ceph::Formatter *f) const;
 };
 WRITE_CLASS_ENCODER(rgw_cls_unlink_instance_op)
@@ -297,7 +302,7 @@ struct rgw_cls_read_olh_log_op
     decode(olh_tag, bl);
     DECODE_FINISH(bl);
   }
-  static void generate_test_instances(std::list<rgw_cls_read_olh_log_op *>& o);
+  static std::list<rgw_cls_read_olh_log_op> generate_test_instances();
   void dump(ceph::Formatter *f) const;
 };
 WRITE_CLASS_ENCODER(rgw_cls_read_olh_log_op)
@@ -322,7 +327,7 @@ struct rgw_cls_read_olh_log_ret
     decode(is_truncated, bl);
     DECODE_FINISH(bl);
   }
-  static void generate_test_instances(std::list<rgw_cls_read_olh_log_ret *>& o);
+  static std::list<rgw_cls_read_olh_log_ret> generate_test_instances();
   void dump(ceph::Formatter *f) const;
 };
 WRITE_CLASS_ENCODER(rgw_cls_read_olh_log_ret)
@@ -349,7 +354,7 @@ struct rgw_cls_trim_olh_log_op
     decode(olh_tag, bl);
     DECODE_FINISH(bl);
   }
-  static void generate_test_instances(std::list<rgw_cls_trim_olh_log_op *>& o);
+  static std::list<rgw_cls_trim_olh_log_op> generate_test_instances();
   void dump(ceph::Formatter *f) const;
 };
 WRITE_CLASS_ENCODER(rgw_cls_trim_olh_log_op)
@@ -374,7 +379,7 @@ struct rgw_cls_bucket_clear_olh_op {
     DECODE_FINISH(bl);
   }
 
-  static void generate_test_instances(std::list<rgw_cls_bucket_clear_olh_op *>& o);
+  static std::list<rgw_cls_bucket_clear_olh_op> generate_test_instances();
   void dump(ceph::Formatter *f) const;
 };
 WRITE_CLASS_ENCODER(rgw_cls_bucket_clear_olh_op)
@@ -419,7 +424,7 @@ struct rgw_cls_list_op
     DECODE_FINISH(bl);
   }
   void dump(ceph::Formatter *f) const;
-  static void generate_test_instances(std::list<rgw_cls_list_op*>& o);
+  static std::list<rgw_cls_list_op> generate_test_instances();
 };
 WRITE_CLASS_ENCODER(rgw_cls_list_op)
 
@@ -430,7 +435,7 @@ struct rgw_cls_list_ret {
   // if is_truncated is true, starting marker for next iteration; this
   // is necessary as it's possible after maximum number of tries we
   // still might have zero entries to return, in which case we have to
-  // at least move the ball foward
+  // at least move the ball forward
   cls_rgw_obj_key marker;
 
   // cls_filtered is not transmitted; it is assumed true for versions
@@ -461,7 +466,7 @@ struct rgw_cls_list_ret {
     DECODE_FINISH(bl);
   }
   void dump(ceph::Formatter *f) const;
-  static void generate_test_instances(std::list<rgw_cls_list_ret*>& o);
+  static std::list<rgw_cls_list_ret> generate_test_instances();
 };
 WRITE_CLASS_ENCODER(rgw_cls_list_ret)
 
@@ -485,7 +490,7 @@ struct rgw_cls_check_index_ret
     DECODE_FINISH(bl);
   }
   void dump(ceph::Formatter *f) const;
-  static void generate_test_instances(std::list<rgw_cls_check_index_ret *>& o);
+  static std::list<rgw_cls_check_index_ret> generate_test_instances();
 };
 WRITE_CLASS_ENCODER(rgw_cls_check_index_ret)
 
@@ -493,23 +498,27 @@ struct rgw_cls_bucket_update_stats_op
 {
   bool absolute{false};
   std::map<RGWObjCategory, rgw_bucket_category_stats> stats;
+  std::map<RGWObjCategory, rgw_bucket_category_stats> dec_stats;
 
   rgw_cls_bucket_update_stats_op() {}
 
   void encode(ceph::buffer::list &bl) const {
-    ENCODE_START(1, 1, bl);
+    ENCODE_START(2, 1, bl);
     encode(absolute, bl);
     encode(stats, bl);
+    encode(dec_stats, bl);
     ENCODE_FINISH(bl);
   }
   void decode(ceph::buffer::list::const_iterator &bl) {
-    DECODE_START(1, bl);
+    DECODE_START(2, bl);
     decode(absolute, bl);
     decode(stats, bl);
+    if (struct_v >= 2)
+      decode(dec_stats, bl);
     DECODE_FINISH(bl);
   }
   void dump(ceph::Formatter *f) const;
-  static void generate_test_instances(std::list<rgw_cls_bucket_update_stats_op *>& o);
+  static std::list<rgw_cls_bucket_update_stats_op> generate_test_instances();
 };
 WRITE_CLASS_ENCODER(rgw_cls_bucket_update_stats_op)
 
@@ -527,6 +536,19 @@ struct rgw_cls_obj_remove_op {
     decode(keep_attr_prefixes, bl);
     DECODE_FINISH(bl);
   }
+
+  void dump(ceph::Formatter *f) const {
+    encode_json("keep_attr_prefixes", keep_attr_prefixes, f);
+  }
+
+  static std::list<rgw_cls_obj_remove_op> generate_test_instances() {
+    std::list<rgw_cls_obj_remove_op> o;
+    o.emplace_back();
+    o.back().keep_attr_prefixes.push_back("keep_attr_prefixes1");
+    o.back().keep_attr_prefixes.push_back("keep_attr_prefixes2");
+    o.back().keep_attr_prefixes.push_back("keep_attr_prefixes3");
+    return o;
+  }
 };
 WRITE_CLASS_ENCODER(rgw_cls_obj_remove_op)
 
@@ -543,6 +565,17 @@ struct rgw_cls_obj_store_pg_ver_op {
     DECODE_START(1, bl);
     decode(attr, bl);
     DECODE_FINISH(bl);
+  }
+
+  void dump(ceph::Formatter *f) const {
+    f->dump_string("attr", attr);
+  }
+
+  static std::list<rgw_cls_obj_store_pg_ver_op> generate_test_instances() {
+    std::list<rgw_cls_obj_store_pg_ver_op> o;
+    o.emplace_back();
+    o.back().attr = "attr";
+    return o;
   }
 };
 WRITE_CLASS_ENCODER(rgw_cls_obj_store_pg_ver_op)
@@ -565,6 +598,19 @@ struct rgw_cls_obj_check_attrs_prefix {
     decode(check_prefix, bl);
     decode(fail_if_exist, bl);
     DECODE_FINISH(bl);
+  }
+
+  void dump(ceph::Formatter *f) const {
+    f->dump_string("check_prefix", check_prefix);
+    f->dump_bool("fail_if_exist", fail_if_exist);
+  }
+
+  static std::list<rgw_cls_obj_check_attrs_prefix> generate_test_instances() {
+    std::list<rgw_cls_obj_check_attrs_prefix> o;
+    o.emplace_back();
+    o.back().check_prefix = "prefix";
+    o.back().fail_if_exist = true;
+    return o;
   }
 };
 WRITE_CLASS_ENCODER(rgw_cls_obj_check_attrs_prefix)
@@ -619,6 +665,17 @@ struct rgw_cls_usage_log_add_op {
     }
     DECODE_FINISH(bl);
   }
+
+  void dump(ceph::Formatter *f) const {
+    f->dump_object("info", info);
+    f->dump_string("user", user.to_str());
+  }
+
+  static std::list<rgw_cls_usage_log_add_op> generate_test_instances() {
+    std::list<rgw_cls_usage_log_add_op> o;
+    o.emplace_back();
+    return o;
+  }
 };
 WRITE_CLASS_ENCODER(rgw_cls_usage_log_add_op)
 
@@ -643,6 +700,21 @@ struct rgw_cls_bi_get_op {
     type = (BIIndexType)c;
     DECODE_FINISH(bl);
   }
+
+  void dump(ceph::Formatter *f) const {
+    f->dump_stream("key") << key;
+    f->dump_int("type", (int)type);
+  }
+
+  static std::list<rgw_cls_bi_get_op> generate_test_instances() {
+    std::list<rgw_cls_bi_get_op> o;
+    o.emplace_back();
+    o.emplace_back();
+    o.back().key.name = "key";
+    o.back().key.instance = "instance";
+    o.back().type = BIIndexType::Plain;
+    return o;
+  }
 };
 WRITE_CLASS_ENCODER(rgw_cls_bi_get_op)
 
@@ -661,6 +733,17 @@ struct rgw_cls_bi_get_ret {
     DECODE_START(1, bl);
     decode(entry, bl);
     DECODE_FINISH(bl);
+  }
+
+  void dump(ceph::Formatter *f) const {
+    f->dump_string("entry", entry.idx);
+  }
+
+  static std::list<rgw_cls_bi_get_ret> generate_test_instances() {
+    std::list<rgw_cls_bi_get_ret> o;
+    o.emplace_back();
+    o.back().entry.idx = "entry";
+    return o;
   }
 };
 WRITE_CLASS_ENCODER(rgw_cls_bi_get_ret)
@@ -681,30 +764,96 @@ struct rgw_cls_bi_put_op {
     decode(entry, bl);
     DECODE_FINISH(bl);
   }
+
+  void dump(ceph::Formatter *f) const {
+    f->dump_string("entry", entry.idx);
+  }
+
+  static std::list<rgw_cls_bi_put_op> generate_test_instances() {
+    std::list<rgw_cls_bi_put_op> o;
+    o.emplace_back();
+    o.emplace_back();
+    o.back().entry.idx = "entry";
+    return o;
+  }
 };
 WRITE_CLASS_ENCODER(rgw_cls_bi_put_op)
 
-struct rgw_cls_bi_list_op {
-  uint32_t max;
-  std::string name_filter; // limit resultto one object and its instances
-  std::string marker;
-
-  rgw_cls_bi_list_op() : max(0) {}
+struct rgw_cls_bi_put_entries_op {
+  std::vector<rgw_cls_bi_entry> entries;
+  bool check_existing = false;
 
   void encode(ceph::buffer::list& bl) const {
     ENCODE_START(1, 1, bl);
-    encode(max, bl);
-    encode(name_filter, bl);
-    encode(marker, bl);
+    encode(entries, bl);
+    encode(check_existing, bl);
     ENCODE_FINISH(bl);
   }
 
   void decode(ceph::buffer::list::const_iterator& bl) {
     DECODE_START(1, bl);
+    decode(entries, bl);
+    decode(check_existing, bl);
+    DECODE_FINISH(bl);
+  }
+
+  void dump(ceph::Formatter *f) const;
+
+  static std::list<rgw_cls_bi_put_entries_op> generate_test_instances() {
+    std::list<rgw_cls_bi_put_entries_op> o;
+    o.emplace_back();
+    o.emplace_back();
+    o.back().entries.push_back({.idx = "entry"});
+    o.back().check_existing = true;
+    return o;
+  }
+};
+WRITE_CLASS_ENCODER(rgw_cls_bi_put_entries_op)
+
+struct rgw_cls_bi_list_op {
+  uint32_t max;
+  std::string name_filter; // limit result to one object and its instances
+  std::string marker;
+  bool reshardlog;
+
+  rgw_cls_bi_list_op() : max(0), reshardlog(false) {}
+
+  void encode(ceph::buffer::list& bl) const {
+    ENCODE_START(2, 1, bl);
+    encode(max, bl);
+    encode(name_filter, bl);
+    encode(marker, bl);
+    encode(reshardlog, bl);
+    ENCODE_FINISH(bl);
+  }
+
+  void decode(ceph::buffer::list::const_iterator& bl) {
+    DECODE_START(2, bl);
     decode(max, bl);
     decode(name_filter, bl);
     decode(marker, bl);
+    if (struct_v >= 2) {
+      decode(reshardlog, bl);
+    }
     DECODE_FINISH(bl);
+  }
+
+  void dump(ceph::Formatter *f) const {
+    f->dump_unsigned("max", max);
+    f->dump_string("name_filter", name_filter);
+    f->dump_string("marker", marker);
+    f->dump_bool("reshardlog", reshardlog);
+  }
+
+  static std::list<rgw_cls_bi_list_op> generate_test_instances() {
+    std::list<rgw_cls_bi_list_op> o;
+    o.emplace_back();
+    o.emplace_back();
+    o.back().max = 100;
+    o.back().name_filter = "name_filter";
+    o.back().marker = "marker";
+    o.back().reshardlog = true;
+    return o;
   }
 };
 WRITE_CLASS_ENCODER(rgw_cls_bi_list_op)
@@ -727,6 +876,22 @@ struct rgw_cls_bi_list_ret {
     decode(entries, bl);
     decode(is_truncated, bl);
     DECODE_FINISH(bl);
+  }
+
+  void dump(ceph::Formatter *f) const {
+    f->dump_bool("is_truncated", is_truncated);
+    encode_json("entries", entries, f);
+  }
+
+  static std::list<rgw_cls_bi_list_ret> generate_test_instances() {
+    std::list<rgw_cls_bi_list_ret> o;
+    o.emplace_back();
+    o.emplace_back();
+    o.back().entries.push_back(rgw_cls_bi_entry());
+    o.back().entries.push_back(rgw_cls_bi_entry());
+    o.back().entries.back().idx = "entry";
+    o.back().is_truncated = true;
+    return o;
   }
 };
 WRITE_CLASS_ENCODER(rgw_cls_bi_list_ret)
@@ -763,6 +928,27 @@ struct rgw_cls_usage_log_read_op {
     }
     DECODE_FINISH(bl);
   }
+
+  void dump(ceph::Formatter *f) const {
+    f->dump_unsigned("start_epoch", start_epoch);
+    f->dump_unsigned("end_epoch", end_epoch);
+    f->dump_string("owner", owner);
+    f->dump_string("bucket", bucket);
+    f->dump_string("iter", iter);
+    f->dump_unsigned("max_entries", max_entries);
+  }
+
+  static std::list<rgw_cls_usage_log_read_op> generate_test_instances() {
+    std::list<rgw_cls_usage_log_read_op> o;
+    o.emplace_back();
+    o.back().start_epoch = 1;
+    o.back().end_epoch = 2;
+    o.back().owner = "owner";
+    o.back().bucket = "bucket";
+    o.back().iter = "iter";
+    o.back().max_entries = 100;
+    return o;
+  }
 };
 WRITE_CLASS_ENCODER(rgw_cls_usage_log_read_op)
 
@@ -785,6 +971,26 @@ struct rgw_cls_usage_log_read_ret {
     decode(truncated, bl);
     decode(next_iter, bl);
     DECODE_FINISH(bl);
+  }
+
+  void dump(ceph::Formatter *f) const {
+    f->dump_bool("truncated", truncated);
+    f->dump_string("next_iter", next_iter);
+    encode_json("usage", usage, f);
+  }
+
+  static std::list<rgw_cls_usage_log_read_ret> generate_test_instances() {
+    std::list<rgw_cls_usage_log_read_ret> o;
+    o.emplace_back();
+    o.back().next_iter = "123";
+    o.back().truncated = true;
+    o.back().usage.clear();
+    o.emplace_back();
+    o.back().usage[rgw_user_bucket("user1", "bucket1")] = rgw_usage_log_entry();
+    o.back().usage[rgw_user_bucket("user2", "bucket2")] = rgw_usage_log_entry();
+    o.back().truncated = true;
+    o.back().next_iter = "next_iter";
+    return o;
   }
 };
 WRITE_CLASS_ENCODER(rgw_cls_usage_log_read_ret)
@@ -814,6 +1020,24 @@ struct rgw_cls_usage_log_trim_op {
     }
     DECODE_FINISH(bl);
   }
+
+  void dump(ceph::Formatter *f) const {
+    f->dump_unsigned("start_epoch", start_epoch);
+    f->dump_unsigned("end_epoch", end_epoch);
+    f->dump_string("user", user);
+    f->dump_string("bucket", bucket);
+  }
+
+  static std::list<rgw_cls_usage_log_trim_op> generate_test_instances() {
+    std::list<rgw_cls_usage_log_trim_op> ls;
+    rgw_cls_usage_log_trim_op m;
+    m.start_epoch = 1;
+    m.end_epoch = 2;
+    m.user = "user";
+    m.bucket = "bucket";
+    ls.push_back(std::move(m));
+    return ls;
+  }
 };
 WRITE_CLASS_ENCODER(rgw_cls_usage_log_trim_op)
 
@@ -837,7 +1061,7 @@ struct cls_rgw_gc_set_entry_op {
   }
 
   void dump(ceph::Formatter *f) const;
-  static void generate_test_instances(std::list<cls_rgw_gc_set_entry_op*>& ls);
+  static std::list<cls_rgw_gc_set_entry_op> generate_test_instances();
 
   size_t estimate_encoded_size() const {
     constexpr size_t start_overhead = sizeof(__u8) + sizeof(__u8) + sizeof(ceph_le32); // version and length prefix
@@ -867,7 +1091,7 @@ struct cls_rgw_gc_defer_entry_op {
   }
 
   void dump(ceph::Formatter *f) const;
-  static void generate_test_instances(std::list<cls_rgw_gc_defer_entry_op*>& ls);
+  static std::list<cls_rgw_gc_defer_entry_op> generate_test_instances();
 };
 WRITE_CLASS_ENCODER(cls_rgw_gc_defer_entry_op)
 
@@ -897,7 +1121,7 @@ struct cls_rgw_gc_list_op {
   }
 
   void dump(ceph::Formatter *f) const;
-  static void generate_test_instances(std::list<cls_rgw_gc_list_op*>& ls);
+  static std::list<cls_rgw_gc_list_op> generate_test_instances();
 };
 WRITE_CLASS_ENCODER(cls_rgw_gc_list_op)
 
@@ -926,7 +1150,7 @@ struct cls_rgw_gc_list_ret {
   }
 
   void dump(ceph::Formatter *f) const;
-  static void generate_test_instances(std::list<cls_rgw_gc_list_ret*>& ls);
+  static std::list<cls_rgw_gc_list_ret> generate_test_instances();
 };
 WRITE_CLASS_ENCODER(cls_rgw_gc_list_ret)
 
@@ -948,7 +1172,7 @@ struct cls_rgw_gc_remove_op {
   }
 
   void dump(ceph::Formatter *f) const;
-  static void generate_test_instances(std::list<cls_rgw_gc_remove_op*>& ls);
+  static std::list<cls_rgw_gc_remove_op> generate_test_instances();
 };
 WRITE_CLASS_ENCODER(cls_rgw_gc_remove_op)
 
@@ -973,7 +1197,7 @@ struct cls_rgw_bi_log_list_op {
   }
 
   void dump(ceph::Formatter *f) const;
-  static void generate_test_instances(std::list<cls_rgw_bi_log_list_op*>& ls);
+  static std::list<cls_rgw_bi_log_list_op> generate_test_instances();
 };
 WRITE_CLASS_ENCODER(cls_rgw_bi_log_list_op)
 
@@ -998,7 +1222,7 @@ struct cls_rgw_bi_log_trim_op {
   }
 
   void dump(ceph::Formatter *f) const;
-  static void generate_test_instances(std::list<cls_rgw_bi_log_trim_op*>& ls);
+  static std::list<cls_rgw_bi_log_trim_op> generate_test_instances();
 };
 WRITE_CLASS_ENCODER(cls_rgw_bi_log_trim_op)
 
@@ -1023,7 +1247,7 @@ struct cls_rgw_bi_log_list_ret {
   }
 
   void dump(ceph::Formatter *f) const;
-  static void generate_test_instances(std::list<cls_rgw_bi_log_list_ret*>& ls);
+  static std::list<cls_rgw_bi_log_list_ret> generate_test_instances();
 };
 WRITE_CLASS_ENCODER(cls_rgw_bi_log_list_ret)
 
@@ -1125,7 +1349,7 @@ struct cls_rgw_lc_get_entry_ret {
     DECODE_FINISH(bl);
   }
   void dump(ceph::Formatter *f) const;
-  static void generate_test_instances(std::list<cls_rgw_lc_get_entry_ret*>& ls);
+  static std::list<cls_rgw_lc_get_entry_ret> generate_test_instances();
 };
 WRITE_CLASS_ENCODER(cls_rgw_lc_get_entry_ret)
 
@@ -1173,6 +1397,22 @@ struct cls_rgw_lc_set_entry_op {
       decode(entry, bl);
     }
     DECODE_FINISH(bl);
+  }
+
+  void dump(ceph::Formatter *f) const {
+    f->dump_string("bucket", entry.bucket);
+    f->dump_int("start_time", entry.start_time);
+    f->dump_int("status", entry.status);
+  }
+
+  static std::list<cls_rgw_lc_set_entry_op> generate_test_instances() {
+    std::list<cls_rgw_lc_set_entry_op> ls;
+    ls.emplace_back();
+    ls.emplace_back();
+    ls.back().entry.bucket = "foo";
+    ls.back().entry.start_time = 123;
+    ls.back().entry.status = 456;
+    return ls;
   }
 };
 WRITE_CLASS_ENCODER(cls_rgw_lc_set_entry_op)
@@ -1287,23 +1527,56 @@ cls_rgw_lc_list_entries_ret(uint8_t compat_v = 3)
 };
 WRITE_CLASS_ENCODER(cls_rgw_lc_list_entries_ret)
 
+struct cls_rgw_mp_upload_part_info_update_op {
+  std::string part_key;
+  RGWUploadPartInfo info;
+
+  cls_rgw_mp_upload_part_info_update_op() {}
+
+  void encode(buffer::list& bl) const {
+    ENCODE_START(1, 1, bl);
+    encode(part_key, bl);
+    encode(info, bl);
+    ENCODE_FINISH(bl);
+  }
+
+  void decode(buffer::list::const_iterator& bl) {
+    DECODE_START(1, bl);
+    decode(part_key, bl);
+    decode(info, bl);
+    DECODE_FINISH(bl);
+  }
+
+  static std::list<cls_rgw_mp_upload_part_info_update_op> generate_test_instances();
+  void dump(Formatter* f) const;
+};
+WRITE_CLASS_ENCODER(cls_rgw_mp_upload_part_info_update_op)
+
 struct cls_rgw_reshard_add_op {
- cls_rgw_reshard_entry entry;
+  cls_rgw_reshard_entry entry;
+
+  // true -> will not overwrite existing entry
+  bool create_only {false};
 
   cls_rgw_reshard_add_op() {}
 
   void encode(ceph::buffer::list& bl) const {
-    ENCODE_START(1, 1, bl);
+    ENCODE_START(2, 1, bl);
     encode(entry, bl);
+    encode(create_only, bl);
     ENCODE_FINISH(bl);
   }
 
   void decode(ceph::buffer::list::const_iterator& bl) {
-    DECODE_START(1, bl);
+    DECODE_START(2, bl);
     decode(entry, bl);
+    create_only = false;
+    if (struct_v >= 2) {
+      decode(create_only, bl);
+    }
     DECODE_FINISH(bl);
   }
-  static void generate_test_instances(std::list<cls_rgw_reshard_add_op*>& o);
+  static std::list<cls_rgw_reshard_add_op> generate_test_instances();
   void dump(ceph::Formatter *f) const;
 };
 WRITE_CLASS_ENCODER(cls_rgw_reshard_add_op)
@@ -1327,7 +1600,7 @@ struct cls_rgw_reshard_list_op {
     decode(marker, bl);
     DECODE_FINISH(bl);
   }
-  static void generate_test_instances(std::list<cls_rgw_reshard_list_op*>& o);
+  static std::list<cls_rgw_reshard_list_op> generate_test_instances();
   void dump(ceph::Formatter *f) const;
 };
 WRITE_CLASS_ENCODER(cls_rgw_reshard_list_op)
@@ -1352,7 +1625,7 @@ struct cls_rgw_reshard_list_ret {
     decode(is_truncated, bl);
     DECODE_FINISH(bl);
   }
-  static void generate_test_instances(std::list<cls_rgw_reshard_list_ret*>& o);
+  static std::list<cls_rgw_reshard_list_ret> generate_test_instances();
   void dump(ceph::Formatter *f) const;
 };
 WRITE_CLASS_ENCODER(cls_rgw_reshard_list_ret)
@@ -1373,7 +1646,7 @@ struct cls_rgw_reshard_get_op {
     decode(entry, bl);
     DECODE_FINISH(bl);
   }
-  static void generate_test_instances(std::list<cls_rgw_reshard_get_op*>& o);
+  static std::list<cls_rgw_reshard_get_op> generate_test_instances();
   void dump(ceph::Formatter *f) const;
 };
 WRITE_CLASS_ENCODER(cls_rgw_reshard_get_op)
@@ -1394,7 +1667,7 @@ struct cls_rgw_reshard_get_ret {
     decode(entry, bl);
     DECODE_FINISH(bl);
   }
-  static void generate_test_instances(std::list<cls_rgw_reshard_get_ret*>& o);
+  static std::list<cls_rgw_reshard_get_ret> generate_test_instances();
   void dump(ceph::Formatter *f) const;
 };
 WRITE_CLASS_ENCODER(cls_rgw_reshard_get_ret)
@@ -1421,7 +1694,7 @@ struct cls_rgw_reshard_remove_op {
     decode(bucket_id, bl);
     DECODE_FINISH(bl);
   }
-  static void generate_test_instances(std::list<cls_rgw_reshard_remove_op*>& o);
+  static std::list<cls_rgw_reshard_remove_op> generate_test_instances();
   void dump(ceph::Formatter *f) const;
 };
 WRITE_CLASS_ENCODER(cls_rgw_reshard_remove_op)
@@ -1440,7 +1713,7 @@ struct cls_rgw_set_bucket_resharding_op  {
     decode(entry, bl);
     DECODE_FINISH(bl);
   }
-  static void generate_test_instances(std::list<cls_rgw_set_bucket_resharding_op*>& o);
+  static std::list<cls_rgw_set_bucket_resharding_op> generate_test_instances();
   void dump(ceph::Formatter *f) const;
 };
 WRITE_CLASS_ENCODER(cls_rgw_set_bucket_resharding_op)
@@ -1455,7 +1728,7 @@ struct cls_rgw_clear_bucket_resharding_op {
     DECODE_START(1, bl);
     DECODE_FINISH(bl);
   }
-  static void generate_test_instances(std::list<cls_rgw_clear_bucket_resharding_op*>& o);
+  static std::list<cls_rgw_clear_bucket_resharding_op>generate_test_instances();
   void dump(ceph::Formatter *f) const;
 };
 WRITE_CLASS_ENCODER(cls_rgw_clear_bucket_resharding_op)
@@ -1475,7 +1748,7 @@ struct cls_rgw_guard_bucket_resharding_op  {
     DECODE_FINISH(bl);
   }
 
-  static void generate_test_instances(std::list<cls_rgw_guard_bucket_resharding_op*>& o);
+  static std::list<cls_rgw_guard_bucket_resharding_op>generate_test_instances();
   void dump(ceph::Formatter *f) const;
 };
 WRITE_CLASS_ENCODER(cls_rgw_guard_bucket_resharding_op)
@@ -1492,7 +1765,7 @@ struct cls_rgw_get_bucket_resharding_op  {
     DECODE_FINISH(bl);
   }
 
-  static void generate_test_instances(std::list<cls_rgw_get_bucket_resharding_op*>& o);
+  static std::list<cls_rgw_get_bucket_resharding_op>generate_test_instances();
   void dump(ceph::Formatter *f) const;
 };
 WRITE_CLASS_ENCODER(cls_rgw_get_bucket_resharding_op)
@@ -1512,7 +1785,7 @@ struct cls_rgw_get_bucket_resharding_ret  {
     DECODE_FINISH(bl);
   }
 
-  static void generate_test_instances(std::list<cls_rgw_get_bucket_resharding_ret*>& o);
+  static std::list<cls_rgw_get_bucket_resharding_ret>generate_test_instances();
   void dump(ceph::Formatter *f) const;
 };
 WRITE_CLASS_ENCODER(cls_rgw_get_bucket_resharding_ret)

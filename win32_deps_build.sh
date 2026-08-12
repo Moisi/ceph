@@ -1,30 +1,28 @@
 #!/usr/bin/env bash
 
-set -e
+set -eu
 
 SCRIPT_DIR="$(dirname "$BASH_SOURCE")"
 SCRIPT_DIR="$(realpath "$SCRIPT_DIR")"
 
-num_vcpus=$(nproc)
-NUM_WORKERS=${NUM_WORKERS:-$num_vcpus}
-
-DEPS_DIR="${DEPS_DIR:-$SCRIPT_DIR/build.deps}"
 depsSrcDir="$DEPS_DIR/src"
 depsToolsetDir="$DEPS_DIR/mingw"
 
 lz4SrcDir="${depsSrcDir}/lz4"
 lz4Dir="${depsToolsetDir}/lz4"
 lz4Tag="v1.9.2"
-sslTag="OpenSSL_1_1_1c"
+sslTag="openssl-3.0.16"
 sslDir="${depsToolsetDir}/openssl"
 sslSrcDir="${depsSrcDir}/openssl"
 
 # For now, we'll keep the version number within the file path when not using git.
-boostUrl="https://boostorg.jfrog.io/artifactory/main/release/1.79.0/source/boost_1_79_0.tar.gz"
-boostSrcDir="${depsSrcDir}/boost_1_79_0"
+boostUrl="https://download.ceph.com/qa/boost_1_87_0.tar.bz2"
+boostSha256Sum="af57be25cb4c4f4b413ed692fe378affb4352ea50fbe294a11ef548f4d527d89"
+boostSrcDir="${depsSrcDir}/boost_1_87_0"
 boostDir="${depsToolsetDir}/boost"
 zlibDir="${depsToolsetDir}/zlib"
 zlibSrcDir="${depsSrcDir}/zlib"
+zlibTag="v1.3.1"
 backtraceDir="${depsToolsetDir}/libbacktrace"
 backtraceSrcDir="${depsSrcDir}/libbacktrace"
 snappySrcDir="${depsSrcDir}/snappy"
@@ -43,10 +41,14 @@ dokanTag="v2.0.5.1000"
 dokanSrcDir="${depsSrcDir}/dokany"
 dokanLibDir="${depsToolsetDir}/dokany/lib"
 
-# Allow for OS specific customizations through the OS flag (normally
-# passed through from win32_build).
-# Valid options are currently "ubuntu", "rhel", and "suse".
-OS=${OS:-"ubuntu"}
+libicuUrl="https://github.com/unicode-org/icu"
+libicuTag="release-76-1"
+libicuSrcDir="${depsSrcDir}/icu"
+libicuLibDir="${depsToolsetDir}/libicu"
+
+mingwLlvmUrl="https://github.com/mstorsjo/llvm-mingw/releases/download/20230320/llvm-mingw-20230320-ucrt-ubuntu-18.04-x86_64.tar.xz"
+mingwLlvmSha256Sum="bc367753dea829d219be32e2e64e2d15d03158ce8e700ae5210ca3d78e6a07ea"
+mingwLlvmDir="${DEPS_DIR}/mingw-llvm"
 
 function _make() {
   make -j $NUM_WORKERS $@
@@ -74,7 +76,8 @@ case "$OS" in
             libtool \
             ninja-build \
             zip \
-            python3-Cython \
+            bzip2 \
+            xz \
             python3-PyYAML \
             gcc \
             diffutils \
@@ -86,20 +89,36 @@ case "$OS" in
     ubuntu)
         sudo apt-get update
         sudo env DEBIAN_FRONTEND=noninteractive apt-get -y install \
-            mingw-w64 cmake pkg-config \
-            python3-dev python3-pip python3-yaml \
-                autoconf libtool ninja-build wget zip
-        sudo python3 -m pip install cython
+            mingw-w64 g++ cmake pkg-config \
+            python3-dev python3-yaml \
+                autoconf libtool ninja-build wget xz-utils zip bzip2 \
+                git
         ;;
     suse)
         for PKG in mingw64-cross-gcc-c++ mingw64-libgcc_s_seh1 mingw64-libstdc++6 \
-                cmake pkgconf python3-devel autoconf libtool ninja zip \
-                python3-Cython python3-PyYAML \
+                cmake pkgconf python3-devel autoconf libtool ninja xz zip bzip2 \
+                python3-PyYAML \
                 gcc patch wget git; do
             rpm -q $PKG >/dev/null || zypper -n install $PKG
         done
         ;;
 esac
+
+if [[ -n $USE_MINGW_LLVM && ! -d $mingwLlvmDir ]]; then
+    echo "Fetching mingw-llvm"
+    cd $DEPS_DIR
+    wget -q -O mingw-llvm.tar.xz $mingwLlvmUrl
+    checksum=`sha256sum mingw-llvm.tar.xz | cut -d ' ' -f 1`
+    if [[ "$mingwLlvmSha256Sum" != "$checksum" ]]; then
+        echo "Invalid mingw-llvm checksum: $checksum" >&2
+        exit 1
+    fi
+    tar xJf mingw-llvm.tar.xz
+    rm mingw-llvm.tar.xz
+    # Remove the version from the mingw-llvm dirname, making it easier to locate
+    # and avoiding MAX_PATH issues with WSL.
+    mv `basename $mingwLlvmUrl | sed 's/\.tar\..*//g'` $mingwLlvmDir
+fi
 
 MINGW_CMAKE_FILE="$DEPS_DIR/mingw.cmake"
 source "$SCRIPT_DIR/mingw_conf.sh"
@@ -107,7 +126,7 @@ source "$SCRIPT_DIR/mingw_conf.sh"
 echo "Building zlib."
 cd $depsSrcDir
 if [[ ! -d $zlibSrcDir ]]; then
-    git clone --depth 1 https://github.com/madler/zlib
+    git clone --branch $zlibTag --depth 1 https://github.com/madler/zlib
 fi
 cd $zlibSrcDir
 # Apparently the configure script is broken...
@@ -149,20 +168,33 @@ echo "Building boost."
 cd $depsSrcDir
 if [[ ! -d $boostSrcDir ]]; then
     echo "Downloading boost."
-    wget -qO- $boostUrl | tar xz
+    wget -q -O boost.tar.bz2 $boostUrl
+    checksum=`sha256sum boost.tar.bz2 | cut -d ' ' -f 1`
+    if [[ "$boostSha256Sum" != "$checksum" ]]; then
+        echo "Invalid boost checksum: $checksum" >&2
+        exit 1
+    fi
+    tar -xf boost.tar.bz2
+    rm boost.tar.bz2
 fi
 
 cd $boostSrcDir
-echo "using gcc : mingw32 : ${MINGW_CXX} ;" > user-config.jam
+
+if [[ -n $USE_MINGW_LLVM ]]; then
+    b2toolset="clang"
+    echo "using clang :  : ${MINGW_CXX} ;" > user-config.jam
+else
+    b2toolset="gcc-mingw32"
+    echo "using gcc : mingw32 : ${MINGW_CXX} ;" > user-config.jam
+fi
 
 # Workaround for https://github.com/boostorg/thread/issues/156
 # Older versions of mingw provided a different pthread lib.
 sed -i 's/lib$(libname)GC2.a/lib$(libname).a/g' ./libs/thread/build/Jamfile.v2
-sed -i 's/mthreads/pthreads/g' ./tools/build/src/tools/gcc.py
-sed -i 's/mthreads/pthreads/g' ./tools/build/src/tools/gcc.jam
-
-sed -i 's/pthreads/mthreads/g' ./tools/build/src/tools/gcc.py
-sed -i 's/pthreads/mthreads/g' ./tools/build/src/tools/gcc.jam
+if [[ -z $USE_MINGW_LLVM ]]; then
+    sed -i 's/mthreads/pthreads/g' ./tools/build/src/tools/gcc.jam
+    sed -i 's/pthreads/mthreads/g' ./tools/build/src/tools/gcc.jam
+fi
 
 export PTW32_INCLUDE=${PTW32Include}
 export PTW32_LIB=${PTW32Lib}
@@ -199,16 +231,47 @@ patch -N boost/thread/pthread/thread_data.hpp <<EOL
  #endif
 EOL
 
+patch -N libs/stacktrace/src/from_exception.cpp <<EOL
+--- libs/stacktrace/src/from_exception.cpp        2019-10-11 15:26:15.678703586 +0300
++++ libs/stacktrace/src/from_exception.cpp.new    2019-10-11 15:26:07.321463698 +0300
+@@ -4,7 +4,7 @@
+ // accompanying file LICENSE_1_0.txt or copy at
+ // http://www.boost.org/LICENSE_1_0.txt)
+
+-#if defined(_MSC_VER)
++#if defined(__MINGW32__) || defined(_MSC_VER)
+
+ #include <boost/stacktrace/safe_dump_to.hpp>
+ #include <windows.h>
+EOL
+
 ./bootstrap.sh
 
-./b2 install --user-config=user-config.jam toolset=gcc-mingw32 \
+if [[ $ENABLE_SHARED == "ON" ]]; then
+    b2_link="shared"
+else
+    b2_link="static"
+fi
+
+./b2 install --user-config=user-config.jam toolset=$b2toolset \
     target-os=windows release \
-    link=static,shared \
+    link=$b2_link \
     threadapi=win32 --prefix=$boostDir \
     address-model=64 architecture=x86 \
     binary-format=pe abi=ms -j $NUM_WORKERS \
     -sZLIB_INCLUDE=$zlibDir/include -sZLIB_LIBRARY_PATH=$zlibDir/lib \
     --without-python --without-mpi --without-log --without-wave
+
+if [[ -n $USE_MINGW_LLVM && $ENABLE_SHARED == "ON" ]]; then
+    # b2 doesn't generate import libs when using mingw-llvm. We'll tell cmake
+    # to use the dlls instead of import libs, which mingw is capable of.
+    #
+    # TODO: consider dropping this if we get to fix Boost's clang-linux.jam
+    # file. Worth mentioning that Boost might drop the import libs altogether:
+    # https://github.com/bfgroup/b2/issues/278
+    find $boostDir/lib/cmake -name "*.cmake" \
+        -exec sed -i 's/IMPORTED_LOCATION_RELEASE/IMPORTED_IMPLIB_RELEASE/g' {} \;
+fi
 
 echo "Building libbacktrace."
 cd $depsSrcDir
@@ -312,6 +375,28 @@ $MINGW_DLLTOOL -d $dokanSrcDir/dokan/dokan.def \
 # dokan.h is defined in both ./dokan and ./sys while both are using
 # sys/public.h without the "sys" prefix.
 cp $dokanSrcDir/sys/public.h $dokanSrcDir/dokan
+
+echo "Building libicu."
+cd $depsSrcDir
+if [[ ! -d $libicuSrcDir ]]; then
+    git clone --branch $libicuTag --depth 1 $libicuUrl
+    cd $libicuSrcDir
+fi
+mkdir -p $libicuSrcDir/build-windows
+mkdir -p $libicuSrcDir/build-linux
+
+cd $libicuSrcDir/build-linux
+../icu4c/source/configure
+_make
+
+cd $libicuSrcDir/build-windows
+../icu4c/source/configure \
+    --enable-static \
+    --host=${MINGW_BASE} \
+    --with-cross-build=$PWD/../build-linux \
+    --prefix=$libicuLibDir
+_make
+_make install
 
 echo "Finished building Ceph dependencies."
 touch $depsToolsetDir/completed

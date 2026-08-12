@@ -7,6 +7,7 @@
 #include "osd_types.h"
 #include "OpRequest.h"
 #include "object_state.h"
+#include "Watch.h" // for WatchRef
 
 /*
   * keep tabs on object modifications that are in flight.
@@ -188,9 +189,8 @@ public:
   }
 
   /// in-progress copyfrom ops for this object
-  bool blocked:1;
-  bool requeue_scrub_on_unblock:1;    // true if we need to requeue scrub on unblock
-
+  bool blocked;
+  bool requeue_scrub_on_unblock;    // true if we need to requeue scrub on unblock
 };
 
 inline std::ostream& operator<<(std::ostream& out, const ObjectState& obs)

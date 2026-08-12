@@ -446,7 +446,7 @@ int IoCtx::aio_operate(const std::string& oid, AioCompletion *c,
                        ObjectWriteOperation *op) {
   TestIoCtxImpl *ctx = reinterpret_cast<TestIoCtxImpl*>(io_ctx_impl);
   TestObjectOperationImpl *ops = reinterpret_cast<TestObjectOperationImpl*>(op->impl);
-  return ctx->aio_operate(oid, *ops, c->pc, NULL, 0);
+  return ctx->aio_operate(oid, *ops, c->pc, nullptr, nullptr, 0);
 }
 
 int IoCtx::aio_operate(const std::string& oid, AioCompletion *c,
@@ -462,7 +462,7 @@ int IoCtx::aio_operate(const std::string& oid, AioCompletion *c,
     snv[i] = snaps[i];
   SnapContext snapc(seq, snv);
 
-  return ctx->aio_operate(oid, *ops, c->pc, &snapc, flags);
+  return ctx->aio_operate(oid, *ops, c->pc, &snapc, nullptr, flags);
 }
 
 int IoCtx::aio_operate(const std::string& oid, AioCompletion *c,
@@ -601,6 +601,13 @@ int IoCtx::omap_get_vals(const std::string& oid,
   return ctx->execute_operation(
     oid, std::bind(&TestIoCtxImpl::omap_get_vals, _1, _2, start_after, "",
                      max_return, out_vals));
+}
+
+int IoCtx::omap_rm_keys(const std::string& oid,
+                        const std::set<std::string>& keys) {
+  TestIoCtxImpl *ctx = reinterpret_cast<TestIoCtxImpl*>(io_ctx_impl);
+  return ctx->execute_operation(
+    oid, std::bind(&TestIoCtxImpl::omap_rm_keys, _1, _2, keys));
 }
 
 int IoCtx::operate(const std::string& oid, ObjectWriteOperation *op) {

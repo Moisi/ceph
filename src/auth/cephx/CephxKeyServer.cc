@@ -14,6 +14,7 @@
 
 #include "common/config.h"
 #include "CephxKeyServer.h"
+#include "common/Clock.h" // for ceph_clock_now()
 #include "common/dout.h"
 #include <sstream>
 
@@ -255,6 +256,18 @@ std::map<EntityName,CryptoKey> KeyServer::get_used_pending_keys()
   std::scoped_lock l(lock);
   ret.swap(used_pending_keys);
   return ret;
+}
+
+void KeyServer::dump(Formatter *f) const
+{
+  f->dump_object("data", data);
+}
+
+std::list<KeyServer> KeyServer::generate_test_instances()
+{
+  std::list<KeyServer> ls;
+  ls.emplace_back(nullptr, nullptr);
+  return ls;
 }
 
 bool KeyServer::generate_secret(CryptoKey& secret)

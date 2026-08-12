@@ -101,7 +101,6 @@ struct old_rgw_bucket {
 
   void dump(Formatter *f) const;
   void decode_json(JSONObj *obj);
-  static void generate_test_instances(std::list<old_rgw_bucket*>& o);
 
   bool operator<(const old_rgw_bucket& b) const {
     return name.compare(b.name) < 0;
@@ -501,6 +500,8 @@ void test_rgw_init_old_bucket(old_rgw_bucket *bucket, const char *name);
 void test_rgw_populate_bucket(rgw_bucket *b, const char *t, const char *n, const char *m, const char *id);
 void test_rgw_init_bucket(rgw_bucket *bucket, const char *name);
 rgw_obj test_rgw_create_obj(const rgw_bucket& bucket, const std::string& name, const std::string& instance, const std::string& ns);
+
+
 
 #endif
 

@@ -5,20 +5,24 @@
 #include "include/buffer.h"
 #include "include/Context.h"
 #include "include/ceph_assert.h"
+#include "common/Clock.h" // for ceph_clock_now()
+#include "common/debug.h"
 #include "common/deleter.h"
-#include "common/dout.h"
 #include "common/environment.h"
 #include "common/errno.h"
 #include "common/hostname.h"
 #include "common/WorkQueue.h"
 #include "common/Timer.h"
 #include "common/perf_counters.h"
+#include "common/perf_counters_collection.h"
 #include "librbd/ImageCtx.h"
 #include "librbd/asio/ContextWQ.h"
 #include "librbd/cache/pwl/ImageCacheState.h"
 #include "librbd/cache/pwl/LogEntry.h"
 #include "librbd/plugin/Api.h"
+
 #include <map>
+#include <shared_mutex> // for std::shared_lock
 #include <vector>
 
 #undef dout_subsys
@@ -259,7 +263,7 @@ void AbstractWriteLog<I>::perf_start(std::string name) {
 
   plb.add_u64_counter(l_librbd_pwl_cmp, "cmp", "Compare and Write requests");
   plb.add_u64_counter(l_librbd_pwl_cmp_bytes, "cmp_bytes", "Compare and Write bytes compared/written");
-  plb.add_time_avg(l_librbd_pwl_cmp_latency, "cmp_lat", "Compare and Write latecy");
+  plb.add_time_avg(l_librbd_pwl_cmp_latency, "cmp_lat", "Compare and Write latency");
   plb.add_u64_counter(l_librbd_pwl_cmp_fails, "cmp_fails", "Compare and Write compare fails");
 
   plb.add_u64_counter(l_librbd_pwl_internal_flush, "internal_flush", "Flush RWL (write back to OSD)");
@@ -301,7 +305,8 @@ void AbstractWriteLog<I>::log_perf() {
   ss << "\"image\": \"" << m_image_ctx.name << "\",";
   bl.append(ss);
   bl.append("\"stats\": ");
-  m_image_ctx.cct->get_perfcounters_collection()->dump_formatted(f, 0);
+  m_image_ctx.cct->get_perfcounters_collection()->dump_formatted(
+      f, false, select_labeled_t::unlabeled);
   f->flush(bl);
   bl.append(",\n\"histograms\": ");
   m_image_ctx.cct->get_perfcounters_collection()->dump_formatted_histograms(f, 0);
@@ -517,7 +522,7 @@ void AbstractWriteLog<I>::pwl_init(Context *on_finish, DeferredContexts &later) 
   if ((!m_cache_state->present) &&
       (access(m_log_pool_name.c_str(), F_OK) == 0)) {
     ldout(cct, 5) << "There's an existing pool file " << m_log_pool_name
-                  << ", While there's no cache in the image metatata." << dendl;
+                  << ", While there's no cache in the image metadata." << dendl;
     if (remove(m_log_pool_name.c_str()) != 0) {
       lderr(cct) << "failed to remove the pool file " << m_log_pool_name
                  << dendl;
@@ -657,6 +662,20 @@ void AbstractWriteLog<I>::shut_down(Context *on_finish) {
       periodic_stats();
 
       std::unique_lock locker(m_lock);
+
+      ceph_assert(m_current_sync_point);
+      if (!m_current_sync_point->earlier_sync_point) {
+        // This is the only sync point, hence no need to wait for the persistence
+        // of prior sync points.
+        m_current_sync_point->prior_persisted_gather_activate();
+        // we don't create a new sync point, if there are no writes in current sync point's
+        // log entry.
+        ceph_assert(m_current_sync_point->log_entry->writes == 0);
+        // In that case, we shold not wait for the log entry's persistence of current
+        // sync point, which is otherwise waited until we flush its prior sync point.
+        m_current_sync_point->persist_gather_activate();
+      }
+
       check_image_cache_state_clean();
       m_wake_up_enabled = false;
       m_log_entries.clear();
@@ -1752,7 +1771,7 @@ void AbstractWriteLog<I>::process_writeback_dirty_entries() {
     std::lock_guard locker(m_lock);
     while (flushed < IN_FLIGHT_FLUSH_WRITE_LIMIT) {
       if (m_shutting_down) {
-        ldout(cct, 5) << "Flush during shutdown supressed" << dendl;
+        ldout(cct, 5) << "Flush during shutdown suppressed" << dendl;
         /* Do flush complete only when all flush ops are finished */
         all_clean = !m_flush_ops_in_flight;
         break;

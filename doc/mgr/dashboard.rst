@@ -6,33 +6,29 @@ Ceph Dashboard
 Overview
 --------
 
-The Ceph Dashboard is a built-in web-based Ceph management and monitoring
-application through which you can inspect and administer various aspects
-and resources within the cluster. It is implemented as a :ref:`ceph-manager-daemon` module.
+The Ceph Dashboard is a web-based Ceph management-and-monitoring tool that can
+be used to inspect and administer resources in the cluster. It is implemented
+as a :ref:`ceph-manager-daemon` module.
 
-The original Ceph Dashboard that was shipped with Ceph Luminous started
-out as a simple read-only view into run-time information and performance
-data of Ceph clusters. It used a very simple architecture to achieve the
-original goal. However, there was growing demand for richer web-based
-management capabilities, to make it easier to administer Ceph for users that
-prefer a WebUI over the CLI.
+The original Ceph Dashboard shipped with Ceph Luminous and was a simple
+read-only view into the run-time information and performance data of Ceph
+clusters. It had a simple architecture. However, demand grew for richer,
+web-based management capabilities for users who prefer a WebUI over the CLI.
 
-The new :term:`Ceph Dashboard` module adds web-based monitoring and
-administration to the Ceph Manager. The architecture and functionality of this new
-module are derived from
-and inspired by the `openATTIC Ceph management and monitoring tool
-<https://openattic.org/>`_. Development is actively driven by the
-openATTIC team at `SUSE <https://www.suse.com/>`_, with support from
-companies including `Red Hat <https://redhat.com/>`_ and members of the Ceph
-community.
+The :term:`Ceph Dashboard` module adds web-based monitoring and administration
+to the Ceph Manager. The architecture and functionality of this new module are
+derived from the `openATTIC Ceph management and monitoring tool
+<https://openattic.org/>`_. Development was originally driven by the openATTIC
+team at `SUSE <https://www.suse.com/>`_, with support from members of the Ceph
+community and from companies including `Red Hat <https://redhat.com/>`_.
 
-The dashboard module's backend code uses the CherryPy framework and implements
-a custom REST API. The WebUI implementation is based on
-Angular/TypeScript and includes both functionality from the original dashboard
-and new features originally developed for the standalone version
-of openATTIC. The Ceph Dashboard module is implemented as an
-application that provides a graphical representation of information and statistics
-through a web server hosted by ``ceph-mgr``.
+The dashboard module's backend code uses the CherryPy framework, and implements
+a custom REST API. The WebUI implementation is based on Angular/TypeScript and
+includes both functionality from the original dashboard and new features
+originally developed for the standalone version of openATTIC. The Ceph
+Dashboard module is implemented as an application that provides a graphical
+representation of information and statistics through a web server hosted by
+``ceph-mgr``.
 
 Feature Overview
 ^^^^^^^^^^^^^^^^
@@ -47,8 +43,8 @@ The dashboard provides the following features:
   after the first login or after a configurable time period. See
   :ref:`dashboard-user-role-management` for details.
 * **Single Sign-On (SSO)**: The dashboard supports authentication
-  via an external identity provider using the SAML 2.0 protocol. See
-  :ref:`dashboard-sso-support` for details.
+   via an external identity provider using the SAML 2.0 protocol or thse OAuth2 protocol. See
+   :ref:dashboard-saml2-sso-support and :ref:dashboard-oauth2-sso-support for details.
 * **SSL/TLS support**: All HTTP communication between the web browser and the
   dashboard is secured via SSL. A self-signed certificate can be created with
   a built-in command, but it's also possible to import custom certificates
@@ -127,62 +123,57 @@ The Ceph Dashboard offers the following monitoring and management capabilities:
 Overview of the Dashboard Landing Page
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-Displays overall cluster status, performance, and capacity metrics. Shows instant
-feedback for changes in the cluster and provides easy access to subpages of the
-dashboard.
+The landing page of Ceph Dashboard serves as the home page and features metrics
+such as the overall cluster status, performance, and capacity. It provides real-time
+updates on any changes in the cluster and allows quick access to other sections of the dashboard.
+
+.. image:: dashboard-landing-page.png
+
+Details
+"""""""
+Provides an overview of the cluster configuration, displaying various critical aspects of the cluster.
+
+.. image:: details-card.png
 
 .. _dashboard-landing-page-status:
 
 Status
 """"""
+Provides a visual indication of cluster health, and displays cluster alerts grouped by severity.
 
-* **Cluster Status**: Displays overall cluster health. In case of any error it
-  displays a short description of the error and provides a link to the logs.
-* **Hosts**: Displays the total number of hosts associated to the cluster and
-  links to a subpage that lists and describes each.
-* **Monitors**: Displays mons and their quorum status and
-  open sessions.  Links to a subpage that lists and describes each.
-* **OSDs**: Displays object storage daemons (ceph-osds) and
-  the numbers of OSDs running (up), in service
-  (in), and out of the cluster (out). Provides links to
-  subpages providing a list of all OSDs and related management actions.
-* **Managers**: Displays active and standby Ceph Manager
-  daemons (ceph-mgr).
-* **Object Gateway**: Displays active object gateways (RGWs) and
-  provides links to subpages that list all object gateway daemons.
-* **Metadata Servers**: Displays active and standby CephFS metadata
-  service daemons (ceph-mds).
-* **iSCSI Gateways**: Display iSCSI gateways available,
-  active (up), and inactive (down). Provides a link to a subpage
-  showing a list of all iSCSI Gateways.
+.. image:: status-card-open.png
 
 .. _dashboard-landing-page-capacity:
 
 Capacity
 """"""""
+* **Used**: Displays the used capacity out of the total physical capacity provided by storage nodes (OSDs)
+* **Warning**: Displays the `nearfull` threshold of the OSDs
+* **Danger**: Displays the `full` threshold of the OSDs
 
-* **Raw Capacity**: Displays the capacity used out of the total
-  physical capacity provided by storage nodes (OSDs).
-* **Objects**: Displays the number and status of RADOS objects
-  including the percentages of healthy, misplaced, degraded, and unfound
-  objects.
-* **PG Status**: Displays the total number of placement groups and
-  their status, including the percentage clean, working,
-  warning, and unknown.
-* **Pools**: Displays pools and links to a subpage listing details.
-* **PGs per OSD**: Displays the number of placement groups assigned to
-  object storage daemons.
+.. image:: capacity-card.png
+
+.. _dashboard-landing-page-inventory:
+
+Inventory
+"""""""""
+An inventory for all assets within the cluster.
+Provides direct access to subpages of the dashboard from each item of this card.
+
+.. image:: inventory-card.png
 
 .. _dashboard-landing-page-performance:
 
-Performance
-"""""""""""
+Cluster Utilization
+"""""""""""""""""""
+* **Used Capacity**: Total capacity used of the cluster. The maximum value of the chart is the maximum capacity of the cluster.
+* **IOPS (Input/Output Operations Per Second)**: Number of read and write operations.
+* **Latency**: Amount of time that it takes to process a read or a write request.
+* **Client Throughput**: Amount of data that clients read or write to the cluster.
+* **Recovery Throughput**: Amount of recovery data that clients read or write to the cluster.
 
-* **Client READ/Write**: Displays an overview of
-  client input and output operations.
-* **Client Throughput**: Displays the data transfer rates to and from Ceph clients.
-* **Recovery throughput**: Displays rate of cluster healing and balancing operations.
-* **Scrubbing**: Displays light and deep scrub status.
+
+.. image:: cluster-utilization-card.png
 
 Supported Browsers
 ^^^^^^^^^^^^^^^^^^
@@ -234,7 +225,7 @@ All HTTP connections to the dashboard are secured with SSL/TLS by default.
 To get the dashboard up and running quickly, you can generate and install a
 self-signed certificate:
 
-.. prompt:: bash $
+.. prompt:: bash #
 
    ceph dashboard create-self-signed-cert
 
@@ -247,7 +238,7 @@ certificate that is issued by a certificate authority (CA) should be used.
 
 For example, a key pair can be generated with a command similar to:
 
-.. prompt:: bash $
+.. prompt:: bash #
 
    openssl req -new -nodes -x509 \
    -subj "/O=IT/CN=ceph-mgr-dashboard" -days 3650 \
@@ -256,7 +247,7 @@ For example, a key pair can be generated with a command similar to:
 The ``dashboard.crt`` file should then be signed by a CA. Once that is done, you
 can enable it for Ceph manager instances by running the following commands:
 
-.. prompt:: bash $
+.. prompt:: bash #
 
    ceph dashboard set-ssl-certificate -i dashboard.crt
    ceph dashboard set-ssl-certificate-key -i dashboard.key
@@ -265,14 +256,14 @@ If unique certificates are desired for each manager instance,
 the name of the instance can be included as follows (where ``$name`` is the name
 of the ``ceph-mgr`` instance, usually the hostname):
 
-.. prompt:: bash $
+.. prompt:: bash #
 
    ceph dashboard set-ssl-certificate $name -i dashboard.crt
    ceph dashboard set-ssl-certificate-key $name -i dashboard.key
 
 SSL can also be disabled by setting this configuration value:
 
-.. prompt:: bash $
+.. prompt:: bash #
 
    ceph config set mgr mgr/dashboard/ssl false
 
@@ -293,7 +284,7 @@ wanted or required. See :ref:`dashboard-proxy-configuration` for more details.
   fail mgr`` or by disabling and re-enabling the dashboard module (which also
   triggers the manager to respawn itself):
   
-  .. prompt:: bash $
+  .. prompt:: bash #
 
      ceph mgr module disable dashboard
      ceph mgr module enable dashboard
@@ -314,7 +305,7 @@ which corresponds to all available IPv4 and IPv6 addresses.
 These defaults can be changed via the configuration key facility on a
 cluster-wide level (so they apply to all manager instances) as follows:
 
-.. prompt:: bash $
+.. prompt:: bash #
 
    ceph config set mgr mgr/dashboard/server_addr $IP
    ceph config set mgr mgr/dashboard/server_port $PORT
@@ -324,7 +315,7 @@ Since each ``ceph-mgr`` hosts its own instance of the dashboard, it may be
 necessary to configure them separately. The IP address and port for a specific
 manager instance can be changed with the following commands:
 
-.. prompt:: bash $
+.. prompt:: bash #
 
    ceph config set mgr mgr/dashboard/$name/server_addr $IP
    ceph config set mgr mgr/dashboard/$name/server_port $PORT
@@ -349,7 +340,7 @@ section.
 To create a user with the administrator role you can use the following
 commands:
 
-.. prompt:: bash $
+.. prompt:: bash #
 
    ceph dashboard ac-user-create <username> -i <file-containing-password> administrator
 
@@ -361,7 +352,7 @@ for multiple times. It is enabled by default to prevent brute-force or dictionar
 attacks. The user can get or set the default number of lock-out attempts using
 these commands respectively:
 
-.. prompt:: bash $
+.. prompt:: bash #
 
    ceph dashboard get-account-lockout-attempts
    ceph dashboard set-account-lockout-attempts <value:int>
@@ -372,7 +363,7 @@ these commands respectively:
   However, by disabling this feature, the account is more vulnerable to brute-force or
   dictionary based attacks. This can be disabled by:
 
-  .. prompt:: bash $
+  .. prompt:: bash #
 
      ceph dashboard set-account-lockout-attempts 0
 
@@ -383,7 +374,7 @@ If a user account is disabled as a result of multiple invalid login attempts, th
 it needs to be manually enabled by the administrator. This can be done by the following
 command:
 
-.. prompt:: bash $
+.. prompt:: bash #
 
    ceph dashboard ac-user-enable <username>
 
@@ -406,7 +397,7 @@ When RGW is deployed with cephadm, the RGW credentials used by the
 dashboard will be automatically configured. You can also manually force the
 credentials to be set up with:
 
-.. prompt:: bash $
+.. prompt:: bash #
 
    ceph dashboard set-rgw-credentials
 
@@ -415,7 +406,7 @@ the system.
 
 If you've configured a custom 'admin' resource in your RGW admin API, you should set it here also:
 
-.. prompt:: bash $
+.. prompt:: bash #
 
    ceph dashboard set-rgw-api-admin-resource <admin_resource>
 
@@ -424,14 +415,27 @@ you should disable certificate verification in the dashboard to avoid refused
 connections, e.g. caused by certificates signed by unknown CA or not matching
 the host name:
 
-.. prompt:: bash $
+.. prompt:: bash #
 
    ceph dashboard set-rgw-api-ssl-verify False
+
+To set a custom hostname or address for an RGW gateway, set the value of ``RGW_HOSTNAME_PER_DAEMON``
+accordingly:
+
+.. prompt:: bash #
+
+   ceph dashboard set-rgw-hostname <gateway_name> <hostname>
+
+The setting can be unset using:
+
+.. prompt:: bash #
+
+   ceph dashboard unset-rgw-hostname <gateway_name>
 
 If the Object Gateway takes too long to process requests and the dashboard runs
 into timeouts, you can set the timeout value to your needs:
 
-.. prompt:: bash $
+.. prompt:: bash #
 
    ceph dashboard set-rest-requests-timeout <seconds>
 
@@ -459,13 +463,13 @@ verification when accessing ceph-iscsi API.
 
 To disable API SSL verification run the following command:
 
-.. prompt:: bash $
+.. prompt:: bash #
 
    ceph dashboard set-iscsi-api-ssl-verification false
 
 The available iSCSI gateways must be defined using the following commands:
 
-.. prompt:: bash $
+.. prompt:: bash #
 
    ceph dashboard iscsi-gateway-list
    # Gateway URL format for a new gateway: <scheme>://<username>:<password>@<host>[:port]
@@ -520,7 +524,7 @@ on appropriate hosts, proceed with the following steps.
 
 #.  Enable the Ceph Exporter which comes as Ceph Manager module by running:
 
-    .. prompt:: bash $
+    .. prompt:: bash #
 
        ceph mgr module enable prometheus
 
@@ -568,7 +572,7 @@ on appropriate hosts, proceed with the following steps.
 
 #.  Install the `vonage-status-panel and grafana-piechart-panel` plugins using:
 
-    .. prompt:: bash $
+    .. prompt:: bash #
 
       grafana-cli plugins install vonage-status-panel
       grafana-cli plugins install grafana-piechart-panel
@@ -578,7 +582,7 @@ on appropriate hosts, proceed with the following steps.
     Dashboards can be added to Grafana by importing dashboard JSON files.
     Use the following command to download the JSON files:
 
-    .. prompt:: bash $
+    .. prompt:: bash #
 
        wget https://raw.githubusercontent.com/ceph/ceph/main/monitoring/ceph-mixin/dashboards_out/<Dashboard-name>.json
 
@@ -587,7 +591,7 @@ on appropriate hosts, proceed with the following steps.
 
     For Example, for ceph-cluster overview you can use:
 
-    .. prompt:: bash $
+    .. prompt:: bash #
 
        wget https://raw.githubusercontent.com/ceph/ceph/main/monitoring/ceph-mixin/dashboards_out/ceph-cluster.json
 
@@ -627,7 +631,7 @@ connection information that the Ceph Dashboard will use to access Grafana.
 You need to tell the dashboard on which URL the Grafana instance is
 running/deployed:
 
-.. prompt:: bash $
+.. prompt:: bash #
 
    ceph dashboard set-grafana-api-url <grafana-server-url>  # default: ''
 
@@ -648,7 +652,7 @@ disable certificate verification in the dashboard to avoid refused connections,
 which can be a result of certificates signed by an unknown CA or that do not
 match the host name:
 
-.. prompt:: bash $
+.. prompt:: bash #
 
    ceph dashboard set-grafana-api-ssl-verify False
 
@@ -659,7 +663,7 @@ You can also access Grafana directly to monitor your cluster.
   Ceph Dashboard configuration information can also be unset. For example, to
   clear the Grafana API URL we configured above:
 
-  .. prompt:: bash $
+  .. prompt:: bash #
 
      ceph dashboard reset-grafana-api-url
 
@@ -689,7 +693,7 @@ services).
 
 To change the URL that is returned to the frontend issue the following command:
 
-.. prompt:: bash $
+.. prompt:: bash #
 
    ceph dashboard set-grafana-frontend-api-url <grafana-server-url>
 
@@ -697,10 +701,10 @@ If no value is set for that option, it will simply fall back to the value of the
 GRAFANA_API_URL option. If set, it will instruct the browser to use this URL to
 access Grafana.
 
-.. _dashboard-sso-support:
+.. _dashboard-saml2-sso-support:
 
-Enabling Single Sign-On (SSO)
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+Enabling SAML2 Single Sign-On (SSO)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 The Ceph Dashboard supports external authentication of users via the
 `SAML 2.0 <https://en.wikipedia.org/wiki/SAML_2.0>`_ protocol. You need to
@@ -717,7 +721,7 @@ process can be performed by an existing Identity Provider (IdP).
 
 To configure SSO on Ceph Dashboard, you should use the following command:
 
-.. prompt:: bash $
+.. prompt:: bash #
 
    ceph dashboard sso setup saml2 <ceph_dashboard_base_url> <idp_metadata> {<idp_username_attribute>} {<idp_entity_id>} {<sp_x_509_cert>} {<sp_private_key>}
 
@@ -735,13 +739,57 @@ Parameters:
 
 To display the current SAML 2.0 configuration, use the following command:
 
-.. prompt:: bash $
+.. prompt:: bash #
 
    ceph dashboard sso show saml2
 
 .. note::
 
   For more information about `onelogin_settings`, please check the `onelogin documentation <https://github.com/onelogin/python-saml>`_.
+
+To disable SSO:
+
+.. prompt:: bash #
+
+   ceph dashboard sso disable
+
+To check if SSO is enabled:
+
+.. prompt:: bash #
+
+   ceph dashboard sso status
+
+To enable SSO:
+
+.. prompt:: bash #
+
+   ceph dashboard sso enable saml2
+
+.. _dashboard-oauth2-sso-support:
+
+Enabling OAuth2 Single Sign-On (SSO)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The Ceph Dashboard supports external authentication of users via the
+`OAuth <https://en.wikipedia.org/wiki/OAuth>`_ protocol. You need to
+have :ref:`cephadm` enabled as your orchestrator with an active
+:ref:`deploy-cephadm-mgmt-gateway` and :ref:`deploy-cephadm-oauth2-proxy` services.
+
+From the IDP of choice, Keycloak is the current recomendation and tested solution,
+configure the IDP's client used in the `oauth2-proxy` service configuration to validate the following redirect URLs
+for login_url: `https://<host_name>|<IP_address>/oauth2/callback` and
+the following logout_url: `https://<host_name>|<IP_address>/ /oauth2/sign_out`
+
+Again, from the IDP, we will need a user with a valid role, this user will be the one to perform
+authorization against, we can create a role like: 'administator' to give admin level access to the user.
+
+Make certain that the ``enable_auth`` flag has been included in the ``ceph orch
+apply mgmt-gateway`` command and that it has been set to ``true`` by running a
+command of the following form:
+
+.. prompt:: bash $
+
+   ceph orch apply mgmt-gateway --enable_auth=true --placement=<ceph-node-02>
 
 To disable SSO:
 
@@ -759,7 +807,7 @@ To enable SSO:
 
 .. prompt:: bash $
 
-   ceph dashboard sso enable saml2
+   ceph dashboard sso enable oauth2
 
 .. _dashboard-alerting:
 
@@ -836,13 +884,13 @@ in order to manage silences.
 
   To use it, specify the host and port of the Alertmanager server:
   
-  .. prompt:: bash $
+  .. prompt:: bash #
 
      ceph dashboard set-alertmanager-api-host <alertmanager-host:port>  # default: ''
 
   For example:
   
-  .. prompt:: bash $
+  .. prompt:: bash #
 
      ceph dashboard set-alertmanager-api-host 'http://localhost:9093'
 
@@ -851,13 +899,13 @@ in order to manage silences.
   that a new silence will match a corresponding alert.
 
   
-  .. prompt:: bash $
+  .. prompt:: bash #
 
      ceph dashboard set-prometheus-api-host <prometheus-host:port>  # default: ''
 
   For example:
 
-  .. prompt:: bash $
+  .. prompt:: bash #
 
      ceph dashboard set-prometheus-api-host 'http://localhost:9090'
 
@@ -876,13 +924,13 @@ an unknown CA or that do not match the host name.
 
 - For Prometheus:
 
-.. prompt:: bash $
+.. prompt:: bash #
 
    ceph dashboard set-prometheus-api-ssl-verify False
 
 - For Alertmanager:
 
-.. prompt:: bash $
+.. prompt:: bash #
 
    ceph dashboard set-alertmanager-api-ssl-verify False
 
@@ -902,13 +950,13 @@ following checks:
 
 The password policy feature can be switched on or off completely:
 
-.. prompt:: bash $
+.. prompt:: bash #
 
     ceph dashboard set-pwd-policy-enabled <true|false>
 
 The following individual checks can also be switched on or off:
 
-.. prompt:: bash $
+.. prompt:: bash #
 
   ceph dashboard set-pwd-policy-check-length-enabled <true|false>
   ceph dashboard set-pwd-policy-check-oldpwd-enabled <true|false>
@@ -923,13 +971,13 @@ policy.
 
 - Minimum password length (defaults to 8):
 
-.. prompt:: bash $
+.. prompt:: bash #
 
    ceph dashboard set-pwd-policy-min-length <N>
 
 - Minimum password complexity (defaults to 10):
 
-  .. prompt:: bash $
+  .. prompt:: bash #
 
      ceph dashboard set-pwd-policy-min-complexity <N>
 
@@ -946,7 +994,7 @@ policy.
 - A list of comma separated words that are not allowed to be used in a
   password:
 
-  .. prompt:: bash $
+  .. prompt:: bash #
 
      ceph dashboard set-pwd-policy-exclusion-list <word>[,...]
 
@@ -968,13 +1016,13 @@ We provide a set of CLI commands to manage user accounts:
 
 - *Show User(s)*:
 
-  .. prompt:: bash $
+  .. prompt:: bash #
 
      ceph dashboard ac-user-show [<username>]
 
 - *Create User*:
   
-  .. prompt:: bash $
+  .. prompt:: bash #
 
      ceph dashboard ac-user-create [--enabled] [--force-password] [--pwd_update_required] <username> -i <file-containing-password> [<rolename>] [<name>] [<email>] [<pwd_expiration_date>]
 
@@ -984,19 +1032,19 @@ We provide a set of CLI commands to manage user accounts:
 
 - *Delete User*:
 
-  .. prompt:: bash $
+  .. prompt:: bash #
 
      ceph dashboard ac-user-delete <username>
 
 - *Change Password*:
 
-  .. prompt:: bash $
+  .. prompt:: bash #
 
      ceph dashboard ac-user-set-password [--force-password] <username> -i <file-containing-password>
 
 - *Change Password Hash*:
 
-  .. prompt:: bash $
+  .. prompt:: bash #
 
      ceph dashboard ac-user-set-password-hash <username> -i <file-containing-password-hash>
 
@@ -1005,19 +1053,19 @@ We provide a set of CLI commands to manage user accounts:
 
 - *Modify User (name, and email)*:
 
-  .. prompt:: bash $
+  .. prompt:: bash #
 
      ceph dashboard ac-user-set-info <username> <name> <email>
 
 - *Disable User*:
 
-  .. prompt:: bash $
+  .. prompt:: bash #
 
      ceph dashboard ac-user-disable <username>
 
 - *Enable User*:
 
-  .. prompt:: bash $
+  .. prompt:: bash #
 
      ceph dashboard ac-user-enable <username>
 
@@ -1096,7 +1144,7 @@ The list of system roles are:
 
 The list of available roles can be retrieved with the following command:
 
-.. prompt:: bash $
+.. prompt:: bash #
 
    ceph dashboard ac-role-show [<rolename>]
 
@@ -1105,25 +1153,25 @@ following:
 
 - *Create Role*:
 
-  .. prompt:: bash $
+  .. prompt:: bash #
 
      ceph dashboard ac-role-create <rolename> [<description>]
 
 - *Delete Role*:
 
-  .. prompt:: bash $
+  .. prompt:: bash #
 
      ceph dashboard ac-role-delete <rolename>
 
 - *Add Scope Permissions to Role*:
 
-  .. prompt:: bash $
+  .. prompt:: bash #
 
      ceph dashboard ac-role-add-scope-perms <rolename> <scopename> <permission> [<permission>...]
 
 - *Delete Scope Permission from Role*:
 
-  .. prompt:: bash $
+  .. prompt:: bash #
 
      ceph dashboard ac-role-del-scope-perms <rolename> <scopename>
 
@@ -1131,19 +1179,19 @@ To assign roles to users, the following commands are available:
 
 - *Set User Roles*:
 
-  .. prompt:: bash $
+  .. prompt:: bash #
 
      ceph dashboard ac-user-set-roles <username> <rolename> [<rolename>...]
 
 - *Add Roles To User*:
 
-  .. prompt:: bash $
+  .. prompt:: bash #
 
      ceph dashboard ac-user-add-roles <username> <rolename> [<rolename>...]
 
 - *Delete Roles from User*:
 
-  .. prompt:: bash $
+  .. prompt:: bash #
 
      ceph dashboard ac-user-del-roles <username> <rolename> [<rolename>...]
 
@@ -1157,13 +1205,13 @@ and has read-only access to other scopes.
 
 1. *Create the user*:
 
-   .. prompt:: bash $
+   .. prompt:: bash #
 
       ceph dashboard ac-user-create bob -i <file-containing-password>
 
 2. *Create role and specify scope permissions*:
 
-   .. prompt:: bash $
+   .. prompt:: bash #
 
       ceph dashboard ac-role-create rbd/pool-manager
       ceph dashboard ac-role-add-scope-perms rbd/pool-manager rbd-image read create update delete
@@ -1171,7 +1219,7 @@ and has read-only access to other scopes.
 
 3. *Associate roles to user*:
 
-   .. prompt:: bash $
+   .. prompt:: bash #
 
       ceph dashboard ac-user-set-roles bob rbd/pool-manager read-only
 
@@ -1200,7 +1248,7 @@ you may wish to service it under a URL prefix. To get the dashboard
 to use hyperlinks that include your prefix, you can set the
 ``url_prefix`` setting:
 
-.. prompt:: bash $
+.. prompt:: bash #
 
    ceph config set mgr mgr/dashboard/url_prefix $PREFIX
 
@@ -1215,13 +1263,13 @@ internal (unresolvable) URLs are published to the frontend client. Use the
 following command to get the dashboard to respond with an HTTP error (500 by default)
 instead of redirecting to the active dashboard:
 
-.. prompt:: bash $
+.. prompt:: bash #
 
    ceph config set mgr mgr/dashboard/standby_behaviour "error"
 
 To reset the setting to default redirection, use the following command:
 
-.. prompt:: bash $
+.. prompt:: bash #
 
    ceph config set mgr mgr/dashboard/standby_behaviour "redirect"
 
@@ -1231,26 +1279,44 @@ Configure the error status code
 When redirection is disabled, you may want to customize the HTTP status
 code of standby dashboards. To do so you need to run the command:
 
-.. prompt:: bash $
+.. prompt:: bash #
 
    ceph config set mgr mgr/dashboard/standby_error_status_code 503
 
 Resolve IP address to hostname before redirect
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-The redirect from a standby to the active dashboard is done via the IP
-address. This is done because resolving IP addresses to hostnames can be error
-prone in containerized environments. It is also the reason why the option is
+Redirection from a standby dashboard to the active dashboard is done via the
+manager's IP address, not via the manager's hostname. In virtualized
+environments, IP-address-based redirection reduces the incidence of error as
+compared to hostname-based resolution.  Because of the increased risk of error
+due to hostname-based resolution, the option for hostname resolution is
 disabled by default.
+
 However, in some situations it might be helpful to redirect via the hostname.
-For example if the configured TLS certificate matches only the hostnames. To
-activate the redirection via the hostname run the following command::
+For example, if the configured TLS certificate matches only the hostnames and
+not the IP addresses of those hosts, hostname redirection would be preferable.
 
-  $ ceph config set mgr mgr/dashboard/redirect_resolve_ip_addr True
+To activate redirection from standby dashboards to active dashboards via the
+manager's hostname, run the following command:
 
-You can disable it again by::
+.. prompt:: bash #
 
-  $ ceph config set mgr mgr/dashboard/redirect_resolve_ip_addr False
+   ceph config set mgr mgr/dashboard/redirect_resolve_ip_addr True
+
+Disable hostname redirection by running the following command:
+
+.. prompt:: bash #
+
+   ceph config set mgr mgr/dashboard/redirect_resolve_ip_addr False
+
+.. warning::
+
+   If you attempt to activate redirection by using the command above and you
+   get the error message ``EINVAL: unrecognized config option
+   'mgr/dashboard/redirect_resolve_ip_addr'``, then you might be running a
+   release of Ceph prior to version 17.2.6. This feature was introduced in
+   17.2.6, in this commit: https://github.com/ceph/ceph/pull/48219.
 
 HAProxy example configuration
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -1291,9 +1357,9 @@ redirection on standby nodes.
     mode tcp
     option httpchk GET /
     http-check expect status 200
-    server x <HOST>:<PORT> ssl check verify none
-    server y <HOST>:<PORT> ssl check verify none
-    server z <HOST>:<PORT> ssl check verify none
+    server x <HOST>:<PORT> check check-ssl verify none
+    server y <HOST>:<PORT> check check-ssl verify none
+    server z <HOST>:<PORT> check check-ssl verify none
 
 .. _dashboard-auditing:
 
@@ -1304,7 +1370,7 @@ The REST API can log PUT, POST and DELETE requests to the Ceph
 audit log. This feature is disabled by default, but can be enabled with the
 following command:
 
-.. prompt:: bash $
+.. prompt:: bash #
 
    ceph dashboard set-audit-api-enabled <true|false>
 
@@ -1318,7 +1384,7 @@ If enabled, the following parameters are logged per each request:
 The logging of the request payload (the arguments and their values) is enabled
 by default. Execute the following command to disable this behaviour:
 
-.. prompt:: bash $
+.. prompt:: bash #
 
    ceph dashboard set-audit-api-log-payload <true|false>
 
@@ -1355,7 +1421,7 @@ Locating the Dashboard
 
 If you are unsure of the location of the Ceph Dashboard, run the following command:
 
-.. prompt:: bash $
+.. prompt:: bash #
 
    ceph mgr services | jq .dashboard
 
@@ -1380,7 +1446,7 @@ commands:
 
 #. Verify the Ceph Dashboard module is enabled:
 
-   .. prompt:: bash $
+   .. prompt:: bash #
 
       ceph mgr module ls | jq .enabled_modules
 
@@ -1395,7 +1461,7 @@ commands:
 
 #. If it is not listed, activate the module with the following command:
 
-   .. prompt:: bash $
+   .. prompt:: bash #
 
       ceph mgr module enable dashboard
 
@@ -1403,7 +1469,7 @@ commands:
 
    * Check if ``ceph-mgr`` log messages are written to a file by:
      
-     .. prompt:: bash $
+     .. prompt:: bash #
 
         ceph config get mgr log_to_file
 
@@ -1414,7 +1480,7 @@ commands:
    * Get the location of the log file (it's ``/var/log/ceph/<cluster-name>-<daemon-name>.log``
      by default):
 
-     .. prompt:: bash $
+     .. prompt:: bash #
 
         ceph config get mgr log_file
 
@@ -1422,23 +1488,23 @@ commands:
 
         /var/log/ceph/$cluster-$name.log
 
-#. Ensure the SSL/TSL support is configured properly:
+#. Ensure the SSL/TLS support is configured properly:
 
-   * Check if the SSL/TSL support is enabled:
+   * Check if the SSL/TLS support is enabled:
 
-     .. prompt:: bash $
+     .. prompt:: bash #
 
         ceph config get mgr mgr/dashboard/ssl
 
    * If the command returns ``true``, verify a certificate exists by:
 
-     .. prompt:: bash $
+     .. prompt:: bash #
 
         ceph config-key get mgr/dashboard/crt
 
      and:
 
-     .. prompt:: bash $
+     .. prompt:: bash #
 
         ceph config-key get mgr/dashboard/key
 
@@ -1446,7 +1512,7 @@ commands:
      certificate or follow the instructions outlined in
      :ref:`dashboard-ssl-tls-support`:
 
-     .. prompt:: bash $
+     .. prompt:: bash #
 
         ceph dashboard create-self-signed-cert
 
@@ -1468,7 +1534,7 @@ error, run through the procedural checks below:
 #. If your user credentials are correct, but you are experiencing the same
    error, check that the user account exists:
 
-   .. prompt:: bash $
+   .. prompt:: bash #
 
       ceph dashboard ac-user-show <username>
 
@@ -1479,7 +1545,7 @@ error, run through the procedural checks below:
 
 #. Check if the user is enabled:
 
-   .. prompt:: bash $
+   .. prompt:: bash #
 
       ceph dashboard ac-user-show <username> | jq .enabled
 
@@ -1490,7 +1556,7 @@ error, run through the procedural checks below:
    Check if ``enabled`` is set to ``true`` for your user. If not the user is
    not enabled, run:
 
-   .. prompt:: bash $
+   .. prompt:: bash #
 
       ceph dashboard ac-user-enable <username>
 
@@ -1524,7 +1590,7 @@ modules*. Select *Dashboard module* and click the edit button. Click the
 
 To enable it via the CLI, run the following command:
 
-.. prompt:: bash $
+.. prompt:: bash #
 
    ceph dashboard debug enable
 
@@ -1537,7 +1603,7 @@ debugging.
 
 #. Increase the logging level of manager daemons:
 
-   .. prompt:: bash $
+   .. prompt:: bash #
 
       ceph tell mgr config set debug_mgr 20
 
@@ -1548,26 +1614,25 @@ debugging.
      and click the edit button. Modify the ``log_level`` configuration.
    * To adjust it via the CLI, run the following command:
 
-     .. prompt:: bash $
+     .. prompt:: bash #
 
-        bin/ceph config set mgr mgr/dashboard/log_level debug
+        ceph config set mgr mgr/dashboard/log_level debug
 
 3. High log levels can result in considerable log volume, which can
-easily fill up your filesystem. Set a calendar reminder for an hour, a day,
-or a week in the future to revert this temporary logging increase.  This looks
-something like this:
+easily fill up your filesystem or central log store. Set a calendar reminder for an hour, a day,
+or a week in the future to revert a temporary logging increase. Any current, non-default setting
+may be shown with the below command:
 
-   .. prompt:: bash $
+   .. prompt:: bash #
 
-      ceph config log
+      ceph config dump | grep mgr/dashboard/log_level
 
    ::
-
       ...
-      --- 11 --- 2020-11-07 11:11:11.960659 --- mgr.x/dashboard/log_level = debug ---
+      mgr advanced  mgr/dashboard/log_level debug
       ...
     
-   .. prompt:: bash $
+   .. prompt:: bash #
 
       ceph config reset 11
 
@@ -1585,13 +1650,13 @@ To learn more about centralized logging, see :ref:`cephadm-monitoring-centralize
 
 3. To see debug-level messages as well as info-level events, run the following command via CLI:
 
-   .. prompt:: bash $
+   .. prompt:: bash #
 
       ceph config set mgr mgr/cephadm/log_to_cluster_level debug
 
 4. To enable logging to files, run the following commands via CLI:
 
-   .. prompt:: bash $
+   .. prompt:: bash #
 
       ceph config set global log_to_file true
       ceph config set global mon_cluster_log_to_file true
@@ -1617,13 +1682,13 @@ on the issue tracker. Under the ``my account`` tab in the Ceph Issue Tracker,
 the user can see their API access key. This key is used for authentication
 when creating a new issue. To store the Ceph API access key, in the CLI run:
 
-.. prompt:: bash $
+.. prompt:: bash #
 
    ``ceph dashboard set-issue-tracker-api-key -i <file-containing-key>``
 
 Then on successful update, you can create an issue using:
 
-.. prompt:: bash $
+.. prompt:: bash #
 
    ``ceph dashboard create issue <project> <tracker_type> <subject> <description>``
 

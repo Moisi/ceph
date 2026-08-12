@@ -20,8 +20,9 @@ class entity_addrvec_t;
 #define CEPH_PICK_ADDRESS_IPV6        0x20
 #define CEPH_PICK_ADDRESS_PREFER_IPV4 0x40
 #define CEPH_PICK_ADDRESS_DEFAULT_MON_PORTS  0x80
+#define CEPH_PICK_ADDRESS_PUBLIC_BIND 0x100
 
-#ifndef WITH_SEASTAR
+#ifndef WITH_CRIMSON
 /*
   Pick addresses based on subnets if needed.
 
@@ -43,7 +44,7 @@ class entity_addrvec_t;
  */
 void pick_addresses(CephContext *cct, int needs);
 
-#endif	// !WITH_SEASTAR
+#endif	// !WITH_CRIMSON
 
 int pick_addresses(CephContext *cct, unsigned flags, entity_addrvec_t *addrs,
 		   int preferred_numa_node = -1);
@@ -93,5 +94,10 @@ const struct sockaddr *find_ip_in_subnet_list(
 int get_iface_numa_node(
   const std::string& iface,
   int *node);
+
+bool is_addr_in_subnet(
+  CephContext *cct,
+  const std::string &networks,
+  const entity_addr_t &addr);
 
 #endif

@@ -24,6 +24,9 @@
 
 
 class RGWReshard;
+
+
+class BucketReshardManager;
 namespace rgw { namespace sal {
   class RadosStore;
 } }
@@ -82,13 +85,24 @@ class RGWBucketReshard {
   // allocated in at once
   static const std::initializer_list<uint16_t> reshard_primes;
 
+  int calc_target_shard(const RGWBucketInfo& bucket_info, const rgw_obj_key& key,
+                        int& shard, const DoutPrefixProvider *dpp);
+  int reshard_process(const rgw::bucket_index_layout_generation& current,
+                      int& max_entries,
+                      BucketReshardManager& target_shards_mgr,
+                      bool verbose_json_out,
+                      std::ostream *out,
+                      Formatter *formatter, rgw::BucketReshardState reshard_stage,
+                      const DoutPrefixProvider *dpp, optional_yield y);
+
   int do_reshard(const rgw::bucket_index_layout_generation& current,
                  const rgw::bucket_index_layout_generation& target,
-                 int max_entries,
+                 int max_entries, bool support_logrecord,
                  bool verbose,
                  std::ostream *os,
 		 Formatter *formatter,
-                 const DoutPrefixProvider *dpp);
+                 ReshardFaultInjector& fault,
+                 const DoutPrefixProvider *dpp, optional_yield y);
 public:
 
   // pass nullptr for the final parameter if no outer reshard lock to
@@ -98,20 +112,27 @@ public:
 		   const std::map<std::string, bufferlist>& _bucket_attrs,
 		   RGWBucketReshardLock* _outer_reshard_lock);
   int execute(int num_shards, ReshardFaultInjector& f,
-              int max_op_entries, const DoutPrefixProvider *dpp,
+              int max_op_entries, const cls_rgw_reshard_initiator initiator,
+	      const DoutPrefixProvider *dpp, optional_yield y,
               bool verbose = false, std::ostream *out = nullptr,
               ceph::Formatter *formatter = nullptr,
 	      RGWReshard *reshard_log = nullptr);
-  int get_status(const DoutPrefixProvider *dpp, std::list<cls_rgw_bucket_instance_entry> *status);
-  int cancel(const DoutPrefixProvider* dpp);
+  int get_status(const DoutPrefixProvider *dpp, optional_yield y,
+                 std::list<cls_rgw_bucket_instance_entry> *status);
+  int cancel(const DoutPrefixProvider* dpp, optional_yield y);
+  int renew_lock_if_needed(const DoutPrefixProvider *dpp);
 
   static int clear_resharding(rgw::sal::RadosStore* store,
 			      RGWBucketInfo& bucket_info,
 			      std::map<std::string, bufferlist>& bucket_attrs,
-                              const DoutPrefixProvider* dpp);
+                              const DoutPrefixProvider* dpp, optional_yield y);
 
   static uint32_t get_max_prime_shards() {
     return *std::crbegin(reshard_primes);
+  }
+
+  static uint32_t get_min_prime_shards() {
+    return *std::cbegin(reshard_primes);
   }
 
   // returns the prime in our list less than or equal to the
@@ -140,43 +161,32 @@ public:
     }
   }
 
-  // returns a preferred number of shards given a calculated number of
-  // shards based on max_dynamic_shards and the list of prime values
-  static uint32_t get_preferred_shards(uint32_t suggested_shards,
-				       uint32_t max_dynamic_shards) {
+  // returns a preferred number of shards as a prime value
+  static uint32_t nearest_prime(uint32_t suggested_shards);
 
-    // use a prime if max is within our prime range, otherwise use
-    // specified max
-    const uint32_t absolute_max =
-      max_dynamic_shards >= get_max_prime_shards() ?
-      max_dynamic_shards :
-      get_prime_shards_less_or_equal(max_dynamic_shards);
-
-    // if we can use a prime number, use it, otherwise use suggested;
-    // note get_prime_shards_greater_or_equal will return 0 if no prime in
-    // prime range
-    const uint32_t prime_ish_num_shards =
-      std::max(get_prime_shards_greater_or_equal(suggested_shards),
-	       suggested_shards);
-
-    // dynamic sharding cannot reshard more than defined maximum
-    const uint32_t final_num_shards =
-      std::min(prime_ish_num_shards, absolute_max);
-
-    return final_num_shards;
-  }
+  static void calculate_preferred_shards(const DoutPrefixProvider* dpp,
+					 const uint32_t max_dynamic_shards,
+					 const uint32_t min_layout_shards,
+					 const uint64_t max_objs_per_shard,
+					 const bool is_multisite,
+					 const uint64_t num_objs,
+					 const uint32_t current_shard_count,
+					 bool& need_resharding,
+					 uint32_t* suggested_shard_count,
+					 bool prefer_prime = true);
 
   const std::map<std::string, bufferlist>& get_bucket_attrs() const {
     return bucket_attrs;
   }
 
-  // for multisite, the RGWBucketInfo keeps a history of old log generations
-  // until all peers are done with them. prevent this log history from growing
-  // too large by refusing to reshard the bucket until the old logs get trimmed
+  // for multisite, the RGWBucketInfo keeps a history of old log
+  // generations until all peers are done with them. prevent this log
+  // history from growing too large by refusing to reshard the bucket
+  // until the old logs get trimmed
   static constexpr size_t max_bilog_history = 4;
 
-  static bool can_reshard(const RGWBucketInfo& bucket,
-                          const RGWSI_Zone* zone_svc);
+  static bool should_zone_reshard_now(const RGWBucketInfo& bucket,
+				      const RGWSI_Zone* zone_svc);
 }; // RGWBucketReshard
 
 
@@ -224,18 +234,17 @@ protected:
 
 public:
   RGWReshard(rgw::sal::RadosStore* _store, bool _verbose = false, std::ostream *_out = nullptr, Formatter *_formatter = nullptr);
-  int add(const DoutPrefixProvider *dpp, cls_rgw_reshard_entry& entry);
-  int update(const DoutPrefixProvider *dpp, const RGWBucketInfo& bucket_info);
+  int add(const DoutPrefixProvider *dpp, cls_rgw_reshard_entry& entry, optional_yield y);
+  int update(const DoutPrefixProvider *dpp, const RGWBucketInfo& bucket_info, const cls_rgw_reshard_initiator initiator, optional_yield y);
   int get(const DoutPrefixProvider *dpp, cls_rgw_reshard_entry& entry);
-  int remove(const DoutPrefixProvider *dpp, const cls_rgw_reshard_entry& entry);
+  int remove(const DoutPrefixProvider *dpp, const cls_rgw_reshard_entry& entry, optional_yield y);
   int list(const DoutPrefixProvider *dpp, int logshard_num, std::string& marker, uint32_t max, std::list<cls_rgw_reshard_entry>& entries, bool *is_truncated);
-  int clear_bucket_resharding(const DoutPrefixProvider *dpp, const std::string& bucket_instance_oid, cls_rgw_reshard_entry& entry);
 
   /* reshard thread */
   int process_entry(const cls_rgw_reshard_entry& entry, int max_entries,
-                    const DoutPrefixProvider *dpp);
-  int process_single_logshard(int logshard_num, const DoutPrefixProvider *dpp);
-  int process_all_logshards(const DoutPrefixProvider *dpp);
+                    const DoutPrefixProvider *dpp, optional_yield y);
+  int process_single_logshard(int logshard_num, const DoutPrefixProvider *dpp, optional_yield y);
+  int process_all_logshards(const DoutPrefixProvider *dpp, optional_yield y);
   bool going_down();
   void start_processor();
   void stop_processor();
@@ -252,11 +261,11 @@ class RGWReshardWait {
   ceph::condition_variable cond;
 
   struct Waiter : boost::intrusive::list_base_hook<> {
-    using Executor = boost::asio::io_context::executor_type;
+    using Executor = boost::asio::any_io_executor;
     using Timer = boost::asio::basic_waitable_timer<Clock,
           boost::asio::wait_traits<Clock>, Executor>;
     Timer timer;
-    explicit Waiter(boost::asio::io_context& ioc) : timer(ioc) {}
+    explicit Waiter(boost::asio::any_io_executor ex) : timer(ex) {}
   };
   boost::intrusive::list<Waiter> waiters;
 
@@ -268,7 +277,7 @@ public:
   ~RGWReshardWait() {
     ceph_assert(going_down);
   }
-  int wait(optional_yield y);
+  int wait(const DoutPrefixProvider* dpp, optional_yield y);
   // unblock any threads waiting on reshard
   void stop();
 };

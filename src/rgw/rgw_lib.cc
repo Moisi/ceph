@@ -114,7 +114,7 @@ namespace rgw {
   void RGWLibProcess::handle_request(const DoutPrefixProvider *dpp, RGWRequest* r)
   {
     /*
-     * invariant: valid requests are derived from RGWLibRequst
+     * invariant: valid requests are derived from RGWLibRequest
      */
     RGWLibRequest* req = static_cast<RGWLibRequest*>(r);
 
@@ -218,6 +218,8 @@ namespace rgw {
       goto done;
     }
 
+    s->trace = tracing::rgw::tracer.start_trace(op->name());
+
     /* req is-a RGWOp, currently initialized separately */
     ret = req->op_init();
     if (ret < 0) {
@@ -245,7 +247,14 @@ namespace rgw {
       /* FIXME: remove this after switching all handlers to the new
        * authentication infrastructure. */
       if (! s->auth.identity) {
-	s->auth.identity = rgw::auth::transform_old_authinfo(s);
+        auto result = rgw::auth::transform_old_authinfo(
+            op, null_yield, env.driver, s->user.get());
+        if (!result) {
+          ret = result.error();
+          abort_req(s, op, ret);
+          goto done;
+        }
+	s->auth.identity = std::move(result).value();
       }
 
       ldpp_dout(s, 2) << "reading op permissions" << dendl;
@@ -272,9 +281,7 @@ namespace rgw {
       ldpp_dout(s, 2) << "verifying op permissions" << dendl;
       ret = op->verify_permission(null_yield);
       if (ret < 0) {
-	if (s->system_request) {
-	  ldpp_dout(op, 2) << "overriding permissions due to system operation" << dendl;
-	} else if (s->auth.identity->is_admin_of(s->user->get_id())) {
+	if (s->auth.identity->is_admin()) {
 	  ldpp_dout(op, 2) << "overriding permissions due to admin operation" << dendl;
 	} else {
 	  abort_req(s, op, ret);
@@ -307,7 +314,7 @@ namespace rgw {
               << e.what() << dendl;
     }
     if (should_log) {
-      rgw_log_op(nullptr /* !rest */, s, op, env.olog);
+      rgw_log_op(nullptr /* !rest */, s, op, env.olog.get());
     }
 
     int http_ret = s->err.http_ret;
@@ -375,7 +382,14 @@ namespace rgw {
     /* FIXME: remove this after switching all handlers to the new authentication
      * infrastructure. */
     if (! s->auth.identity) {
-      s->auth.identity = rgw::auth::transform_old_authinfo(s);
+      auto result = rgw::auth::transform_old_authinfo(
+          op, null_yield, env.driver, s->user.get());
+      if (!result) {
+        ret = result.error();
+        abort_req(s, op, ret);
+        goto done;
+      }
+      s->auth.identity = std::move(result).value();
     }
 
     ldpp_dout(s, 2) << "reading op permissions" << dendl;
@@ -402,9 +416,7 @@ namespace rgw {
     ldpp_dout(s, 2) << "verifying op permissions" << dendl;
     ret = op->verify_permission(null_yield);
     if (ret < 0) {
-      if (s->system_request) {
-	ldpp_dout(op, 2) << "overriding permissions due to system operation" << dendl;
-      } else if (s->auth.identity->is_admin_of(s->user->get_id())) {
+      if (s->auth.identity->is_admin()) {
 	ldpp_dout(op, 2) << "overriding permissions due to admin operation" << dendl;
       } else {
 	abort_req(s, op, ret);
@@ -468,6 +480,7 @@ namespace rgw {
 
   int RGWLib::init(vector<const char*>& args)
   {
+    int r{0};
     /* alternative default for module */
     map<std::string,std::string> defaults = {
       { "debug_rgw", "1/5" },
@@ -524,9 +537,15 @@ namespace rgw {
     register_async_signal_handler(SIGUSR1, rgw::signal::handle_sigterm);
 
     main.init_tracepoints();
-    main.init_frontends2(this /* rgwlib */);
-    main.init_notification_endpoints();
+    r = main.init_frontends2(this /* rgwlib */);
+    if (r != 0) {
+      derr << "ERROR: unable to initialize frontend, r = " << r << dendl;
+      main.shutdown();
+      return r;
+    }
+
     main.init_lua();
+    main.init_dedup();
 
     return 0;
   } /* RGWLib::init() */
@@ -554,9 +573,10 @@ namespace rgw {
     if (ret < 0) {
       derr << "ERROR: failed reading user info: uid=" << uid << " ret="
 	   << ret << dendl;
+      return ret;
     }
     user_info = user->get_info();
-    return ret;
+    return 0;
   }
 
   int RGWLibRequest::read_permissions(RGWOp* op, optional_yield y) {
@@ -601,8 +621,8 @@ namespace rgw {
     s->perm_mask = RGW_PERM_FULL_CONTROL;
 
     // populate the owner info
-    s->owner.set_id(s->user->get_id());
-    s->owner.set_name(s->user->get_display_name());
+    s->owner.id = s->user->get_id();
+    s->owner.display_name = s->user->get_display_name();
 
     return 0;
   } /* RGWHandler_Lib::authorize */

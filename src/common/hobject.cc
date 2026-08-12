@@ -1,10 +1,12 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab
 
-#include <charconv>
-
 #include "hobject.h"
 #include "common/Formatter.h"
+
+#include <charconv>
+#include <fmt/compile.h>
+#include <fmt/core.h>
 
 using std::list;
 using std::ostream;
@@ -14,23 +16,25 @@ using std::string;
 using ceph::bufferlist;
 using ceph::Formatter;
 
-static void append_escaped(const string &in, string *out)
+namespace {
+void escape_special_chars(const string& in, string* out)
 {
-  for (string::const_iterator i = in.begin(); i != in.end(); ++i) {
-    if (*i == '%') {
+  for (auto c : in) {
+    if (c == '%') {
       out->push_back('%');
       out->push_back('p');
-    } else if (*i == '.') {
+    } else if (c == '.') {
       out->push_back('%');
       out->push_back('e');
-    } else if (*i == '_') {
+    } else if (c == '_') {
       out->push_back('%');
       out->push_back('u');
     } else {
-      out->push_back(*i);
+      out->push_back(c);
     }
   }
 }
+}  // namespace
 
 set<string> hobject_t::get_prefixes(
   uint32_t bits,
@@ -80,33 +84,25 @@ set<string> hobject_t::get_prefixes(
 
 string hobject_t::to_str() const
 {
-  string out;
-
-  char snap_with_hash[1000];
-  char *t = snap_with_hash;
-  const char *end = t + sizeof(snap_with_hash);
-
   uint64_t poolid(pool);
-  t += snprintf(t, end - t, "%.*llX", 16, (long long unsigned)poolid);
-
   uint32_t revhash(get_nibblewise_key_u32());
-  t += snprintf(t, end - t, ".%.*X", 8, revhash);
 
-  if (snap == CEPH_NOSNAP)
-    t += snprintf(t, end - t, ".head");
-  else if (snap == CEPH_SNAPDIR)
-    t += snprintf(t, end - t, ".snapdir");
-  else
-    t += snprintf(t, end - t, ".%llx", (long long unsigned)snap);
+  string out;
+  if (snap == CEPH_NOSNAP) {
+    out = fmt::format(FMT_COMPILE("{:016X}.{:08X}.head."), poolid, revhash);
+  } else if (snap == CEPH_SNAPDIR) {
+    out = fmt::format(FMT_COMPILE("{:016X}.{:08X}.snapdir."), poolid, revhash);
+  } else {
+    out = fmt::format(
+	FMT_COMPILE("{:016X}.{:08X}.{:x}."), poolid, revhash,
+	(unsigned long long)snap);
+  }
 
-  out.append(snap_with_hash, t);
-
+  escape_special_chars(oid.name, &out);
   out.push_back('.');
-  append_escaped(oid.name, &out);
+  escape_special_chars(get_key(), &out);
   out.push_back('.');
-  append_escaped(get_key(), &out);
-  out.push_back('.');
-  append_escaped(nspace, &out);
+  escape_special_chars(nspace, &out);
 
   return out;
 }
@@ -198,16 +194,18 @@ void hobject_t::dump(Formatter *f) const
   f->dump_string("namespace", nspace);
 }
 
-void hobject_t::generate_test_instances(list<hobject_t*>& o)
+list<hobject_t> hobject_t::generate_test_instances()
 {
-  o.push_back(new hobject_t);
-  o.push_back(new hobject_t);
-  o.back()->max = true;
-  o.push_back(new hobject_t(object_t("oname"), string(), 1, 234, -1, ""));
-  o.push_back(new hobject_t(object_t("oname2"), string("okey"), CEPH_NOSNAP,
+  list<hobject_t> o;
+  o.emplace_back();
+  o.emplace_back();
+  o.back().max = true;
+  o.push_back(hobject_t(object_t("oname"), string(), 1, 234, -1, ""));
+  o.push_back(hobject_t(object_t("oname2"), string("okey"), CEPH_NOSNAP,
 	67, 0, "n1"));
-  o.push_back(new hobject_t(object_t("oname3"), string("oname3"),
+  o.push_back(hobject_t(object_t("oname3"), string("oname3"),
 	CEPH_SNAPDIR, 910, 1, "n2"));
+  return o;
 }
 
 static void append_out_escaped(const string &in, string *out)
@@ -495,33 +493,35 @@ void ghobject_t::dump(Formatter *f) const
   if (generation != NO_GEN)
     f->dump_int("generation", generation);
   if (shard_id != shard_id_t::NO_SHARD)
-    f->dump_int("shard_id", shard_id);
+    f->dump_int("shard_id", int(shard_id));
   f->dump_int("max", (int)max);
 }
 
-void ghobject_t::generate_test_instances(list<ghobject_t*>& o)
+list<ghobject_t> ghobject_t::generate_test_instances()
 {
-  o.push_back(new ghobject_t);
-  o.push_back(new ghobject_t);
-  o.back()->hobj.max = true;
-  o.push_back(new ghobject_t(hobject_t(object_t("oname"), string(), 1, 234, -1, "")));
+  list<ghobject_t> o;
+  o.emplace_back();
+  o.emplace_back();
+  o.back().hobj.max = true;
+  o.push_back(ghobject_t(hobject_t(object_t("oname"), string(), 1, 234, -1, "")));
 
-  o.push_back(new ghobject_t(hobject_t(object_t("oname2"), string("okey"), CEPH_NOSNAP,
+  o.push_back(ghobject_t(hobject_t(object_t("oname2"), string("okey"), CEPH_NOSNAP,
         67, 0, "n1"), 1, shard_id_t(0)));
-  o.push_back(new ghobject_t(hobject_t(object_t("oname2"), string("okey"), CEPH_NOSNAP,
+  o.push_back(ghobject_t(hobject_t(object_t("oname2"), string("okey"), CEPH_NOSNAP,
         67, 0, "n1"), 1, shard_id_t(1)));
-  o.push_back(new ghobject_t(hobject_t(object_t("oname2"), string("okey"), CEPH_NOSNAP,
+  o.push_back(ghobject_t(hobject_t(object_t("oname2"), string("okey"), CEPH_NOSNAP,
         67, 0, "n1"), 1, shard_id_t(2)));
-  o.push_back(new ghobject_t(hobject_t(object_t("oname3"), string("oname3"),
+  o.push_back(ghobject_t(hobject_t(object_t("oname3"), string("oname3"),
         CEPH_SNAPDIR, 910, 1, "n2"), 1, shard_id_t(0)));
-  o.push_back(new ghobject_t(hobject_t(object_t("oname3"), string("oname3"),
+  o.push_back(ghobject_t(hobject_t(object_t("oname3"), string("oname3"),
         CEPH_SNAPDIR, 910, 1, "n2"), 2, shard_id_t(0)));
-  o.push_back(new ghobject_t(hobject_t(object_t("oname3"), string("oname3"),
+  o.push_back(ghobject_t(hobject_t(object_t("oname3"), string("oname3"),
         CEPH_SNAPDIR, 910, 1, "n2"), 3, shard_id_t(0)));
-  o.push_back(new ghobject_t(hobject_t(object_t("oname3"), string("oname3"),
+  o.push_back(ghobject_t(hobject_t(object_t("oname3"), string("oname3"),
         CEPH_SNAPDIR, 910, 1, "n2"), 3, shard_id_t(1)));
-  o.push_back(new ghobject_t(hobject_t(object_t("oname3"), string("oname3"),
+  o.push_back(ghobject_t(hobject_t(object_t("oname3"), string("oname3"),
         CEPH_SNAPDIR, 910, 1, "n2"), 3, shard_id_t(2)));
+  return o;
 }
 
 ostream& operator<<(ostream& out, const ghobject_t& o)
@@ -552,14 +552,16 @@ bool ghobject_t::parse(const string& s)
   // look for shard# prefix
   const char *start = s.c_str();
   const char *p;
-  int sh = shard_id_t::NO_SHARD;
+  shard_id_t sh = shard_id_t::NO_SHARD;
   for (p = start; *p && isxdigit(*p); ++p) ;
   if (!*p && *p != '#')
     return false;
   if (p > start) {
-    int r = sscanf(s.c_str(), "%x", &sh);
+    unsigned int sh_i;
+    int r = sscanf(s.c_str(), "%x", &sh_i);
     if (r < 1)
       return false;
+    sh = shard_id_t(sh_i);
     start = p + 1;
   } else {
     ++start;

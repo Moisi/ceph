@@ -1,40 +1,38 @@
 import argparse
 import pytest
-import os
 from ceph_volume import exceptions, process
 from ceph_volume.util import arg_validators
-from mock.mock import patch, MagicMock
+from unittest.mock import patch, MagicMock
 
 
 class TestOSDPath(object):
 
-    def setup(self):
+    def setup_method(self):
         self.validator = arg_validators.OSDPath()
 
     def test_is_not_root(self, monkeypatch):
-        monkeypatch.setattr(os, 'getuid', lambda: 100)
+        monkeypatch.setattr('ceph_volume.decorators.os.getuid', lambda : 100)
         with pytest.raises(exceptions.SuperUserError):
             self.validator('')
 
-    def test_path_is_not_a_directory(self, is_root, monkeypatch, fake_filesystem):
+    def test_path_is_not_a_directory(self, monkeypatch, fake_filesystem):
         fake_file = fake_filesystem.create_file('/tmp/foo')
+        monkeypatch.setattr('ceph_volume.decorators.os.getuid', lambda : 0)
         monkeypatch.setattr(arg_validators.disk, 'is_partition', lambda x: False)
-        validator = arg_validators.OSDPath()
         with pytest.raises(argparse.ArgumentError):
-            validator(fake_file.path)
+            self.validator(fake_file.path)
 
-    def test_files_are_missing(self, is_root, tmpdir, monkeypatch):
-        tmppath = str(tmpdir)
-        monkeypatch.setattr(arg_validators.disk, 'is_partition', lambda x: False)
-        validator = arg_validators.OSDPath()
+    @patch('ceph_volume.decorators.os.getuid', return_value=0)
+    @patch('ceph_volume.util.arg_validators.disk.is_partition', return_value=False)
+    def test_files_are_missing(self, m_is_partition, m_getuid, fake_filesystem):
         with pytest.raises(argparse.ArgumentError) as error:
-            validator(tmppath)
+            self.validator('/tmp/osdpath')
         assert 'Required file (ceph_fsid) was not found in OSD' in str(error.value)
 
 
 class TestExcludeGroupOptions(object):
 
-    def setup(self):
+    def setup_method(self):
         self.parser = argparse.ArgumentParser()
 
     def test_flags_in_one_group(self):
@@ -79,7 +77,7 @@ class TestExcludeGroupOptions(object):
 
 class TestValidDevice(object):
 
-    def setup(self, fake_filesystem):
+    def setup_method(self, fake_filesystem):
         self.validator = arg_validators.ValidDevice()
 
     @patch('ceph_volume.util.arg_validators.disk.has_bluestore_label', return_value=False)
@@ -113,7 +111,7 @@ class TestValidDevice(object):
             self.validator('/dev/foo')
 
 class TestValidZapDevice(object):
-    def setup(self):
+    def setup_method(self):
         self.validator = arg_validators.ValidZapDevice()
 
     @patch('ceph_volume.util.arg_validators.Device')
@@ -146,7 +144,7 @@ class TestValidZapDevice(object):
         assert self.validator('/dev/foo')
 
 class TestValidDataDevice(object):
-    def setup(self):
+    def setup_method(self):
         self.validator = arg_validators.ValidDataDevice()
 
     @patch('ceph_volume.util.arg_validators.Device')
@@ -194,7 +192,7 @@ class TestValidDataDevice(object):
             self.validator('/dev/foo')
 
 class TestValidRawDevice(object):
-    def setup(self):
+    def setup_method(self):
         self.validator = arg_validators.ValidRawDevice()
 
     @patch('ceph_volume.util.arg_validators.Device')
@@ -268,7 +266,7 @@ class TestValidRawDevice(object):
             assert self.validator('/dev/foo')
 
 class TestValidBatchDevice(object):
-    def setup(self):
+    def setup_method(self):
         self.validator = arg_validators.ValidBatchDevice()
 
     @patch('ceph_volume.util.arg_validators.Device')
@@ -303,7 +301,7 @@ class TestValidBatchDevice(object):
         assert self.validator('/dev/foo')
 
 class TestValidBatchDataDevice(object):
-    def setup(self):
+    def setup_method(self):
         self.validator = arg_validators.ValidBatchDataDevice()
 
     @patch('ceph_volume.util.arg_validators.Device')
@@ -340,7 +338,7 @@ class TestValidBatchDataDevice(object):
 
 class TestValidFraction(object):
 
-    def setup(self):
+    def setup_method(self):
         self.validator = arg_validators.ValidFraction()
 
     def test_fraction_is_valid(self, fake_call):

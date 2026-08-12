@@ -52,14 +52,14 @@ struct rbm_test_t :
 
   seastar::future<> set_up_fut() final {
     device = random_block_device::create_test_ephemeral(
-      0, DEFAULT_TEST_SIZE);
+      random_block_device::DEFAULT_TEST_CBJOURNAL_SIZE, DEFAULT_TEST_SIZE);
     block_size = device->get_block_size();
     size = device->get_available_size();
     rbm_manager.reset(new BlockRBManager(device.get(), std::string(), false));
     config = get_rbm_ephemeral_device_config(0, 1);
-    return device->mount().handle_error(crimson::ct_error::assert_all{}
+    return device->mkfs(config).handle_error(crimson::ct_error::assert_all{}
     ).then([this] {
-      return device->mkfs(config).handle_error(crimson::ct_error::assert_all{}
+      return device->mount().handle_error(crimson::ct_error::assert_all{}
       ).then([this] {
 	return rbm_manager->open().handle_error(crimson::ct_error::assert_all{});
       });
@@ -67,38 +67,38 @@ struct rbm_test_t :
   }
 
   seastar::future<> tear_down_fut() final {
-    rbm_manager->close().unsafe_get0();
-    device->close().unsafe_get0();
+    rbm_manager->close().unsafe_get();
+    device->close().unsafe_get();
     rbm_manager.reset();
     device.reset();
     return seastar::now();
   }
 
   auto mkfs() {
-    return device->mkfs(config).unsafe_get0();
+    return device->mkfs(config).unsafe_get();
   }
 
-  auto read_rbm_header() {
-    return device->read_rbm_header(RBM_START_ADDRESS).unsafe_get0();
+  auto read_rbm_superblock() {
+    return device->read_rbm_superblock(RBM_START_ADDRESS).unsafe_get();
   }
 
   auto open() {
-    device->mount().unsafe_get0();
-    return rbm_manager->open().unsafe_get0();
+    device->mount().unsafe_get();
+    return rbm_manager->open().unsafe_get();
   }
 
   auto write(uint64_t addr, bufferptr &ptr) {
     paddr_t paddr = convert_abs_addr_to_paddr(
       addr,
       rbm_manager->get_device_id());
-    return rbm_manager->write(paddr, ptr).unsafe_get0();
+    return rbm_manager->write(paddr, ptr).unsafe_get();
   }
 
   auto read(uint64_t addr, bufferptr &ptr) {
     paddr_t paddr = convert_abs_addr_to_paddr(
       addr,
       rbm_manager->get_device_id());
-    return rbm_manager->read(paddr, ptr).unsafe_get0();
+    return rbm_manager->read(paddr, ptr).unsafe_get();
   }
 
   bufferptr generate_extent(size_t blocks) {
@@ -107,11 +107,13 @@ struct rbm_test_t :
       std::numeric_limits<char>::max()
     );
     char contents = distribution(generator);
-    return buffer::ptr(buffer::create(blocks * block_size, contents));
+    auto bp = bufferptr(ceph::buffer::create_page_aligned(blocks * block_size));
+    memset(bp.c_str(), contents, bp.length());
+    return bp;
   }
 
   void close() {
-    rbm_manager->close().unsafe_get0();
+    rbm_manager->close().unsafe_get();
     return;
   }
 
@@ -120,14 +122,14 @@ struct rbm_test_t :
 TEST_F(rbm_test_t, mkfs_test)
 {
  run_async([this] {
-   auto super = read_rbm_header();
+   auto super = read_rbm_superblock();
    ASSERT_TRUE(
        super.block_size == block_size &&
        super.size == size
    );
    config.spec.id = DEVICE_ID_NULL;
    mkfs();
-   super = read_rbm_header();
+   super = read_rbm_superblock();
    ASSERT_TRUE(
        super.config.spec.id == DEVICE_ID_NULL &&
        super.size == size 

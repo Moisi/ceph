@@ -47,13 +47,22 @@ also reported on the `ceph-qa mailing list <https://ceph.com/irc/>`_.
 Testing Priority
 ----------------
 
-In brief: in the ``teuthology-suite`` command option ``-p <N>``, set the value of ``<N>`` to a number lower than 1000. An explanation of why follows.
+In brief: in the ``teuthology-suite`` command option ``-p <N>``, set the value
+of ``<N>`` to a number less than 500. An explanation of why follows.
 
 The ``teuthology-suite`` command includes an option ``-p <N>``. This option specifies the priority of the jobs submitted to the queue. The lower the value of ``N``, the higher the priority.
 
-The default value of ``N`` is ``1000``. This is the same priority value given to the nightly tests (the nightlies). Often, the volume of testing done during the nightly tests is so great that the full number of nightly tests do not get run during the time allotted for their run.
+The default value of ``N`` is ``1000``. Most nightly tests automatically
+scheduled by ``teuthology@teuthology.front.sepia.ceph.com`` are run with ``N >=
+500``. Some critical nightly tests are given higher priority, such as smoke
+tests or QA runs for an imminent major releases.
 
-Set the value of ``N`` lower than ``1000``, or your tests will not have priority over the nightly tests. This means that they might never run.
+.. note:: Often the volume of testing done during the nightly tests is so great
+          that the full number of nightly tests do not get run during the time allotted
+          for their run.
+
+Set the value of ``N`` lower than ``500`` or your tests will not have priority
+over the nightly tests. This means that they might never run.
 
 Select your job's priority (the value of ``N``) in accordance with the following guidelines:
 
@@ -79,7 +88,7 @@ Select your job's priority (the value of ``N``) in accordance with the following
    * - **150 <= N < 200**
      - Use this priority for 100 jobs or fewer that test a particular feature
        or fix.  Results are available in about 24 hours.
-   * - **200 <= N < 1000**
+   * - **200 <= N < 500**
      - Use this priority for large test runs.  Results are available in about a
        week.
 
@@ -135,7 +144,7 @@ integration tests for all the Ceph components.
     - verify that teuthology can run integration tests, with and without OpenStack
 
   * - `upgrade <https://github.com/ceph/ceph/tree/master/qa/suites/upgrade>`_
-    - for various versions of Ceph, verify that upgrades can happen without disrupting an ongoing workload
+    - for various versions of Ceph, verify that upgrades can happen without disrupting an ongoing workload (`Upgrade Testing`_)
 
 teuthology-describe
 -------------------
@@ -308,16 +317,16 @@ directory tree within the ``suites/`` subdirectory of the `ceph/qa sub-directory
 The set of all tests defined by a given subdirectory of ``suites/`` is
 called an "integration test suite", or a "teuthology suite".
 
-Combination of yaml facets is controlled by special files (``%`` and
-``+``) that are placed within the directory tree and can be thought of as
-operators.  The ``%`` file is the "convolution" operator and ``+``
-signifies concatenation.
+Combination of YAML facets is controlled by special files (``%``, ``+`` and ``$``)
+that are placed within the directory tree and can be thought of as
+operators.  The ``%`` file is the "convolution" operator, ``+`` signifies
+concatenation and ``$`` is the "random selection" operator.
 
-Convolution operator
-^^^^^^^^^^^^^^^^^^^^
+Convolution operator - ``%``
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 The convolution operator, implemented as a (typically empty) file called ``%``,
-tells teuthology to construct a test matrix from yaml facets found in
+tells teuthology to construct a test matrix from YAML facets found in
 subdirectories below the directory containing the operator.
 
 For example, the `ceph-deploy suite
@@ -412,8 +421,8 @@ tests will still preserve the correct numerator (subset of subsets).
 You can disable nested subsets using the ``--no-nested-subset`` argument to
 ``teuthology-suite``.
 
-Concatenation operator
-^^^^^^^^^^^^^^^^^^^^^^
+Concatenation operator - ``+``
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 For even greater flexibility in sharing yaml files between suites, the
 special file plus (``+``) can be used to concatenate files within a
@@ -476,6 +485,90 @@ A single test from the rbd/thrash suite can be run by adding the
       --machine-type smithi \
       --suite rbd/thrash \
       --filter 'rbd/thrash/{clusters/fixed-2.yaml clusters/openstack.yaml workloads/rbd_api_tests_copy_on_read.yaml}'
+
+.. _upgrade-testing:
+
+Upgrade Testing
+^^^^^^^^^^^^^^^
+
+Using the upgrade suite we are able to verify that upgrades from earlier releases can complete
+successfully without disrupting any ongoing workload.
+Each Release branch upgrade directory includes 2-x upgrade testing.
+Meaning, we are able to test the upgrade from 2 preceding releases to the current one.
+The upgrade sequence is done in `parallel <https://github.com/ceph/teuthology/blob/main/teuthology/task/parallel.py>`_
+with other given workloads.
+
+For instance, the upgrade test directory from the Quincy release branch is as follows:
+
+.. code-block:: none
+
+  .
+  ├── octopus-x
+  └── pacific-x
+
+It is possible to test upgrades from Octopus (2-x) or from Pacific (1-x) to Quincy (x).
+A simple upgrade test consists the following order:
+
+.. code-block:: none
+
+  ├── 0-start.yaml
+  ├── 1-tasks.yaml
+  ├── upgrade-sequence.yaml
+  └── workload
+
+After starting the cluster with the older release we begin running the given ``workload``
+and the ``upgrade-sequnce`` in parallel.
+
+.. code-block:: yaml
+
+  - print: "**** done start parallel"
+  - parallel:
+      - workload
+      - upgrade-sequence
+  - print: "**** done end parallel"
+
+While the ``workload`` directory consists regular yaml files just as in any other suite,
+the ``upgrade-sequnce`` is resposible for running the upgrade and awaitng its completion:
+
+.. code-block:: yaml
+
+  - print: "**** done start upgrade, wait"
+  ...
+    mon.a:
+      - ceph orch upgrade start --image quay.ceph.io/ceph-ci/ceph:$sha1
+      - while ceph orch upgrade status | jq '.in_progress' | grep true ; do ceph orch ps ; ceph versions ; sleep 30 ; done\
+  ...
+  - print: "**** done end upgrade, wait..."
+
+
+It is also possible to upgrade in stages while running workloads in between those:
+
+.. code-block:: none
+
+  ├── %
+  ├── 0-cluster
+  ├── 1-ceph-install
+  ├── 2-partial-upgrade
+  ├── 3-thrash
+  ├── 4-workload
+  ├── 5-finish-upgrade.yaml
+  ├── 6-quincy.yaml
+  └── 8-final-workload
+
+After starting a cluster we upgrade only 2/3 of the cluster (``2-partial-upgrade``).
+The next stage is running thrash tests and given workload tests. Later on, continuing to upgrade the
+rest of the cluster (``5-finish-upgrade.yaml``).
+The last stage is requiring the updated release (``ceph require-osd-release quincy``,
+``ceph osd set-require-min-compat-client quincy``) and running the ``final-workload``.
+
+Random Selection Operator - ``$``
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The presence of a file named ``$`` provides a hint to teuthology to randomly
+include one of the YAML fragments in the test. Such a scenario is typically
+seen when we need to choose one of the flavors of the features/options to be
+tested randomly.
+
 
 Position Independent Linking
 ----------------------------

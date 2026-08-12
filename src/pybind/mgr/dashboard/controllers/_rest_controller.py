@@ -49,6 +49,7 @@ class RESTController(BaseController, skip_registry=True):
         'GET': Permission.READ,
         'POST': Permission.CREATE,
         'PUT': Permission.UPDATE,
+        'PATCH': Permission.UPDATE,
         'DELETE': Permission.DELETE
     }
 
@@ -60,7 +61,8 @@ class RESTController(BaseController, skip_registry=True):
         ('get', {'method': 'GET', 'resource': True, 'status': 200, 'version': APIVersion.DEFAULT}),
         ('delete', {'method': 'DELETE', 'resource': True, 'status': 204, 'version': APIVersion.DEFAULT}),  # noqa E501 #pylint: disable=line-too-long
         ('set', {'method': 'PUT', 'resource': True, 'status': 200, 'version': APIVersion.DEFAULT}),
-        ('singleton_set', {'method': 'PUT', 'resource': False, 'status': 200, 'version': APIVersion.DEFAULT})  # noqa E501 #pylint: disable=line-too-long
+        ('singleton_set', {'method': 'PUT', 'resource': False, 'status': 200, 'version': APIVersion.DEFAULT}),  # noqa E501 #pylint: disable=line-too-long
+        ('update', {'method': 'PATCH', 'resource': True, 'status': 200, 'version': APIVersion.DEFAULT})  # noqa E501 #pylint: disable=line-too-long
     ])
 
     @classmethod
@@ -70,6 +72,7 @@ class RESTController(BaseController, skip_registry=True):
         for k, v in cls._method_mapping.items():
             func = getattr(cls, k, None)
             while hasattr(func, "__wrapped__"):
+                assert func
                 func = func.__wrapped__
             if v['resource'] and func:
                 path_params = cls.get_path_param_names()

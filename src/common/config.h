@@ -15,6 +15,7 @@
 #ifndef CEPH_CONFIG_H
 #define CEPH_CONFIG_H
 
+#include <iosfwd>
 #include <map>
 #include <variant>
 #include <boost/container/small_vector.hpp>
@@ -38,6 +39,8 @@ enum {
 };
 
 extern const char *ceph_conf_level_name(int level);
+
+extern const char *CEPH_CONF_FILE_DEFAULT;
 
 /** This class represents the current Ceph configuration.
  *
@@ -89,7 +92,7 @@ public:
   /*
    * Mapping from legacy config option names to class members
    */
-  std::map<std::string_view, member_ptr_t> legacy_values;
+  static const std::map<std::string_view, member_ptr_t> legacy_values;
 
   /**
    * The configuration schema, in the form of Option objects describing
@@ -203,7 +206,7 @@ public:
   template<typename T, typename Callback, typename...Args>
   auto with_val(const ConfigValues& values, const std::string_view key,
 		Callback&& cb, Args&&... args) const ->
-    std::result_of_t<Callback(const T&, Args...)> {
+    std::invoke_result_t<Callback, const T&, Args...> {
     return std::forward<Callback>(cb)(
       std::get<T>(this->get_val_generic(values, key)),
       std::forward<Args>(args)...);

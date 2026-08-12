@@ -38,7 +38,7 @@ struct allocator_test_t :
       allocator.reset(new AvlAllocator(false));
       return seastar::now();
     } 
-    ceph_assert(0 == "no support");
+    ceph_abort("no support");
   }
   seastar::future<> tear_down_fut() final {
     if (allocator) {
@@ -46,9 +46,9 @@ struct allocator_test_t :
     }
     return seastar::now();
   }
-  void init_alloc(uint64_t block_size, uint64_t total_size) {
+  void init_alloc(uint64_t block_size, uint64_t total_size, uint64_t base_addr = 0) {
     assert(allocator);
-    allocator->init(0, total_size, block_size);
+    allocator->init(base_addr, total_size, block_size);
   }
   void close() {
     assert(allocator);
@@ -56,6 +56,9 @@ struct allocator_test_t :
   }
   auto allocate(size_t size) {
     return allocator->alloc_extent(size);
+  }
+  auto allocates(size_t size) {
+    return allocator->alloc_extents(size);
   }
   void free(uint64_t start, uint64_t length) {
     allocator->free_extent(start, length);
@@ -98,7 +101,7 @@ TEST_P(allocator_test_t, test_init_alloc_free)
   }
 }
 
-TEST_P(allocator_test_t, test_alloc_failure)
+TEST_P(allocator_test_t, test_scattered_alloc)
 {
   uint64_t block_size = 8192;
   uint64_t capacity = 1024 * block_size;
@@ -108,15 +111,43 @@ TEST_P(allocator_test_t, test_alloc_failure)
     allocator->mark_extent_used(0, block_size * 256);
     allocator->mark_extent_used(block_size * 512, block_size * 256);
 
+    auto result = allocates(block_size * 512);
+    ASSERT_EQ(true, result.has_value());
+
+    free(0, block_size * 256);
+
+    result = allocates(block_size * 512);
+    ASSERT_EQ(false, result.has_value());
+  }
+}
+
+TEST_P(allocator_test_t, test_base_addr)
+{
+  uint64_t block_size = 8192;
+  uint64_t capacity = 1024 * block_size;
+
+  auto run_case = [&](uint64_t base_addr) {
+    init_alloc(block_size, capacity, base_addr);
+
+    allocator->mark_extent_used(base_addr, block_size * 256);
+    allocator->mark_extent_used(base_addr + (block_size * 512), block_size * 256);
+
     auto result = allocate(block_size * 512);
     ASSERT_EQ(false, result.has_value());
 
-    free(0, block_size * 256);
-    allocator->mark_extent_used(0, block_size * 512);
+    result = allocates(block_size * 512);
+    ASSERT_EQ(true, result.has_value());
+
+    free(base_addr, block_size * 512);
 
     result = allocate(block_size * 512);
-    ASSERT_EQ(false, result.has_value());
-  }
+    ASSERT_EQ(true, result.has_value());
+
+    close();
+  };
+
+  run_case(0 /* base_addr */);
+  run_case(capacity /* base_addr */);
 }
 
 TEST_P(allocator_test_t, test_random_alloc_verify)
@@ -142,9 +173,9 @@ TEST_P(allocator_test_t, test_random_alloc_verify)
     for (auto p : alloc_map) {
       free(p.first, p.second);
       avail += p.second;
-      alloc_map.erase(p.first, p.second);
       ASSERT_EQ(avail, allocator->get_available_size());
     }
+    alloc_map.clear();
     ASSERT_EQ(capacity, allocator->get_available_size());
 
     for (int i = 0; i < 100; i++) {

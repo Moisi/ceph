@@ -4,11 +4,13 @@
 
 #include "mds/mdstypes.h"
 #include "include/buffer.h"
+#include "include/intarith.h" // for cbits()
 #include "include/rbd_types.h"
 #include "include/rados/librados.hpp"
 #include "include/stringify.h"
 #include "include/types.h"
 #include "global/global_context.h"
+#include "common/Clock.h" // for ceph_clock_now()
 #include "common/Cond.h"
 #include "common/ceph_crypto.h"
 #include "test/librados/test_cxx.h"
@@ -120,7 +122,7 @@ static inline void buf_to_hex(const unsigned char *buf, int len, char *str)
 }
 
 void check_fp_oid_refcount(librados::IoCtx& ioctx, std::string foid, uint64_t count,
-			   std::string fp_algo = NULL)
+			   std::string fp_algo = std::string{})
 {
   bufferlist t;
   int size = foid.length();
@@ -148,7 +150,7 @@ void check_fp_oid_refcount(librados::IoCtx& ioctx, std::string foid, uint64_t co
   ASSERT_LE(count, refs.count());
 }
 
-string get_fp_oid(string oid, std::string fp_algo = NULL)
+string get_fp_oid(string oid, std::string fp_algo = std::string{})
 {
   if (fp_algo == "sha1") {
     unsigned char fingerprint[CEPH_CRYPTO_SHA1_DIGESTSIZE + 1];
@@ -6264,10 +6266,12 @@ public:
   ~LibRadosTwoPoolsECPP() override {};
 protected:
   static void SetUpTestCase() {
+    SKIP_IF_CRIMSON();
     pool_name = get_temp_pool_name();
     ASSERT_EQ("", create_one_ec_pool_pp(pool_name, s_cluster));
   }
   static void TearDownTestCase() {
+    SKIP_IF_CRIMSON();
     ASSERT_EQ(0, destroy_one_ec_pool_pp(pool_name, s_cluster));
   }
   static std::string cache_pool_name;

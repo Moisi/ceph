@@ -15,6 +15,15 @@
 
 #pragma once
 
+#include <cstdint>
+#include <optional>
+#include <string>
+#include <vector>
+
+#include "include/encoding.h"
+
+namespace ceph { class Formatter; }
+
 struct compression_block {
   uint64_t old_ofs;
   uint64_t new_ofs;
@@ -71,6 +80,7 @@ struct RGWCompressionInfo {
      DECODE_FINISH(bl);
   } 
   void dump(Formatter *f) const;
+  static std::list<RGWCompressionInfo> generate_test_instances();
 };
 WRITE_CLASS_ENCODER(RGWCompressionInfo)
 

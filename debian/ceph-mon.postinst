@@ -1,3 +1,4 @@
+#!/bin/sh
 # vim: set noet ts=8:
 # postinst script for ceph-mon
 #
@@ -23,7 +24,7 @@ set -e
 
 case "$1" in
     configure)
-	[ -x /sbin/start ] && start ceph-mon-all || :
+    :
     ;;
     abort-upgrade|abort-remove|abort-deconfigure)
 	:

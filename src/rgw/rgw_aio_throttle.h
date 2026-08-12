@@ -15,12 +15,10 @@
 
 #pragma once
 
-#include "include/rados/librados_fwd.hpp"
 #include <memory>
 #include "common/ceph_mutex.h"
 #include "common/async/completion.h"
 #include "common/async/yield_context.h"
-#include "services/svc_rados.h"
 #include "rgw_aio.h"
 
 namespace rgw {
@@ -61,14 +59,13 @@ class BlockingAioThrottle final : public Aio, private Throttle {
   struct Pending : AioResultEntry {
     BlockingAioThrottle *parent = nullptr;
     uint64_t cost = 0;
-    librados::AioCompletion *completion = nullptr;
   };
  public:
   BlockingAioThrottle(uint64_t window) : Throttle(window) {}
 
   virtual ~BlockingAioThrottle() override {};
 
-  AioResultList get(const RGWSI_RADOS::Obj& obj, OpFunc&& f,
+  AioResultList get(rgw_raw_obj obj, OpFunc&& f,
                     uint64_t cost, uint64_t id) override final;
 
   void put(AioResult& r) override final;
@@ -83,8 +80,7 @@ class BlockingAioThrottle final : public Aio, private Throttle {
 // a throttle that yields the coroutine instead of blocking. all public
 // functions must be called within the coroutine strand
 class YieldingAioThrottle final : public Aio, private Throttle {
-  boost::asio::io_context& context;
-  yield_context yield;
+  boost::asio::yield_context yield;
   struct Handler;
 
   // completion callback associated with the waiter
@@ -97,14 +93,13 @@ class YieldingAioThrottle final : public Aio, private Throttle {
   struct Pending : AioResultEntry { uint64_t cost = 0; };
 
  public:
-  YieldingAioThrottle(uint64_t window, boost::asio::io_context& context,
-                      yield_context yield)
-    : Throttle(window), context(context), yield(yield)
+  YieldingAioThrottle(uint64_t window, boost::asio::yield_context yield)
+    : Throttle(window), yield(yield)
   {}
 
   virtual ~YieldingAioThrottle() override {};
 
-  AioResultList get(const RGWSI_RADOS::Obj& obj, OpFunc&& f,
+  AioResultList get(rgw_raw_obj obj, OpFunc&& f,
                     uint64_t cost, uint64_t id) override final;
 
   void put(AioResult& r) override final;
@@ -122,7 +117,6 @@ inline auto make_throttle(uint64_t window_size, optional_yield y)
   std::unique_ptr<Aio> aio;
   if (y) {
     aio = std::make_unique<YieldingAioThrottle>(window_size,
-                                                y.get_io_context(),
                                                 y.get_yield_context());
   } else {
     aio = std::make_unique<BlockingAioThrottle>(window_size);

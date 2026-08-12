@@ -6,6 +6,7 @@
 #include <iostream>
 #include <map>
 
+#include "include/function2.hpp"
 #include "include/types.h"
 
 #include "common/Formatter.h"
@@ -33,10 +34,7 @@ bool operator!=(const ACLGranteeType& lhs, const ACLGranteeType& rhs) {
 }
 
 bool operator==(const ACLGrant& lhs, const ACLGrant& rhs) {
-  return lhs.type == rhs.type && lhs.id == rhs.id
-      && lhs.email == rhs.email && lhs.permission == rhs.permission
-      && lhs.name == rhs.name && lhs.group == rhs.group
-      && lhs.url_spec == rhs.url_spec;
+  return lhs.grantee == rhs.grantee && lhs.permission == rhs.permission;
 }
 bool operator!=(const ACLGrant& lhs, const ACLGrant& rhs) {
   return !(lhs == rhs);
@@ -61,13 +59,6 @@ bool operator!=(const RGWAccessControlList& lhs,
   return !(lhs == rhs);
 }
 
-bool operator==(const ACLOwner& lhs, const ACLOwner& rhs) {
-  return lhs.id == rhs.id && lhs.display_name == rhs.display_name;
-}
-bool operator!=(const ACLOwner& lhs, const ACLOwner& rhs) {
-  return !(lhs == rhs);
-}
-
 bool operator==(const RGWAccessControlPolicy& lhs,
                 const RGWAccessControlPolicy& rhs) {
   return lhs.acl == rhs.acl && lhs.owner == rhs.owner;
@@ -77,59 +68,49 @@ bool operator!=(const RGWAccessControlPolicy& lhs,
   return !(lhs == rhs);
 }
 
-void RGWAccessControlList::_add_grant(ACLGrant *grant)
+void RGWAccessControlList::register_grant(const ACLGrant& grant)
 {
-  ACLPermission& perm = grant->get_permission();
-  ACLGranteeType& type = grant->get_type();
-  switch (type.get_type()) {
-  case ACL_TYPE_REFERER:
-    referer_list.emplace_back(grant->get_referer(), perm.get_permissions());
+  ACLPermission perm = grant.get_permission();
+
+  if (const auto* user = grant.get_user(); user) {
+    acl_user_map[to_string(user->id)] |= perm.get_permissions();
+  } else if (const auto* email = grant.get_email(); email) {
+    acl_user_map[email->address] |= perm.get_permissions();
+  } else if (const auto* group = grant.get_group(); group) {
+    acl_group_map[group->type] |= perm.get_permissions();
+  } else if (const auto* referer = grant.get_referer(); referer) {
+    referer_list.emplace_back(referer->url_spec, perm.get_permissions());
 
     /* We're specially handling the Swift's .r:* as the S3 API has a similar
      * concept and thus we can have a small portion of compatibility here. */
-     if (grant->get_referer() == RGW_REFERER_WILDCARD) {
+     if (referer->url_spec == RGW_REFERER_WILDCARD) {
        acl_group_map[ACL_GROUP_ALL_USERS] |= perm.get_permissions();
      }
-    break;
-  case ACL_TYPE_GROUP:
-    acl_group_map[grant->get_group()] |= perm.get_permissions();
-    break;
-  default:
-    {
-      rgw_user id;
-      if (!grant->get_id(id)) {
-        ldout(cct, 0) << "ERROR: grant->get_id() failed" << dendl;
-      }
-      acl_user_map[id.to_str()] |= perm.get_permissions();
-    }
   }
 }
 
-void RGWAccessControlList::add_grant(ACLGrant *grant)
+void RGWAccessControlList::add_grant(const ACLGrant& grant)
 {
-  rgw_user id;
-  grant->get_id(id); // not that this will return false for groups, but that's ok, we won't search groups
-  grant_map.insert(pair<string, ACLGrant>(id.to_str(), *grant));
-  _add_grant(grant);
+  std::string id;
+  if (const auto* user = grant.get_user(); user) {
+    id = to_string(user->id);
+  } else if (const auto* email = grant.get_email(); email) {
+    id = email->address;
+  } // other types share the empty key in the grant multimap
+  grant_map.emplace(id, grant);
+  register_grant(grant);
 }
 
-void RGWAccessControlList::remove_canon_user_grant(rgw_user& user_id)
+void RGWAccessControlList::remove_canon_user_grant(const rgw_owner& owner)
 {
-  auto multi_map_iter = grant_map.find(user_id.to_str());
-  if(multi_map_iter != grant_map.end()) {
-    auto grants = grant_map.equal_range(user_id.to_str());
-    grant_map.erase(grants.first, grants.second);
-  }
-
-  auto map_iter = acl_user_map.find(user_id.to_str());
-  if (map_iter != acl_user_map.end()){
-    acl_user_map.erase(map_iter);
-  }
+  const std::string& id = to_string(owner);
+  grant_map.erase(id);
+  acl_user_map.erase(id);
 }
 
 uint32_t RGWAccessControlList::get_perm(const DoutPrefixProvider* dpp, 
                                         const rgw::auth::Identity& auth_identity,
-                                        const uint32_t perm_mask)
+                                        const uint32_t perm_mask) const
 {
   ldpp_dout(dpp, 5) << "Searching permissions for identity=" << auth_identity
                 << " mask=" << perm_mask << dendl;
@@ -156,7 +137,7 @@ uint32_t RGWAccessControlList::get_group_perm(const DoutPrefixProvider *dpp,
 uint32_t RGWAccessControlList::get_referer_perm(const DoutPrefixProvider *dpp,
                                                 const uint32_t current_perm,
                                                 const std::string http_referer,
-                                                const uint32_t perm_mask)
+                                                const uint32_t perm_mask) const
 {
   ldpp_dout(dpp, 5) << "Searching permissions for referer=" << http_referer
                 << " mask=" << perm_mask << dendl;
@@ -180,14 +161,14 @@ uint32_t RGWAccessControlPolicy::get_perm(const DoutPrefixProvider* dpp,
                                           const rgw::auth::Identity& auth_identity,
                                           const uint32_t perm_mask,
                                           const char * const http_referer,
-                                          bool ignore_public_acls)
+                                          bool ignore_public_acls) const
 {
   ldpp_dout(dpp, 20) << "-- Getting permissions begin with perm_mask=" << perm_mask
                  << dendl;
 
   uint32_t perm = acl.get_perm(dpp, auth_identity, perm_mask);
 
-  if (auth_identity.is_owner_of(owner.get_id())) {
+  if (auth_identity.is_owner_of(owner.id)) {
     perm |= perm_mask & (RGW_PERM_READ_ACP | RGW_PERM_WRITE_ACP);
   }
 
@@ -211,7 +192,7 @@ uint32_t RGWAccessControlPolicy::get_perm(const DoutPrefixProvider* dpp,
   }
 
   ldpp_dout(dpp, 5) << "-- Getting permissions done for identity=" << auth_identity
-                << ", owner=" << owner.get_id()
+                << ", owner=" << owner.id
                 << ", perm=" << perm << dendl;
 
   return perm;
@@ -222,7 +203,7 @@ bool RGWAccessControlPolicy::verify_permission(const DoutPrefixProvider* dpp,
                                                const uint32_t user_perm_mask,
                                                const uint32_t perm,
                                                const char * const http_referer,
-                                               bool ignore_public_acls)
+                                               bool ignore_public_acls) const
 {
   uint32_t test_perm = perm | RGW_PERM_READ_OBJS | RGW_PERM_WRITE_OBJS;
 
@@ -265,12 +246,22 @@ bool RGWAccessControlPolicy::is_public(const DoutPrefixProvider *dpp) const
 
 }
 
-void ACLPermission::generate_test_instances(list<ACLPermission*>& o)
+bool ACLOwner::empty() const
 {
-  ACLPermission *p = new ACLPermission;
-  p->set_permissions(RGW_PERM_WRITE_ACP);
-  o.push_back(p);
-  o.push_back(new ACLPermission);
+  return std::visit(fu2::overload(
+      [] (const rgw_user& uid) { return uid.empty(); },
+      [] (const rgw_account_id& aid) { return aid.empty(); }
+      ), id);
+}
+
+list<ACLPermission> ACLPermission::generate_test_instances()
+{
+  list<ACLPermission> o;
+  ACLPermission p;
+  p.set_permissions(RGW_PERM_WRITE_ACP);
+  o.push_back(std::move(p));
+  o.emplace_back();
+  return o;
 }
 
 void ACLPermission::dump(Formatter *f) const
@@ -286,98 +277,96 @@ void ACLGranteeType::dump(Formatter *f) const
 void ACLGrant::dump(Formatter *f) const
 {
   f->open_object_section("type");
-  type.dump(f);
+  get_type().dump(f);
   f->close_section();
 
-  f->dump_string("id", id.to_str());
-  f->dump_string("email", email);
+  struct dump_visitor {
+    Formatter* f;
 
-  f->open_object_section("permission");
-  permission.dump(f);
-  f->close_section();
+    void operator()(const ACLGranteeCanonicalUser& user) {
+      encode_json("id", user.id, f);
+      encode_json("name", user.name, f);
+    }
+    void operator()(const ACLGranteeEmailUser& email) {
+      encode_json("email", email.address, f);
+    }
+    void operator()(const ACLGranteeGroup& group) {
+      encode_json("group", static_cast<int>(group.type), f);
+    }
+    void operator()(const ACLGranteeUnknown&) {}
+    void operator()(const ACLGranteeReferer& r) {
+      encode_json("url_spec", r.url_spec, f);
+    }
+  };
+  std::visit(dump_visitor{f}, grantee);
 
-  f->dump_string("name", name);
-  f->dump_int("group", (int)group);
-  f->dump_string("url_spec", url_spec);
+  encode_json("permission", permission, f);
 }
 
-void ACLGrant::generate_test_instances(list<ACLGrant*>& o)
+list<ACLGrant> ACLGrant::generate_test_instances()
 {
-  rgw_user id("rgw");
-  string name, email;
-  name = "Mr. RGW";
-  email = "r@gw";
+  list<ACLGrant> o;
+  ACLGrant g1;
+  g1.set_canon(rgw_user{"rgw"}, "Mr. RGW", RGW_PERM_READ);
+  o.push_back(std::move(g1));
 
-  ACLGrant *g1 = new ACLGrant;
-  g1->set_canon(id, name, RGW_PERM_READ);
-  g1->email = email;
-  o.push_back(g1);
+  ACLGrant g2;
+  g1.set_group(ACL_GROUP_AUTHENTICATED_USERS, RGW_PERM_WRITE);
+  o.push_back(std::move(g2));
 
-  ACLGrant *g2 = new ACLGrant;
-  g1->set_group(ACL_GROUP_AUTHENTICATED_USERS, RGW_PERM_WRITE);
-  o.push_back(g2);
-
-  o.push_back(new ACLGrant);
+  o.emplace_back();
+  return o;
 }
 
-void ACLGranteeType::generate_test_instances(list<ACLGranteeType*>& o)
+list<ACLGranteeType> ACLGranteeType::generate_test_instances()
 {
-  ACLGranteeType *t = new ACLGranteeType;
-  t->set(ACL_TYPE_CANON_USER);
-  o.push_back(t);
-  o.push_back(new ACLGranteeType);
+  list<ACLGranteeType> o;
+  o.push_back(ACLGranteeType(ACL_TYPE_CANON_USER));
+  o.emplace_back();
+  return o;
 }
 
-void RGWAccessControlList::generate_test_instances(list<RGWAccessControlList*>& o)
+list<RGWAccessControlList> RGWAccessControlList::generate_test_instances()
 {
-  RGWAccessControlList *acl = new RGWAccessControlList(NULL);
-
-  list<ACLGrant *> glist;
-  list<ACLGrant *>::iterator iter;
-
-  ACLGrant::generate_test_instances(glist);
-  for (iter = glist.begin(); iter != glist.end(); ++iter) {
-    ACLGrant *grant = *iter;
-    acl->add_grant(grant);
-
-    delete grant;
+  list<RGWAccessControlList> o;
+  RGWAccessControlList acl;
+  list<ACLGrant> grants = ACLGrant::generate_test_instances();
+  for (ACLGrant& grant : grants) {
+    acl.add_grant(grant);
   }
-  o.push_back(acl);
-  o.push_back(new RGWAccessControlList(NULL));
+  o.push_back(std::move(acl));
+  o.emplace_back();
+  return o;
 }
 
-void ACLOwner::generate_test_instances(list<ACLOwner*>& o)
+list<ACLOwner> ACLOwner::generate_test_instances()
 {
-  ACLOwner *owner = new ACLOwner;
-  owner->id = "rgw";
-  owner->display_name = "Mr. RGW";
-  o.push_back(owner);
-  o.push_back(new ACLOwner);
+  list<ACLOwner> o;
+  ACLOwner owner;
+  owner.id = "rgw";
+  owner.display_name = "Mr. RGW";
+  o.push_back(std::move(owner));
+  o.emplace_back();
+  return o;
 }
 
-void RGWAccessControlPolicy::generate_test_instances(list<RGWAccessControlPolicy*>& o)
+list<RGWAccessControlPolicy> RGWAccessControlPolicy::generate_test_instances()
 {
-  list<RGWAccessControlList *> acl_list;
-  list<RGWAccessControlList *>::iterator iter;
-  for (iter = acl_list.begin(); iter != acl_list.end(); ++iter) {
-    RGWAccessControlList::generate_test_instances(acl_list);
-    iter = acl_list.begin();
+  list<RGWAccessControlPolicy> o;
+  list<RGWAccessControlList> acl_list = RGWAccessControlList::generate_test_instances();
+  for (auto& acl : acl_list) {
+    RGWAccessControlPolicy p;
+    p.acl = acl;
 
-    RGWAccessControlPolicy *p = new RGWAccessControlPolicy(NULL);
-    RGWAccessControlList *l = *iter;
-    p->acl = *l;
+    p.owner.id = rgw_user{"rgw"};
+    p.owner.display_name = "radosgw";
 
-    string name = "radosgw";
-    rgw_user id("rgw");
-    p->owner.set_name(name);
-    p->owner.set_id(id);
-
-    o.push_back(p);
-
-    delete l;
+    o.push_back(std::move(p));
   }
 
-  o.push_back(new RGWAccessControlPolicy(NULL));
+  o.emplace_back();
+
+  return o;
 }
 
 void RGWAccessControlList::dump(Formatter *f) const
@@ -417,14 +406,14 @@ void RGWAccessControlList::dump(Formatter *f) const
 
 void ACLOwner::dump(Formatter *f) const
 {
-  encode_json("id", id.to_str(), f);
+  encode_json("id", to_string(id), f);
   encode_json("display_name", display_name, f);
 }
 
 void ACLOwner::decode_json(JSONObj *obj) {
   string id_str;
   JSONDecoder::decode_json("id", id_str, obj);
-  id.from_str(id_str);
+  id = parse_owner(id_str);
   JSONDecoder::decode_json("display_name", display_name, obj);
 }
 
@@ -434,9 +423,9 @@ void RGWAccessControlPolicy::dump(Formatter *f) const
   encode_json("owner", owner, f);
 }
 
-ACLGroupTypeEnum ACLGrant::uri_to_group(string& uri)
+ACLGroupTypeEnum ACLGrant::uri_to_group(std::string_view uri)
 {
   // this is required for backward compatibility
-  return ACLGrant_S3::uri_to_group(uri);
+  return rgw::s3::acl_uri_to_group(uri);
 }
 

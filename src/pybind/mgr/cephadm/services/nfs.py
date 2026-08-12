@@ -1,26 +1,36 @@
 import errno
+import ipaddress
 import logging
 import os
 import subprocess
 import tempfile
 from typing import Dict, Tuple, Any, List, cast, Optional
+from configparser import ConfigParser
+from io import StringIO
 
 from mgr_module import HandleCommandResult
 from mgr_module import NFS_POOL_NAME as POOL_NAME
 
 from ceph.deployment.service_spec import ServiceSpec, NFSServiceSpec
+from .service_registry import register_cephadm_service
 
-from orchestrator import DaemonDescription
+from orchestrator import DaemonDescription, OrchestratorError
 
 from cephadm.services.cephadmservice import AuthEntity, CephadmDaemonDeploySpec, CephService
 
 logger = logging.getLogger(__name__)
 
 
+@register_cephadm_service
 class NFSService(CephService):
     TYPE = 'nfs'
+    DEFAULT_EXPORTER_PORT = 9587
 
-    def ranked(self) -> bool:
+    @property
+    def needs_monitoring(self) -> bool:
+        return True
+
+    def ranked(self, spec: ServiceSpec) -> bool:
         return True
 
     def fence(self, daemon_id: str) -> None:
@@ -42,7 +52,7 @@ class NFSService(CephService):
                     if daemon_id is not None:
                         self.fence(daemon_id)
                 del rank_map[rank]
-                nodeid = f'{spec.service_name()}.{rank}'
+                nodeid = f'{rank}'
                 self.mgr.log.info(f'Removing {nodeid} from the ganesha grace table')
                 self.run_grace_tool(cast(NFSServiceSpec, spec), 'remove', nodeid)
                 self.mgr.spec_store.save_rank_map(spec.service_name(), rank_map)
@@ -76,7 +86,9 @@ class NFSService(CephService):
 
         deps: List[str] = []
 
-        nodeid = f'{daemon_spec.service_name}.{daemon_spec.rank}'
+        nodeid = f'{daemon_spec.rank}'
+
+        nfs_idmap_conf = '/etc/ganesha/idmap.conf'
 
         # create the RADOS recovery pool keyring
         rados_user = f'{daemon_type}.{daemon_id}'
@@ -89,13 +101,33 @@ class NFSService(CephService):
         # create the rados config object
         self.create_rados_config_obj(spec)
 
+        port = daemon_spec.ports[0] if daemon_spec.ports else 2049
+        monitoring_ip, monitoring_port = self.get_monitoring_details(daemon_spec.service_name, host)
+
         # create the RGW keyring
         rgw_user = f'{rados_user}-rgw'
         rgw_keyring = self.create_rgw_keyring(daemon_spec)
+        bind_addr = ''
+        if spec.virtual_ip and not spec.enable_haproxy_protocol:
+            bind_addr = spec.virtual_ip
+            daemon_spec.port_ips = {str(port): spec.virtual_ip}
+            # update daemon spec ip for prometheus, as monitoring will happen on this
+            # ip, if no monitor ip specified
+            daemon_spec.ip = bind_addr
+        elif daemon_spec.ip:
+            bind_addr = daemon_spec.ip
+            daemon_spec.port_ips = {str(port): daemon_spec.ip}
+        if not bind_addr:
+            logger.warning(f'Bind address in {daemon_type}.{daemon_id}\'s ganesha conf is defaulting to empty')
+        else:
+            logger.debug("using haproxy bind address: %r", bind_addr)
+
+        if monitoring_ip:
+            daemon_spec.port_ips.update({str(monitoring_port): monitoring_ip})
 
         # generate the ganesha config
         def get_ganesha_conf() -> str:
-            context = {
+            context: Dict[str, Any] = {
                 "user": rados_user,
                 "nodeid": nodeid,
                 "pool": POOL_NAME,
@@ -103,10 +135,35 @@ class NFSService(CephService):
                 "rgw_user": rgw_user,
                 "url": f'rados://{POOL_NAME}/{spec.service_id}/{spec.rados_config_name()}',
                 # fall back to default NFS port if not present in daemon_spec
-                "port": daemon_spec.ports[0] if daemon_spec.ports else 2049,
-                "bind_addr": daemon_spec.ip if daemon_spec.ip else '',
+                "port": port,
+                "monitoring_addr": monitoring_ip,
+                "monitoring_port": monitoring_port,
+                "bind_addr": bind_addr,
+                "haproxy_hosts": [],
+                "nfs_idmap_conf": nfs_idmap_conf,
+                "enable_nlm": str(spec.enable_nlm).lower(),
+                "cluster_id": self.mgr._cluster_fsid,
             }
+            if spec.enable_haproxy_protocol:
+                context["haproxy_hosts"] = self._haproxy_hosts()
+                if spec.virtual_ip:
+                    context["haproxy_hosts"].append(spec.virtual_ip)
+                logger.debug("selected haproxy_hosts: %r", context["haproxy_hosts"])
             return self.mgr.template.render('services/nfs/ganesha.conf.j2', context)
+
+        # generate the idmap config
+        def get_idmap_conf() -> str:
+            idmap_conf = spec.idmap_conf
+            output = ''
+            if idmap_conf is not None:
+                cp = ConfigParser()
+                out = StringIO()
+                cp.read_dict(idmap_conf)
+                cp.write(out)
+                out.seek(0)
+                output = out.read()
+                out.close()
+            return output
 
         # generate the cephadm config json
         def get_cephadm_config() -> Dict[str, Any]:
@@ -117,6 +174,7 @@ class NFSService(CephService):
             config['extra_args'] = ['-N', 'NIV_EVENT']
             config['files'] = {
                 'ganesha.conf': get_ganesha_conf(),
+                'idmap.conf': get_idmap_conf()
             }
             config.update(
                 self.get_config_and_keyring(
@@ -282,9 +340,64 @@ class NFSService(CephService):
             '--namespace', cast(str, spec.service_id),
             'rm', 'grace',
         ]
-        subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=10
-        )
+        try:
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=10
+            )
+        except Exception as e:
+            err_msg = f'Got unexpected exception trying to remove ganesha grace file for nfs.{spec.service_id} service: {str(e)}'
+            self.mgr.log.warning(err_msg)
+            raise OrchestratorError(err_msg)
+        if result.returncode:
+            if "No such file" in result.stderr.decode('utf-8'):
+                logger.info(f'Grace file for nfs.{spec.service_id} already deleted')
+            else:
+                err_msg = f'Failed to remove ganesha grace file for nfs.{spec.service_id} service: {result.stderr.decode("utf-8")}'
+                self.mgr.log.warning(err_msg)
+                raise OrchestratorError(err_msg)
+
+    def _haproxy_hosts(self) -> List[str]:
+        # NB: Ideally, we would limit the list to IPs on hosts running
+        # haproxy/ingress only, but due to the nature of cephadm today
+        # we'd "only know the set of haproxy hosts after they've been
+        # deployed" (quoth @adk7398). As it is today we limit the list
+        # of hosts we know are managed by cephadm. That ought to be
+        # good enough to prevent acceping haproxy protocol messages
+        # from "rouge" systems that are not under our control. At
+        # least until we learn otherwise.
+        cluster_ips: List[str] = []
+        for host in self.mgr.inventory.keys():
+            default_addr = self.mgr.inventory.get_addr(host)
+            cluster_ips.append(default_addr)
+            nets = self.mgr.cache.networks.get(host)
+            if not nets:
+                continue
+            for subnet, iface in nets.items():
+                ip_subnet = ipaddress.ip_network(subnet)
+                if ipaddress.ip_address(default_addr) in ip_subnet:
+                    continue  # already present
+                if ip_subnet.is_loopback or ip_subnet.is_link_local:
+                    continue  # ignore special subnets
+                addrs: List[str] = sum((addr_list for addr_list in iface.values()), [])
+                if addrs:
+                    # one address per interface/subnet is enough
+                    cluster_ips.append(addrs[0])
+        return cluster_ips
+
+    def get_monitoring_details(self, service_name: str, host: str) -> Tuple[Optional[str], Optional[int]]:
+        spec = cast(NFSServiceSpec, self.mgr.spec_store[service_name].spec)
+        monitoring_port = spec.monitoring_port if spec.monitoring_port else 9587
+
+        # check if monitor needs to be bind on specific ip
+        monitoring_addr = spec.monitoring_ip_addrs.get(host) if spec.monitoring_ip_addrs else None
+        if monitoring_addr and monitoring_addr not in self.mgr.cache.get_host_network_ips(host):
+            logger.debug(f"Monitoring IP {monitoring_addr} is not configured on host {host}.")
+            monitoring_addr = None
+        if not monitoring_addr and spec.monitoring_networks:
+            monitoring_addr = self.mgr.get_first_matching_network_ip(host, spec, spec.monitoring_networks)
+            if not monitoring_addr:
+                logger.debug(f"No IP address found in the network {spec.monitoring_networks} on host {host}.")
+        return monitoring_addr, monitoring_port

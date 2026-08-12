@@ -21,6 +21,7 @@
 #pragma once
 
 #include <string>
+#include <optional>
 #include <fmt/format.h>
 
 #include "include/types.h"
@@ -31,7 +32,9 @@
 #include "rgw_user_types.h"
 #include "rgw_bucket_types.h"
 #include "rgw_obj_types.h"
-#include "rgw_obj_manifest.h"
+#include "rgw_cksum.h"
+
+#include "driver/rados/rgw_obj_manifest.h" // FIXME: subclass dependency
 
 #include "common/Formatter.h"
 
@@ -65,13 +68,24 @@ struct rgw_zone_id {
   rgw_zone_id(std::string&& _id) : id(std::move(_id)) {}
 
   void encode(ceph::buffer::list& bl) const {
-    /* backward compatiblity, not using ENCODE_{START,END} macros */
+    /* backward compatibility, not using ENCODE_{START,END} macros */
     ceph::encode(id, bl);
   }
 
   void decode(ceph::buffer::list::const_iterator& bl) {
-    /* backward compatiblity, not using DECODE_{START,END} macros */
+    /* backward compatibility, not using DECODE_{START,END} macros */
     ceph::decode(id, bl);
+  }
+
+  void dump(ceph::Formatter *f) const {
+    f->dump_string("id", id);
+  }
+
+  static std::list<rgw_zone_id> generate_test_instances() {
+    std::list<rgw_zone_id> o;
+    o.emplace_back();
+    o.push_back(rgw_zone_id("id"));
+    return o;
   }
 
   void clear() {
@@ -131,10 +145,11 @@ extern void decode_json_obj(rgw_placement_rule& v, JSONObj *obj);
 namespace rgw {
 namespace auth {
 class Principal {
-  enum types { User, Role, Tenant, Wildcard, OidcProvider, AssumedRole };
+  enum types { User, Role, Account, Wildcard, OidcProvider, AssumedRole, Service };
   types t;
   rgw_user u;
   std::string idp_url;
+  std::string service_id;
 
   explicit Principal(types t)
     : t(t) {}
@@ -159,8 +174,8 @@ public:
     return Principal(Role, std::move(t), std::move(u));
   }
 
-  static Principal tenant(std::string&& t) {
-    return Principal(Tenant, std::move(t), {});
+  static Principal account(std::string&& t) {
+    return Principal(Account, std::move(t), {});
   }
 
   static Principal oidc_provider(std::string&& idp_url) {
@@ -169,6 +184,12 @@ public:
 
   static Principal assumed_role(std::string&& t, std::string&& u) {
     return Principal(AssumedRole, std::move(t), std::move(u));
+  }
+
+  static Principal service(std::string&& s) {
+    auto p = Principal(Service);
+    p.service_id = std::move(s);
+    return p;
   }
 
   bool is_wildcard() const {
@@ -183,8 +204,8 @@ public:
     return t == Role;
   }
 
-  bool is_tenant() const {
-    return t == Tenant;
+  bool is_account() const {
+    return t == Account;
   }
 
   bool is_oidc_provider() const {
@@ -195,7 +216,11 @@ public:
     return t == AssumedRole;
   }
 
-  const std::string& get_tenant() const {
+  bool is_service() const {
+    return t == Service;
+  }
+
+  const std::string& get_account() const {
     return u.tenant;
   }
 
@@ -213,6 +238,10 @@ public:
 
   const std::string& get_role() const {
     return u.id;
+  }
+
+  const std::string& get_service() const {
+    return service_id;
   }
 
   bool operator ==(const Principal& o) const {
@@ -248,11 +277,15 @@ struct RGWUploadPartInfo {
   ceph::real_time modified;
   RGWObjManifest manifest;
   RGWCompressionInfo cs_info;
+  std::optional<rgw::cksum::Cksum> cksum;
+
+  // Previous part obj prefixes. Recorded here for later cleanup.
+  std::set<std::string> past_prefixes; 
 
   RGWUploadPartInfo() : num(0), size(0) {}
 
   void encode(bufferlist& bl) const {
-    ENCODE_START(4, 2, bl);
+    ENCODE_START(6, 2, bl);
     encode(num, bl);
     encode(size, bl);
     encode(etag, bl);
@@ -260,10 +293,12 @@ struct RGWUploadPartInfo {
     encode(manifest, bl);
     encode(cs_info, bl);
     encode(accounted_size, bl);
+    encode(past_prefixes, bl);
+    encode(cksum, bl);
     ENCODE_FINISH(bl);
   }
   void decode(bufferlist::const_iterator& bl) {
-    DECODE_START_LEGACY_COMPAT_LEN(4, 2, 2, bl);
+    DECODE_START_LEGACY_COMPAT_LEN(6, 2, 2, bl);
     decode(num, bl);
     decode(size, bl);
     decode(etag, bl);
@@ -276,9 +311,15 @@ struct RGWUploadPartInfo {
     } else {
       accounted_size = size;
     }
+    if (struct_v >= 5) {
+      decode(past_prefixes, bl);
+    }
+    if (struct_v >= 6) {
+      decode(cksum, bl);
+    }
     DECODE_FINISH(bl);
   }
   void dump(Formatter *f) const;
-  static void generate_test_instances(std::list<RGWUploadPartInfo*>& o);
+  static std::list<RGWUploadPartInfo> generate_test_instances();
 };
 WRITE_CLASS_ENCODER(RGWUploadPartInfo)

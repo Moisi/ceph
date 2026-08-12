@@ -4,6 +4,7 @@
 #include "librbd/io/SimpleSchedulerObjectDispatch.h"
 #include "include/neorados/RADOS.hpp"
 #include "common/ceph_time.h"
+#include "common/Clock.h" // for ceph_clock_now()
 #include "common/Timer.h"
 #include "common/errno.h"
 #include "librbd/AsioEngine.h"
@@ -105,7 +106,8 @@ bool SimpleSchedulerObjectDispatch<I>::ObjectRequests::try_delay_request(
 
     // try to merge back to an existing request
     iter = m_delayed_requests.lower_bound(object_off);
-    if (iter == m_delayed_requests.end() || iter->first > object_off) {
+    if (iter != m_delayed_requests.begin() &&
+        (iter == m_delayed_requests.end() || iter->first > object_off)) {
       iter--;
     }
     if (iter != m_delayed_requests.end() &&

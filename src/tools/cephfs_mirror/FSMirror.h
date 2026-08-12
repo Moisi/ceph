@@ -47,14 +47,39 @@ public:
 
   bool is_failed() {
     std::scoped_lock locker(m_lock);
-    return m_init_failed ||
-           m_instance_watcher->is_failed() ||
-           m_mirror_watcher->is_failed();
+    bool failed = m_init_failed;
+    if (m_instance_watcher) {
+      failed |= m_instance_watcher->is_failed();
+    }
+    if (m_mirror_watcher) {
+      failed |= m_mirror_watcher->is_failed();
+    }
+    return failed;
+  }
+
+  monotime get_failed_ts() {
+    std::scoped_lock locker(m_lock);
+    return m_failed_ts;
+  }
+
+  void set_failed_ts() {
+    std::scoped_lock locker(m_lock);
+    m_failed_ts = clock::now();
   }
 
   bool is_blocklisted() {
     std::scoped_lock locker(m_lock);
     return is_blocklisted(locker);
+  }
+
+  monotime get_blocklisted_ts() {
+    std::scoped_lock locker(m_lock);
+    return m_blocklisted_ts;
+  }
+
+  void set_blocklisted_ts() {
+    std::scoped_lock locker(m_lock);
+    m_blocklisted_ts = clock::now();
   }
 
   Peers get_peers() {
@@ -99,8 +124,24 @@ private:
     void release_directory(std::string_view dir_path) override {
       fs_mirror->handle_release_directory(dir_path);
     }
+
   };
 
+  struct TimestampListener: public Watcher::ErrorListener {
+    FSMirror *fs_mirror;
+    TimestampListener(FSMirror *fs_mirror)
+      : fs_mirror(fs_mirror) {
+    }
+    void set_blocklisted_ts() {
+      fs_mirror->set_blocklisted_ts();
+    }
+    void set_failed_ts() {
+      fs_mirror->set_failed_ts();
+    }
+  };
+
+  monotime m_blocklisted_ts;
+  monotime m_failed_ts;
   CephContext *m_cct;
   Filesystem m_filesystem;
   uint64_t m_pool_id;
@@ -110,6 +151,7 @@ private:
 
   ceph::mutex m_lock = ceph::make_mutex("cephfs::mirror::fs_mirror");
   SnapListener m_snap_listener;
+  TimestampListener m_ts_listener;
   std::set<std::string, std::less<>> m_directories;
   Peers m_all_peers;
   std::map<Peer, std::unique_ptr<PeerReplayer>> m_peer_replayers;
@@ -129,6 +171,8 @@ private:
   MirrorAdminSocketHook *m_asok_hook = nullptr;
 
   MountRef m_mount;
+
+  PerfCounters *m_perf_counters;
 
   int init_replayer(PeerReplayer *peer_replayer);
   void shutdown_replayer(PeerReplayer *peer_replayer);

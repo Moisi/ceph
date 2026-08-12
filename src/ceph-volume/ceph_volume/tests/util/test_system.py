@@ -4,7 +4,7 @@ import getpass
 import pytest
 from textwrap import dedent
 from ceph_volume.util import system
-from mock.mock import patch
+from unittest.mock import patch
 from ceph_volume.tests.conftest import Factory
 
 
@@ -264,7 +264,7 @@ except NameError:
 
 class TestSetContext(object):
 
-    def setup(self):
+    def setup_method(self):
         try:
             os.environ.pop('CEPH_VOLUME_SKIP_RESTORECON')
         except KeyError:

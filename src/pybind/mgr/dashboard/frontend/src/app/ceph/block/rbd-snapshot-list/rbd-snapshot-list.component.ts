@@ -9,15 +9,13 @@ import {
   ViewChild
 } from '@angular/core';
 
-import { NgbModalRef } from '@ng-bootstrap/ng-bootstrap';
 import moment from 'moment';
 import { of } from 'rxjs';
-import { RbdMirroringService } from '~/app/shared/api/rbd-mirroring.service';
 
 import { RbdService } from '~/app/shared/api/rbd.service';
 import { CdHelperClass } from '~/app/shared/classes/cd-helper.class';
 import { ConfirmationModalComponent } from '~/app/shared/components/confirmation-modal/confirmation-modal.component';
-import { CriticalConfirmationModalComponent } from '~/app/shared/components/critical-confirmation-modal/critical-confirmation-modal.component';
+import { DeleteConfirmationModalComponent } from '~/app/shared/components/delete-confirmation-modal/delete-confirmation-modal.component';
 import { ActionLabelsI18n } from '~/app/shared/constants/app.constants';
 import { CellTemplate } from '~/app/shared/enum/cell-template.enum';
 import { CdTableAction } from '~/app/shared/models/cd-table-action';
@@ -31,7 +29,6 @@ import { Task } from '~/app/shared/models/task';
 import { CdDatePipe } from '~/app/shared/pipes/cd-date.pipe';
 import { DimlessBinaryPipe } from '~/app/shared/pipes/dimless-binary.pipe';
 import { AuthStorageService } from '~/app/shared/services/auth-storage.service';
-import { ModalService } from '~/app/shared/services/modal.service';
 import { NotificationService } from '~/app/shared/services/notification.service';
 import { SummaryService } from '~/app/shared/services/summary.service';
 import { TaskListService } from '~/app/shared/services/task-list.service';
@@ -39,6 +36,8 @@ import { TaskManagerService } from '~/app/shared/services/task-manager.service';
 import { RbdSnapshotFormModalComponent } from '../rbd-snapshot-form/rbd-snapshot-form-modal.component';
 import { RbdSnapshotActionsModel } from './rbd-snapshot-actions.model';
 import { RbdSnapshotModel } from './rbd-snapshot.model';
+import { ModalCdsService } from '~/app/shared/services/modal-cds.service';
+import { DeletionImpact } from '~/app/shared/enum/delete-confirmation-modal-impact.enum';
 
 @Component({
   selector: 'cd-rbd-snapshot-list',
@@ -77,9 +76,7 @@ export class RbdSnapshotListComponent implements OnInit, OnChanges {
 
   columns: CdTableColumn[];
 
-  modalRef: NgbModalRef;
-
-  peerConfigured = false;
+  modalRef: any;
 
   builders = {
     'rbd/snap/create': (metadata: any) => {
@@ -91,17 +88,16 @@ export class RbdSnapshotListComponent implements OnInit, OnChanges {
 
   constructor(
     private authStorageService: AuthStorageService,
-    private modalService: ModalService,
     private dimlessBinaryPipe: DimlessBinaryPipe,
     private cdDatePipe: CdDatePipe,
     private rbdService: RbdService,
-    private rbdMirrorService: RbdMirroringService,
     private taskManagerService: TaskManagerService,
     private notificationService: NotificationService,
     private summaryService: SummaryService,
     private taskListService: TaskListService,
     private actionLabels: ActionLabelsI18n,
-    private cdr: ChangeDetectorRef
+    private cdr: ChangeDetectorRef,
+    private cdsModalService: ModalCdsService
   ) {
     this.permission = this.authStorageService.getPermissions().rbdImage;
   }
@@ -122,7 +118,7 @@ export class RbdSnapshotListComponent implements OnInit, OnChanges {
         pipe: this.dimlessBinaryPipe
       },
       {
-        name: $localize`Provisioned`,
+        name: $localize`Used`,
         prop: 'disk_usage',
         flexGrow: 1,
         cellClass: 'text-right',
@@ -148,20 +144,12 @@ export class RbdSnapshotListComponent implements OnInit, OnChanges {
       }
     ];
 
-    this.rbdMirrorService.getPeerForPool(this.poolName).subscribe((resp: any) => {
-      if (resp.length > 0) {
-        this.peerConfigured = true;
-      }
-    });
-
     this.imageSpec = new ImageSpec(this.poolName, this.namespace, this.rbdName);
     this.rbdTableActions = new RbdSnapshotActionsModel(
       this.actionLabels,
       this.featuresName,
       this.rbdService
     );
-    this.rbdTableActions.create.disable = () =>
-      !this.primary || (!this.peerConfigured && this.mirroring === 'snapshot');
     this.rbdTableActions.create.click = () => this.openCreateSnapshotModal();
     this.rbdTableActions.rename.click = () => this.openEditSnapshotModal();
     this.rbdTableActions.protect.click = () => this.toggleProtection();
@@ -227,21 +215,21 @@ export class RbdSnapshotListComponent implements OnInit, OnChanges {
 
   private openSnapshotModal(taskName: string, snapName: string = null) {
     const modalVariables = {
+      poolName: this.poolName,
+      imageName: this.rbdName,
+      namespace: this.namespace,
       mirroring: this.mirroring
     };
-    this.modalRef = this.modalService.show(RbdSnapshotFormModalComponent, modalVariables);
-    this.modalRef.componentInstance.poolName = this.poolName;
-    this.modalRef.componentInstance.imageName = this.rbdName;
-    this.modalRef.componentInstance.namespace = this.namespace;
+    this.modalRef = this.cdsModalService.show(RbdSnapshotFormModalComponent, modalVariables);
     if (snapName) {
-      this.modalRef.componentInstance.setEditing();
+      this.modalRef.setEditing();
     } else {
       // Auto-create a name for the snapshot: <image_name>_<timestamp_ISO_8601>
       // https://en.wikipedia.org/wiki/ISO_8601
       snapName = `${this.rbdName}_${moment().toISOString(true)}`;
     }
-    this.modalRef.componentInstance.setSnapName(snapName);
-    this.modalRef.componentInstance.onSubmit.subscribe((snapshotName: string) => {
+    this.modalRef.setSnapName(snapName);
+    this.modalRef.onSubmit.subscribe((snapshotName: string) => {
       const executingTask = new ExecutingTask();
       executingTask.name = taskName;
       executingTask.metadata = {
@@ -303,7 +291,7 @@ export class RbdSnapshotListComponent implements OnInit, OnChanges {
         executingTask.name = finishedTask.name;
         executingTask.metadata = finishedTask.metadata;
         this.summaryService.addRunningTask(executingTask);
-        this.modalRef.close();
+        this.cdsModalService.dismissAll();
         this.taskManagerService.subscribe(
           executingTask.name,
           executingTask.metadata,
@@ -313,7 +301,7 @@ export class RbdSnapshotListComponent implements OnInit, OnChanges {
         );
       })
       .catch(() => {
-        this.modalRef.componentInstance.stopLoadingSpinner();
+        this.cdsModalService.stopLoadingSpinner(this.modalRef.snapshotForm);
       });
   }
 
@@ -332,12 +320,13 @@ export class RbdSnapshotListComponent implements OnInit, OnChanges {
       }
     };
 
-    this.modalRef = this.modalService.show(ConfirmationModalComponent, initialState);
+    this.modalRef = this.cdsModalService.show(ConfirmationModalComponent, initialState);
   }
 
   deleteSnapshotModal() {
     const snapshotName = this.selection.selected[0].name;
-    this.modalRef = this.modalService.show(CriticalConfirmationModalComponent, {
+    this.modalRef = this.cdsModalService.show(DeleteConfirmationModalComponent, {
+      impact: DeletionImpact.high,
       itemDescription: $localize`RBD snapshot`,
       itemNames: [snapshotName],
       submitAction: () => this._asyncTask('deleteSnapshot', 'rbd/snap/delete', snapshotName)

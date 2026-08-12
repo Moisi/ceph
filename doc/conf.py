@@ -13,9 +13,13 @@ top_level = \
         os.path.dirname(
             os.path.abspath(__file__)))
 
-pybind_rgw_mod = __import__('rgw', globals(), locals(), [], 0)
-sys.modules['pybind_rgw_mod'] = pybind_rgw_mod
-
+# it could be that ceph was built without RGW support
+# e.g. in a local development environment
+try:
+    pybind_rgw_mod = __import__('rgw', globals(), locals(), [], 0)
+    sys.modules['pybind_rgw_mod'] = pybind_rgw_mod
+except Exception:
+    pass
 
 def parse_ceph_release():
     with open(os.path.join(top_level, 'src/ceph_release')) as f:
@@ -72,7 +76,7 @@ html_show_sphinx = False
 html_static_path = ["_static"]
 html_sidebars = {
     '**': ['smarttoc.html', 'searchbox.html']
-    }
+}
 
 html_css_files = ['css/custom.css']
 
@@ -129,13 +133,23 @@ extensions = [
     'sphinxcontrib.mermaid',
     'sphinxcontrib.openapi',
     'sphinxcontrib.seqdiag',
-    ]
+]
 
 ditaa = shutil.which("ditaa")
 if ditaa is not None:
     # in case we don't have binfmt_misc enabled or jar is not registered
-    ditaa_args = ['-jar', ditaa]
-    ditaa = 'java'
+    _jar_paths = [
+        '/usr/share/ditaa/lib/ditaa.jar',  # Gentoo
+        '/usr/share/ditaa/ditaa.jar',  # deb
+        '/usr/share/java/ditaa.jar',  # rpm
+    ]
+    _jar_paths = [p for p in _jar_paths if os.path.exists(p)]
+    if _jar_paths:
+        ditaa = 'java'
+        ditaa_args = ['-jar', _jar_paths[0]]
+    else:
+        # keep ditaa from shutil.which
+        ditaa_args = []
     extensions += ['sphinxcontrib.ditaa']
 else:
     extensions += ['plantweb.directive']

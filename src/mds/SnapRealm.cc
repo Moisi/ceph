@@ -13,9 +13,13 @@
  */
 
 #include "SnapRealm.h"
+#include "CInode.h"
+#include "CDentry.h"
+#include "CDir.h"
 #include "MDCache.h"
 #include "MDSRank.h"
 #include "SnapClient.h"
+#include "common/debug.h"
 
 #include <string_view>
 
@@ -53,6 +57,8 @@ ostream& operator<<(ostream& out, const SnapRealm& realm)
 
   if (realm.srnode.is_parent_global())
     out << " global ";
+  out << " last_modified " << realm.srnode.last_modified
+      << " change_attr " << realm.srnode.change_attr;
   out << " " << &realm << ")";
   return out;
 }
@@ -61,6 +67,9 @@ SnapRealm::SnapRealm(MDCache *c, CInode *in) :
     mdcache(c), inode(in), inodes_with_caps(member_offset(CInode, item_caps))
 {
   global = (inode->ino() == CEPH_INO_GLOBAL_SNAPREALM);
+  if (inode->ino() == CEPH_INO_ROOT) {
+    srnode.last_modified = in->get_inode()->mtime;
+  }
 }
 
 /*
@@ -250,7 +259,7 @@ snapid_t SnapRealm::resolve_snapname(std::string_view n, inodeno_t atino, snapid
     //if (num && p->second.snapid == num)
     //return p->first;
     if (actual && p->second.name == n)
-	return p->first;
+      return p->first;
     if (!actual && p->second.name == pname && p->second.ino == pino)
       return p->first;
   }
@@ -304,7 +313,7 @@ void SnapRealm::adjust_parent()
 
 void SnapRealm::split_at(SnapRealm *child)
 {
-  dout(10) << "split_at " << *child 
+  dout(10) << __func__ << ": " << *child
 	   << " on " << *child->inode << dendl;
 
   if (inode->is_mdsdir() || !child->inode->is_dir()) {
@@ -323,8 +332,23 @@ void SnapRealm::split_at(SnapRealm *child)
 
   // it's a dir.
 
+  if (child->inode->get_projected_parent_dir()->inode->is_stray()) {
+    if (child->inode->containing_realm) {
+      dout(10) << " moving unlinked directory inode" << dendl;
+      child->inode->move_to_realm(child);
+    } else {
+      /* This shouldn't happen because an unlinked directory will have caps
+       * issued to the caller executing rmdir (for today's clients).
+       */
+      dout(10) << " skipping unlinked directory inode w/o caps" << dendl;
+    }
+    return;
+  }
+
   // split open_children
-  dout(10) << " open_children are " << open_children << dendl;
+  if (!open_children.empty()) {
+    dout(10) << " open_children are " << open_children << dendl;
+  }
   for (set<SnapRealm*>::iterator p = open_children.begin();
        p != open_children.end(); ) {
     SnapRealm *realm = *p;
@@ -341,17 +365,25 @@ void SnapRealm::split_at(SnapRealm *child)
   }
 
   // split inodes_with_caps
+  std::unordered_map<CInode const*,bool> visited;
+  uint64_t count = 0;
+  dout(20) << " reserving space for " << CDir::count() << " dirs" << dendl;
+  visited.reserve(CDir::count()); /* a reasonable starting poing: keep in mind there may be CInode directories without fragments in cache */
   for (auto p = inodes_with_caps.begin(); !p.end(); ) {
     CInode *in = *p;
     ++p;
     // does inode fall within the child realm?
-    if (child->inode->is_ancestor_of(in)) {
-      dout(20) << " child gets " << *in << dendl;
+    if (child->inode->is_ancestor_of(in, &visited)) {
+      dout(25) << " child gets " << *in << dendl;
       in->move_to_realm(child);
+      ++count;
     } else {
-      dout(20) << "    keeping " << *in << dendl;
+      dout(25) << "    keeping " << *in << dendl;
     }
   }
+  dout(20) << " visited " << visited.size() << " directories" << dendl;
+
+  dout(10) << __func__ << ": split " << count << " inodes" << dendl;
 }
 
 void SnapRealm::merge_to(SnapRealm *newparent)
@@ -385,9 +417,16 @@ const bufferlist& SnapRealm::get_snap_trace() const
   return cached_snap_trace;
 }
 
+const bufferlist& SnapRealm::get_snap_trace_new() const
+{
+  check_cache();
+  return cached_snap_trace_new;
+}
+
 void SnapRealm::build_snap_trace() const
 {
   cached_snap_trace.clear();
+  cached_snap_trace_new.clear();
 
   if (global) {
     SnapRealmInfo info(inode->ino(), 0, cached_seq, 0);
@@ -396,7 +435,10 @@ void SnapRealm::build_snap_trace() const
       info.my_snaps.push_back(*p);
 
     dout(10) << "build_snap_trace my_snaps " << info.my_snaps << dendl;
+
+    SnapRealmInfoNew ninfo(info, srnode.last_modified, srnode.change_attr);
     encode(info, cached_snap_trace);
+    encode(ninfo, cached_snap_trace_new);
     return;
   }
 
@@ -429,10 +471,15 @@ void SnapRealm::build_snap_trace() const
     info.my_snaps.push_back(p->first);
   dout(10) << "build_snap_trace my_snaps " << info.my_snaps << dendl;
 
-  encode(info, cached_snap_trace);
+  SnapRealmInfoNew ninfo(info, srnode.last_modified, srnode.change_attr);
 
-  if (parent)
+  encode(info, cached_snap_trace);
+  encode(ninfo, cached_snap_trace_new);
+
+  if (parent) {
     cached_snap_trace.append(parent->get_snap_trace());
+    cached_snap_trace_new.append(parent->get_snap_trace_new());
+  }
 }
 
 void SnapRealm::prune_past_parent_snaps()

@@ -197,6 +197,27 @@ bool RGWObjManifest::get_rule(uint64_t ofs, RGWObjManifestRule *rule)
   return true;
 }
 
+auto RGWObjManifest::obj_find_part(const DoutPrefixProvider *dpp,
+                                   int part_num) const
+    -> obj_iterator
+{
+  const obj_iterator end = obj_end(dpp);
+  if (end.get_cur_part_id() == 0) { // not mulitipart
+    return end;
+  }
+
+  // linear search over parts/stripes
+  for (obj_iterator i = obj_begin(dpp); i != end; ++i) {
+    if (i.get_cur_part_id() == part_num) {
+      return i;
+    }
+    if (i.get_cur_part_id() > part_num) {
+      return end;
+    }
+  }
+  return end;
+}
+
 int RGWObjManifest::generator::create_begin(CephContext *cct, RGWObjManifest *_m,
                                             const rgw_placement_rule& head_placement_rule,
                                             const rgw_placement_rule *tail_placement_rule,
@@ -250,23 +271,29 @@ int RGWObjManifest::generator::create_begin(CephContext *cct, RGWObjManifest *_m
   return 0;
 }
 
-void RGWObjManifestPart::generate_test_instances(std::list<RGWObjManifestPart*>& o)
+std::list<RGWObjManifestPart> RGWObjManifestPart::generate_test_instances()
 {
-  o.push_back(new RGWObjManifestPart);
+  std::list<RGWObjManifestPart> o;
 
-  RGWObjManifestPart *p = new RGWObjManifestPart;
+  o.emplace_back();
+
+  RGWObjManifestPart p;
   rgw_bucket b;
   init_bucket(&b, "tenant", "bucket", ".pool", ".index_pool", "marker_", "12");
 
-  p->loc = rgw_obj(b, "object");
-  p->loc_ofs = 512 * 1024;
-  p->size = 128 * 1024;
-  o.push_back(p);
+  p.loc = rgw_obj(b, "object");
+  p.loc_ofs = 512 * 1024;
+  p.size = 128 * 1024;
+  o.push_back(std::move(p));
+
+  return o;
 }
 
-void RGWObjManifest::generate_test_instances(std::list<RGWObjManifest*>& o)
+std::list<RGWObjManifest> RGWObjManifest::generate_test_instances()
 {
-  RGWObjManifest *m = new RGWObjManifest;
+  std::list<RGWObjManifest> o;
+
+  RGWObjManifest m;
   map<uint64_t, RGWObjManifestPart> objs;
   uint64_t total_size = 0;
   for (int i = 0; i<10; i++) {
@@ -279,9 +306,10 @@ void RGWObjManifest::generate_test_instances(std::list<RGWObjManifest*>& o)
     total_size += p.size;
     objs[total_size] = p;
   }
-  m->set_explicit(total_size, objs);
-  o.push_back(m);
-  o.push_back(new RGWObjManifest);
+  m.set_explicit(total_size, objs);
+  o.push_back(std::move(m));
+  o.emplace_back();
+  return o;
 }
 
 void RGWObjManifestPart::dump(Formatter *f) const
@@ -324,6 +352,11 @@ void RGWObjManifest::dump(Formatter *f) const
   ::encode_json("rules", rules, f);
   ::encode_json("tail_instance", tail_instance, f);
   ::encode_json("tail_placement", tail_placement, f);
+  ::encode_json("tier_type", tier_type, f);
+
+  if (RGWTierType::is_tier_type_supported(tier_type)) {
+    ::encode_json("tier_config", tier_config, f);
+  }
 
   // nullptr being passed into iterators since there
   // is no cct and we aren't doing anything with these
@@ -341,6 +374,20 @@ void RGWObjManifestRule::dump(Formatter *f) const
   encode_json("override_prefix", override_prefix, f);
 }
 
+std::list<RGWObjManifestRule> RGWObjManifestRule::generate_test_instances()
+{
+  std::list<RGWObjManifestRule> o;
+  RGWObjManifestRule r;
+  r.start_part_num = 0;
+  r.start_ofs = 0;
+  r.part_size = 512 * 1024;
+  r.stripe_max_size = 512 * 1024 * 1024;
+  r.override_prefix = "override_prefix";
+  o.push_back(std::move(r));
+  o.emplace_back();
+  return o;
+}
+
 void rgw_obj_select::dump(Formatter *f) const
 {
   f->dump_string("placement_rule", placement_rule.to_str());
@@ -354,6 +401,20 @@ void RGWObjTier::dump(Formatter *f) const
   encode_json("name", name, f);
   encode_json("tier_placement", tier_placement, f);
   encode_json("is_multipart_upload", is_multipart_upload, f);
+}
+
+std::list<RGWObjTier> RGWObjTier::generate_test_instances()
+{
+  std::list<RGWObjTier> o;
+  RGWObjTier t;
+  t.name = "name";
+  for (auto& tier : RGWZoneGroupPlacementTier::generate_test_instances()) {
+    t.tier_placement = tier;
+  }
+  t.is_multipart_upload = true;
+  o.push_back(std::move(t));
+  o.emplace_back();
+  return o;
 }
 
 // returns true on success, false on failure

@@ -21,25 +21,21 @@
 
 #include "rgw_service.h"
 
-#include "svc_rados.h"
+#include "driver/rados/rgw_tools.h"
 
 
 class RGWSI_Cls : public RGWServiceInstance
 {
   RGWSI_Zone *zone_svc{nullptr};
-  RGWSI_RADOS *rados_svc{nullptr};
+  librados::Rados* rados{nullptr};
 
   class ClsSubService : public RGWServiceInstance {
     friend class RGWSI_Cls;
 
-    RGWSI_Cls *cls_svc{nullptr};
-    RGWSI_Zone *zone_svc{nullptr};
-    RGWSI_RADOS *rados_svc{nullptr};
+    RGWSI_Cls *cls{nullptr};
 
-    void init(RGWSI_Cls *_cls_svc, RGWSI_Zone *_zone_svc, RGWSI_RADOS *_rados_svc) {
-      cls_svc = _cls_svc;
-      zone_svc = _cls_svc->zone_svc;
-      rados_svc = _cls_svc->rados_svc;
+    void init(RGWSI_Cls *cls_) {
+      cls = cls_;
     }
 
   public:
@@ -48,7 +44,6 @@ class RGWSI_Cls : public RGWServiceInstance
 
 public:
   class MFA : public ClsSubService {
-    int get_mfa_obj(const DoutPrefixProvider *dpp, const rgw_user& user, std::optional<RGWSI_RADOS::Obj> *obj);
     int get_mfa_ref(const DoutPrefixProvider *dpp, const rgw_user& user, rgw_rados_ref *ref);
 
     void prepare_mfa_write(librados::ObjectWriteOperation *op,
@@ -81,11 +76,11 @@ public:
   } mfa;
 
   class TimeLog : public ClsSubService {
-    int init_obj(const DoutPrefixProvider *dpp, const std::string& oid, RGWSI_RADOS::Obj& obj);
+    int init_obj(const DoutPrefixProvider *dpp, const std::string& oid, rgw_rados_ref& obj);
   public:
     TimeLog(CephContext *cct): ClsSubService(cct) {}
 
-    void prepare_entry(cls_log_entry& entry,
+    void prepare_entry(cls::log::entry& entry,
                        const real_time& ut,
                        const std::string& section,
                        const std::string& key,
@@ -99,7 +94,7 @@ public:
             optional_yield y);
     int add(const DoutPrefixProvider *dpp, 
             const std::string& oid,
-            std::list<cls_log_entry>& entries,
+            std::vector<cls::log::entry>& entries,
             librados::AioCompletion *completion,
             bool monotonic_inc,
             optional_yield y);
@@ -107,19 +102,19 @@ public:
              const std::string& oid,
              const real_time& start_time,
              const real_time& end_time,
-             int max_entries, std::list<cls_log_entry>& entries,
+             int max_entries, std::vector<cls::log::entry>& entries,
              const std::string& marker,
              std::string *out_marker,
              bool *truncated,
              optional_yield y);
     int info(const DoutPrefixProvider *dpp, 
              const std::string& oid,
-             cls_log_header *header,
+             cls::log::header *header,
              optional_yield y);
     int info_async(const DoutPrefixProvider *dpp,
-                   RGWSI_RADOS::Obj& obj,
+                   rgw_rados_ref& obj,
                    const std::string& oid,
-                   cls_log_header *header,
+                   cls::log::header *header,
                    librados::AioCompletion *completion);
     int trim(const DoutPrefixProvider *dpp, 
              const std::string& oid,
@@ -132,7 +127,7 @@ public:
   } timelog;
 
   class Lock : public ClsSubService {
-    int init_obj(const std::string& oid, RGWSI_RADOS::Obj& obj);
+    int init_obj(const std::string& oid, rgw_rados_ref& obj);
     public:
     Lock(CephContext *cct): ClsSubService(cct) {}
     int lock_exclusive(const DoutPrefixProvider *dpp,
@@ -152,15 +147,14 @@ public:
 
   RGWSI_Cls(CephContext *cct): RGWServiceInstance(cct), mfa(cct), timelog(cct), lock(cct) {}
 
-  void init(RGWSI_Zone *_zone_svc, RGWSI_RADOS *_rados_svc) {
-    rados_svc = _rados_svc;
+  void init(RGWSI_Zone *_zone_svc, librados::Rados* rados_) {
+    rados = rados_;
     zone_svc = _zone_svc;
 
-    mfa.init(this, zone_svc, rados_svc);
-    timelog.init(this, zone_svc, rados_svc);
-    lock.init(this, zone_svc, rados_svc);
+    mfa.init(this);
+    timelog.init(this);
+    lock.init(this);
   }
 
   int do_start(optional_yield, const DoutPrefixProvider *dpp) override;
 };
-

@@ -15,7 +15,10 @@
 #ifndef CEPH_MMDSBEACON_H
 #define CEPH_MMDSBEACON_H
 
+#include <map>
+#include <string>
 #include <string_view>
+#include <vector>
 
 #include "msg/Message.h"
 #include "messages/PaxosServiceMessage.h"
@@ -45,6 +48,10 @@ enum mds_metric_t {
   MDS_HEALTH_SLOW_REQUEST,
   MDS_HEALTH_CACHE_OVERSIZED,
   MDS_HEALTH_SLOW_METADATA_IO,
+  MDS_HEALTH_CLIENTS_LAGGY,
+  MDS_HEALTH_CLIENTS_LAGGY_MANY,
+  MDS_HEALTH_CLIENTS_BROKEN_ROOTSQUASH,
+  MDS_HEALTH_ESTIMATED_REPLAY_TIME,
   MDS_HEALTH_DUMMY, // not a real health warning, for testing
 };
 
@@ -63,6 +70,10 @@ inline const char *mds_metric_name(mds_metric_t m)
   case MDS_HEALTH_SLOW_REQUEST: return "MDS_SLOW_REQUEST";
   case MDS_HEALTH_CACHE_OVERSIZED: return "MDS_CACHE_OVERSIZED";
   case MDS_HEALTH_SLOW_METADATA_IO: return "MDS_SLOW_METADATA_IO";
+  case MDS_HEALTH_CLIENTS_LAGGY: return "MDS_CLIENTS_LAGGY";
+  case MDS_HEALTH_CLIENTS_LAGGY_MANY: return "MDS_CLIENTS_LAGGY_MANY";
+  case MDS_HEALTH_CLIENTS_BROKEN_ROOTSQUASH: return "MDS_CLIENTS_BROKEN_ROOTSQUASH";
+  case MDS_HEALTH_ESTIMATED_REPLAY_TIME: return "MDS_ESTIMATED_REPLAY_TIME";
   case MDS_HEALTH_DUMMY: return "MDS_DUMMY";
   default:
     return "???";
@@ -97,6 +108,12 @@ inline const char *mds_metric_summary(mds_metric_t m)
     return "%num% MDSs report oversized cache";
   case MDS_HEALTH_SLOW_METADATA_IO:
     return "%num% MDSs report slow metadata IOs";
+  case MDS_HEALTH_CLIENTS_LAGGY:
+    return "%num% client(s) laggy due to laggy OSDs";  
+  case MDS_HEALTH_CLIENTS_BROKEN_ROOTSQUASH:
+    return "%num% MDS report clients with broken root_squash implementation";
+  case MDS_HEALTH_ESTIMATED_REPLAY_TIME:
+    return "%num% estimated journal replay time";
   default:
     return "???";
   }
@@ -145,6 +162,27 @@ struct MDSHealthMetric
     DECODE_FINISH(bl);
   }
 
+  void dump(ceph::Formatter *f) const {
+    f->dump_string("type", mds_metric_name(type));
+    f->dump_stream("sev") << sev;
+    f->dump_string("message", message);
+    f->open_object_section("metadata");
+    for (auto& i : metadata) {
+      f->dump_string(i.first.c_str(), i.second);
+    }
+    f->close_section();
+  }
+
+  static std::list<MDSHealthMetric> generate_test_instances() {
+    std::list<MDSHealthMetric> ls;
+    ls.push_back(MDSHealthMetric());
+    ls.back().type = MDS_HEALTH_CACHE_OVERSIZED;
+    ls.push_back(MDSHealthMetric(MDS_HEALTH_TRIM, HEALTH_WARN, "MDS is behind on trimming"));
+    ls.back().metadata["mds"] = "a";
+    ls.back().metadata["num"] = "1";
+    return ls;
+  }
+
   bool operator==(MDSHealthMetric const &other) const
   {
     return (type == other.type && sev == other.sev && message == other.message);
@@ -175,6 +213,25 @@ struct MDSHealth
     DECODE_START(1, bl);
     decode(metrics, bl);
     DECODE_FINISH(bl);
+  }
+
+  void dump(ceph::Formatter *f) const {
+    f->open_array_section("metrics");
+    for (auto& i : metrics) {
+      f->open_object_section("metric");
+      i.dump(f);
+      f->close_section();
+    }
+    f->close_section();
+  }
+
+  static std::list<MDSHealth> generate_test_instances() {
+    std::list<MDSHealth> ls;
+    ls.emplace_back();
+    ls.emplace_back();
+    ls.back().metrics.push_back(MDSHealthMetric(MDS_HEALTH_TRIM, HEALTH_WARN,
+             "MDS is behind on trimming"));
+    return ls;
   }
 
   bool operator==(MDSHealth const &other) const

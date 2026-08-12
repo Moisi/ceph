@@ -3,8 +3,6 @@ import logging
 import os
 import re
 
-from shlex import split as shlex_split
-
 from tasks.ceph_test_case import CephTestCase
 
 from teuthology import contextutil
@@ -12,6 +10,12 @@ from teuthology.orchestra import run
 from teuthology.exceptions import CommandFailedError
 
 log = logging.getLogger(__name__)
+
+def classhook(m):
+    def dec(cls):
+        getattr(cls, m)()
+        return cls
+    return dec
 
 def for_teuthology(f):
     """
@@ -67,6 +71,7 @@ class CephFSTestCase(CephTestCase):
     CLIENTS_REQUIRED = 1
     MDSS_REQUIRED = 1
     REQUIRE_ONE_CLIENT_REMOTE = False
+    ALLOW_REFERENT_INODES = False
 
     # Whether to create the default filesystem during setUp
     REQUIRE_FILESYSTEM = True
@@ -76,6 +81,13 @@ class CephFSTestCase(CephTestCase):
     REQUIRE_BACKUP_FILESYSTEM = False
 
     LOAD_SETTINGS = [] # type: ignore
+
+    def _reqid_tostr(self, reqid):
+        """
+        Change a json reqid to a string representation.
+        """
+
+        return f"{reqid['entity']['type']}.{reqid['entity']['num']}:{reqid['tid']}"
 
     def _save_mount_details(self):
         """
@@ -90,22 +102,22 @@ class CephFSTestCase(CephTestCase):
         # In case anything is in the OSD blocklist list, clear it out.  This is to avoid
         # the OSD map changing in the background (due to blocklist expiry) while tests run.
         try:
-            self.mds_cluster.mon_manager.run_cluster_cmd(args="osd blocklist clear")
+            self.run_ceph_cmd("osd blocklist clear")
         except CommandFailedError:
             # Fallback for older Ceph cluster
             try:
-                blocklist = json.loads(self.mds_cluster.mon_manager.raw_cluster_cmd("osd",
-                                      "dump", "--format=json-pretty"))['blocklist']
+                blocklist = json.loads(self.get_ceph_cmd_stdout("osd",
+                    "dump", "--format=json-pretty"))['blocklist']
                 log.info(f"Removing {len(blocklist)} blocklist entries")
                 for addr, blocklisted_at in blocklist.items():
-                    self.mds_cluster.mon_manager.raw_cluster_cmd("osd", "blocklist", "rm", addr)
+                    self.run_ceph_cmd("osd", "blocklist", "rm", addr)
             except KeyError:
                 # Fallback for more older Ceph clusters, who will use 'blacklist' instead.
-                blacklist = json.loads(self.mds_cluster.mon_manager.raw_cluster_cmd("osd",
-                                      "dump", "--format=json-pretty"))['blacklist']
+                blacklist = json.loads(self.get_ceph_cmd_stdout("osd",
+                    "dump", "--format=json-pretty"))['blacklist']
                 log.info(f"Removing {len(blacklist)} blacklist entries")
                 for addr, blocklisted_at in blacklist.items():
-                    self.mds_cluster.mon_manager.raw_cluster_cmd("osd", "blacklist", "rm", addr)
+                    self.run_ceph_cmd("osd", "blacklist", "rm", addr)
 
     def setUp(self):
         super(CephFSTestCase, self).setUp()
@@ -154,7 +166,7 @@ class CephFSTestCase(CephTestCase):
         for entry in self.auth_list():
             ent_type, ent_id = entry['entity'].split(".")
             if ent_type == "client" and ent_id not in client_mount_ids and not (ent_id == "admin" or ent_id[:6] == 'mirror'):
-                self.mds_cluster.mon_manager.raw_cluster_cmd("auth", "del", entry['entity'])
+                self.run_ceph_cmd("auth", "del", entry['entity'])
 
         if self.REQUIRE_FILESYSTEM:
             self.fs = self.mds_cluster.newfs(create=True)
@@ -162,14 +174,14 @@ class CephFSTestCase(CephTestCase):
             # In case some test messed with auth caps, reset them
             for client_id in client_mount_ids:
                 cmd = ['auth', 'caps', f'client.{client_id}', 'mon','allow r',
-                       'osd', f'allow rw pool={self.fs.get_data_pool_name()}',
+                       'osd', f'allow rw tag cephfs data={self.fs.name}',
                        'mds', 'allow']
 
-                if self.run_cluster_cmd_result(cmd) == 0:
+                if self.get_ceph_cmd_result(*cmd) == 0:
                     break
 
                 cmd[1] = 'add'
-                if self.run_cluster_cmd_result(cmd) != 0:
+                if self.get_ceph_cmd_result(*cmd) != 0:
                     raise RuntimeError(f'Failed to create new client {cmd[2]}')
 
             # wait for ranks to become active
@@ -179,19 +191,22 @@ class CephFSTestCase(CephTestCase):
             for i in range(0, self.CLIENTS_REQUIRED):
                 self.mounts[i].mount_wait()
 
+            # enable referent inodes
+            if self.ALLOW_REFERENT_INODES:
+              self.fs.set_allow_referent_inodes(True)
+
         if self.REQUIRE_BACKUP_FILESYSTEM:
             if not self.REQUIRE_FILESYSTEM:
                 self.skipTest("backup filesystem requires a primary filesystem as well")
-            self.fs.mon_manager.raw_cluster_cmd('fs', 'flag', 'set',
-                                                'enable_multiple', 'true',
-                                                '--yes-i-really-mean-it')
+            self.run_ceph_cmd('fs', 'flag', 'set', 'enable_multiple', 'true',
+                              '--yes-i-really-mean-it')
             self.backup_fs = self.mds_cluster.newfs(name="backup_fs")
             self.backup_fs.wait_for_daemons()
 
         # Load an config settings of interest
         for setting in self.LOAD_SETTINGS:
             setattr(self, setting, float(self.fs.mds_asok(
-                ['config', 'get', setting], list(self.mds_cluster.mds_ids)[0]
+                ['config', 'get', setting], mds_id=list(self.mds_cluster.mds_ids)[0]
             )[setting]))
 
         self.configs_set = set()
@@ -220,9 +235,8 @@ class CephFSTestCase(CephTestCase):
         """
         Convenience wrapper on "ceph auth ls"
         """
-        return json.loads(self.mds_cluster.mon_manager.raw_cluster_cmd(
-            "auth", "ls", "--format=json-pretty"
-        ))['auth_dump']
+        return json.loads(self.get_ceph_cmd_stdout("auth", "ls",
+            "--format=json-pretty"))['auth_dump']
 
     def assert_session_count(self, expected, ls_data=None, mds_id=None):
         if ls_data is None:
@@ -243,8 +257,8 @@ class CephFSTestCase(CephTestCase):
     def get_session_data(self, client_id):
         return self._session_by_id(client_id)
 
-    def _session_list(self):
-        ls_data = self.fs.mds_asok(['session', 'ls'])
+    def _session_list(self, rank=None, status=None):
+        ls_data = self.fs.rank_asok(['session', 'ls'], rank=rank, status=status)
         ls_data = [s for s in ls_data if s['state'] not in ['stale', 'closed']]
         return ls_data
 
@@ -260,9 +274,9 @@ class CephFSTestCase(CephTestCase):
     def perf_dump(self, rank=None, status=None):
         return self.fs.rank_asok(['perf', 'dump'], rank=rank, status=status)
 
-    def wait_until_evicted(self, client_id, timeout=30):
+    def wait_until_evicted(self, client_id, rank=None, timeout=30):
         def is_client_evicted():
-            ls = self._session_list()
+            ls = self._session_list(rank=rank)
             for s in ls:
                 if s['id'] == client_id:
                     return False
@@ -337,6 +351,7 @@ class CephFSTestCase(CephTestCase):
                             subtrees = []
                             for r in self.fs.get_ranks(status=status):
                                 s = self.fs.rank_asok(["get", "subtrees"], status=status, rank=r['rank'])
+                                log.debug(f"{json.dumps(s, indent=2)}")
                                 s = filter(lambda s: s['auth_first'] == r['rank'] and s['auth_second'] == -2, s)
                                 subtrees += s
                         else:
@@ -382,11 +397,15 @@ class CephFSTestCase(CephTestCase):
             with contextutil.safe_while(sleep=5, tries=20) as proceed:
                 while proceed():
                     subtrees = self._get_subtrees(status=status, rank=rank, path=path)
-                    subtrees = list(filter(lambda s: s['distributed_ephemeral_pin'] == True and
-                                                     s['auth_first'] == s['export_pin_target'],
-                                           subtrees))
-                    log.info(f"len={len(subtrees)} {subtrees}")
+                    dist = list(filter(lambda s: s['distributed_ephemeral_pin'] == True and
+                                                 s['auth_first'] == s['export_pin_target'],
+                                       subtrees))
+                    log.info(f"len={len(dist)}\n{json.dumps(dist, indent=2)}")
+
                     if len(subtrees) >= count:
+                        if len(subtrees) > len(dist):
+                            # partial migration
+                            continue
                         return subtrees
         except contextutil.MaxWhileTries as e:
             raise RuntimeError("rank {0} failed to reach desired subtree state".format(rank)) from e
@@ -405,16 +424,6 @@ class CephFSTestCase(CephTestCase):
         except contextutil.MaxWhileTries as e:
             raise RuntimeError("rank {0} failed to reach desired subtree state".format(rank)) from e
 
-    def run_cluster_cmd(self, cmd):
-        if isinstance(cmd, str):
-            cmd = shlex_split(cmd)
-        return self.fs.mon_manager.raw_cluster_cmd(*cmd)
-
-    def run_cluster_cmd_result(self, cmd):
-        if isinstance(cmd, str):
-            cmd = shlex_split(cmd)
-        return self.fs.mon_manager.raw_cluster_cmd_result(*cmd)
-
     def create_client(self, client_id, moncap=None, osdcap=None, mdscap=None):
         if not (moncap or osdcap or mdscap):
             if self.fs:
@@ -432,5 +441,5 @@ class CephFSTestCase(CephTestCase):
         if mdscap:
             cmd += ['mds', mdscap]
 
-        self.run_cluster_cmd(cmd)
-        return self.run_cluster_cmd(f'auth get {self.client_name}')
+        self.run_ceph_cmd(*cmd)
+        return self.get_ceph_cmd_stdout(f'auth get {self.client_name}')

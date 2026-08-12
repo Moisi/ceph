@@ -1,11 +1,13 @@
 import os
 import pytest
 from ceph_volume.devices.simple import activate
+from unittest.mock import patch
 
 
 class TestActivate(object):
 
-    def test_no_data_uuid(self, factory, is_root, monkeypatch, capture, fake_filesystem):
+    @patch('ceph_volume.decorators.os.getuid', return_value=0)
+    def test_no_data_uuid(self, m_getuid, factory, capture, fake_filesystem):
         fake_filesystem.create_file('/tmp/json-config', contents='{}')
         args = factory(osd_id='0', osd_fsid='1234', json_config='/tmp/json-config')
         with pytest.raises(RuntimeError):
@@ -22,7 +24,7 @@ class TestActivate(object):
         stdout, stderr = capsys.readouterr()
         assert 'Activate OSDs by mounting devices previously configured' in stdout
 
-    def test_activate_all(self, is_root, monkeypatch):
+    def test_activate_all(self, monkeypatch):
         '''
         make sure Activate calls activate for each file returned by glob
         '''
@@ -127,42 +129,6 @@ class TestEnableSystemdUnits(object):
 
 
 class TestValidateDevices(object):
-
-    def test_filestore_missing_journal(self):
-        activation = activate.Activate([])
-        with pytest.raises(RuntimeError) as error:
-            activation.validate_devices({'type': 'filestore', 'data': {}})
-        assert 'Unable to activate filestore OSD due to missing devices' in str(error.value)
-
-    def test_filestore_missing_data(self):
-        activation = activate.Activate([])
-        with pytest.raises(RuntimeError) as error:
-            activation.validate_devices({'type': 'filestore', 'journal': {}})
-        assert 'Unable to activate filestore OSD due to missing devices' in str(error.value)
-
-    def test_filestore_journal_device_found(self, capsys):
-        activation = activate.Activate([])
-        with pytest.raises(RuntimeError):
-            activation.validate_devices({'type': 'filestore', 'journal': {}})
-        stdout, stderr = capsys.readouterr()
-        assert "devices found: ['journal']" in stderr
-
-    def test_filestore_data_device_found(self, capsys):
-        activation = activate.Activate([])
-        with pytest.raises(RuntimeError):
-            activation.validate_devices({'type': 'filestore', 'data': {}})
-        stdout, stderr = capsys.readouterr()
-        assert "devices found: ['data']" in stderr
-
-    def test_filestore_with_all_devices(self):
-        activation = activate.Activate([])
-        result = activation.validate_devices({'type': 'filestore', 'journal': {}, 'data': {}})
-        assert result is True
-
-    def test_filestore_without_type(self):
-        activation = activate.Activate([])
-        result = activation.validate_devices({'journal': {}, 'data': {}})
-        assert result is True
 
     def test_bluestore_with_all_devices(self):
         activation = activate.Activate([])

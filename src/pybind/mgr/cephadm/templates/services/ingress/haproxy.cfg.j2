@@ -57,31 +57,34 @@ frontend stats
     monitor-uri /health
 
 frontend frontend
-{% if spec.ssl_cert %}
-    bind {{ ip }}:{{ frontend_port }} ssl crt /var/lib/haproxy/haproxy.pem
+{% if spec.ssl or spec.ssl_cert %}
+    bind {{ ip }}:{{ frontend_port }} ssl crt /var/lib/haproxy/haproxy.pem {{ v4v6_flag }}
 {% else %}
-    bind {{ ip }}:{{ frontend_port }}
+    bind {{ ip }}:{{ frontend_port }} {{ v4v6_flag }}
 {% endif %}
     default_backend backend
 
 backend backend
 {% if mode == 'http' %}
     option forwardfor
-{% if backend_spec.ssl %}
+{% if backend_spec.ssl is defined and backend_spec.ssl %}
     default-server ssl
     default-server verify none
 {% endif %}
     balance static-rr
     option httpchk HEAD / HTTP/1.0
     {% for server in servers %}
-    server {{ server.name }} {{ server.ip }}:{{ server.port }} check weight 100
+    server {{ server.name }} {{ server.ip }}:{{ server.port }} check weight 100 inter {{ health_check_interval }}
     {% endfor %}
 {% endif %}
 {% if mode == 'tcp' %}
     mode        tcp
     balance     source
     hash-type   consistent
+{% if default_server_opts %}
+    default-server {{ default_server_opts|join(" ") }}
+{% endif %}
     {% for server in servers %}
-    server {{ server.name }} {{ server.ip }}:{{ server.port }}
+    server {{ server.name }} {{ server.ip }}:{{ server.port }} check
     {% endfor %}
 {% endif %}

@@ -17,30 +17,41 @@ set(osd_srcs
   PGLog.cc
   PrimaryLogPG.cc
   ReplicatedBackend.cc
-  ECBackend.cc
-  ECTransaction.cc
   PGBackend.cc
   OSDCap.cc
   scrubber/pg_scrubber.cc
+  scrubber/osd_scrub.cc
   scrubber/osd_scrub_sched.cc
   scrubber/PrimaryLogScrub.cc
+  scrubber/scrub_job.cc
   scrubber/scrub_machine.cc
+  scrubber/scrub_reservations.cc
+  scrubber/scrub_resources.cc
   scrubber/ScrubStore.cc
   scrubber/scrub_backend.cc
   Watch.cc
   Session.cc
   SnapMapper.cc
   osd_types.cc
-  ECUtil.cc
-  ExtentCache.cc
   scheduler/OpScheduler.cc
   scheduler/OpSchedulerItem.cc
   scheduler/mClockScheduler.cc
   PeeringState.cc
   PGStateUtils.cc
-  recovery_types.cc
   MissingLoc.cc
   osd_perf_counters.cc
+  ECCommonL.cc
+  ECBackendL.cc
+  ECExtentCacheL.cc
+  ECTransactionL.cc
+  ECUtilL.cc
+  ECCommon.cc
+  ECBackend.cc
+  ECExtentCache.cc
+  ECTransaction.cc
+  ECUtil.cc
+  ECInject.cc
+  ECInject.h
   ${CMAKE_SOURCE_DIR}/src/common/TrackedOp.cc
   ${CMAKE_SOURCE_DIR}/src/mgr/OSDPerfMetricTypes.cc
   ${osd_cyg_functions_src}
@@ -53,7 +64,9 @@ endif()
 add_library(osd STATIC ${osd_srcs})
 target_link_libraries(osd
   PUBLIC dmclock::dmclock Boost::MPL
-  PRIVATE os heap_profiler cpu_profiler fmt::fmt ${CMAKE_DL_LIBS})
+  PRIVATE
+    legacy-option-headers
+    os heap_profiler cpu_profiler ${FMT_LIB} ${CMAKE_DL_LIBS})
 if(WITH_LTTNG)
   add_dependencies(osd osd-tp pg-tp)
 endif()
@@ -74,5 +87,5 @@ if(WITH_RBD)
   add_dependencies(osd cls_rbd)
 endif()
 if(WITH_RADOSGW)
-  add_dependencies(osd cls_otp cls_rgw cls_queue cls_rgw_gc cls_2pc_queue cls_fifo)
+  add_dependencies(osd cls_otp cls_rgw cls_queue cls_rgw_gc cls_2pc_queue cls_fifo cls_sem_set)
 endif()

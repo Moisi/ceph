@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "include/rados/librados_fwd.hpp"
 #include "rgw_common.h"
 #include "rgw_coroutine.h"
 
@@ -29,7 +30,11 @@ public:
   virtual RGWCoroutine *start_sync(const DoutPrefixProvider *dpp, RGWDataSyncCtx *sc) {
     return nullptr;
   }
-  virtual RGWCoroutine *sync_object(const DoutPrefixProvider *dpp, RGWDataSyncCtx *sc, rgw_bucket_sync_pipe& sync_pipe, rgw_obj_key& key, std::optional<uint64_t> versioned_epoch, rgw_zone_set *zones_trace) = 0;
+  virtual RGWCoroutine *sync_object(const DoutPrefixProvider *dpp, RGWDataSyncCtx *sc,
+                                    rgw_bucket_sync_pipe& sync_pipe, rgw_obj_key& key,
+                                    std::optional<uint64_t> versioned_epoch,
+                                    const rgw_zone_set_entry& my_trace_entry,
+                                    rgw_zone_set *zones_trace) = 0;
   virtual RGWCoroutine *remove_object(const DoutPrefixProvider *dpp, RGWDataSyncCtx *sc, rgw_bucket_sync_pipe& bucket_info, rgw_obj_key& key, real_time& mtime,
                                       bool versioned, uint64_t versioned_epoch, rgw_zone_set *zones_trace) = 0;
   virtual RGWCoroutine *create_delete_marker(const DoutPrefixProvider *dpp, RGWDataSyncCtx *sc, rgw_bucket_sync_pipe& bucket_info, rgw_obj_key& key, real_time& mtime,
@@ -39,6 +44,11 @@ public:
 class RGWRESTMgr;
 class RGWMetadataHandler;
 class RGWBucketInstanceMetadataHandlerBase;
+class RGWSI_Bucket;
+class RGWSI_BucketIndex;
+class RGWSI_Zone;
+class RGWBucketCtl;
+class RGWDataChangesLog;
 
 class RGWSyncModuleInstance {
 public:
@@ -51,8 +61,16 @@ public:
   virtual bool supports_user_writes() {
     return false;
   }
-  virtual RGWMetadataHandler *alloc_bucket_meta_handler();
-  virtual RGWBucketInstanceMetadataHandlerBase *alloc_bucket_instance_meta_handler(rgw::sal::Driver* driver);
+  virtual auto alloc_bucket_meta_handler(librados::Rados& rados,
+                                         RGWSI_Bucket* svc_bucket,
+                                         RGWBucketCtl* ctl_bucket)
+      -> std::unique_ptr<RGWMetadataHandler>;
+  virtual auto alloc_bucket_instance_meta_handler(rgw::sal::Driver* driver,
+                                                  RGWSI_Zone* svc_zone,
+                                                  RGWSI_Bucket* svc_bucket,
+                                                  RGWSI_BucketIndex* svc_bi,
+                                                  RGWDataChangesLog *svc_datalog)
+      -> std::unique_ptr<RGWMetadataHandler>;
 
   // indication whether the sync module start with full sync (default behavior)
   // incremental sync would follow anyway

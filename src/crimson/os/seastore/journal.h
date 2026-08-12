@@ -8,6 +8,7 @@
 #include "crimson/os/seastore/ordering_handle.h"
 #include "crimson/os/seastore/seastore_types.h"
 #include "crimson/os/seastore/segment_seq_allocator.h"
+#include "crimson/os/seastore/cached_extent.h"
 
 namespace crimson::os::seastore {
 
@@ -22,6 +23,9 @@ class JournalTrimmer;
 class Journal {
 public:
   virtual JournalTrimmer &get_trimmer() = 0;
+
+  virtual writer_stats_t get_writer_stats() const = 0;
+
   /**
    * initializes journal for mkfs writes -- must run prior to calls
    * to submit_record.
@@ -55,13 +59,13 @@ public:
     crimson::ct_error::erange,
     crimson::ct_error::input_output_error
     >;
-  using submit_record_ret = submit_record_ertr::future<
-    record_locator_t
-    >;
-  virtual submit_record_ret submit_record(
+  using on_submission_func_t = std::function<
+    void(record_locator_t)>;
+  virtual submit_record_ertr::future<> submit_record(
     record_t &&record,
-    OrderingHandle &handle
-  ) = 0;
+    OrderingHandle &handle,
+    transaction_type_t t_src,
+    on_submission_func_t &&on_submission) = 0;
 
   /**
    * flush
@@ -88,7 +92,7 @@ public:
     crimson::ct_error::erange>;
   using replay_ret = replay_ertr::future<>;
   using delta_handler_t = std::function<
-    replay_ertr::future<bool>(
+    replay_ertr::future<std::pair<bool, CachedExtentRef>>(
       const record_locator_t&,
       const delta_info_t&,
       const journal_seq_t&, // dirty_tail
@@ -97,12 +101,11 @@ public:
   virtual replay_ret replay(
     delta_handler_t &&delta_handler) = 0;
 
-  virtual seastar::future<> finish_commit(
-    transaction_type_t type) = 0;
-
   virtual ~Journal() {}
 
-  virtual journal_type_t get_type() = 0;
+  virtual backend_type_t get_type() = 0;
+
+  virtual bool is_checksum_needed() = 0; 
 };
 using JournalRef = std::unique_ptr<Journal>;
 

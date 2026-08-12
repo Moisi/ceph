@@ -1,11 +1,11 @@
 import os
-import pkgutil
+import importlib.util
 import shutil
 import subprocess
 import sys
 import tempfile
 import textwrap
-if not pkgutil.find_loader('setuptools'):
+if not importlib.util.find_spec('setuptools'):
     from distutils.core import setup
     from distutils.extension import Extension
 else:
@@ -14,6 +14,7 @@ else:
 from distutils.ccompiler import new_compiler
 from distutils.errors import CompileError, LinkError
 from itertools import filterfalse, takewhile
+from packaging import version
 import distutils.sysconfig
 
 
@@ -115,10 +116,16 @@ def check_sanity():
             output_dir=tmp_dir
         )
 
+        ldflags = os.environ.get('LDFLAGS')
+        if ldflags:
+            extra_postargs = ldflags.split()
+        else:
+            extra_postargs = None
         compiler.link_executable(
             objects=link_objects,
             output_progname=os.path.join(tmp_dir, 'rbd_dummy'),
             libraries=['rbd', 'rados'],
+            extra_postargs=extra_postargs,
             output_dir=tmp_dir,
         )
 
@@ -148,11 +155,22 @@ else:
     sys.exit(1)
 
 cmdclass = {}
+compiler_directives={'language_level': sys.version_info.major}
 try:
     from Cython.Build import cythonize
     from Cython.Distutils import build_ext
+    from Cython import __version__ as cython_version
 
     cmdclass = {'build_ext': build_ext}
+
+    # Needed for building with Cython 0.x and Cython 3 from the same file,
+    # preserving the same behavior.
+    # When Cython 0.x builds go away, replace this compiler directive with
+    # noexcept on rbd_callback_t and librbd_progress_fn_t (or consider doing
+    # something similar to except? -9000 on rbd_diff_iterate2() callback for
+    # progress callbacks to propagate exceptions).
+    if version.parse(cython_version) >= version.parse('3'):
+        compiler_directives['legacy_implicit_noexcept'] = True
 except ImportError:
     print("WARNING: Cython is not installed.")
 
@@ -187,7 +205,7 @@ setup(
         "of the objects the image is striped over must be a power of two."
     ),
     url='https://github.com/ceph/ceph/tree/master/src/pybind/rbd',
-    license='LGPLv2+',
+    license='LGPL-2.0-or-later',
     platforms='Linux',
     ext_modules=cythonize(
         [
@@ -197,14 +215,13 @@ setup(
                 **ext_args
             )
         ],
-        compiler_directives={'language_level': sys.version_info.major},
+        compiler_directives=compiler_directives,
         build_dir=os.environ.get("CYTHON_BUILD_DIR", None),
         **cythonize_args
     ),
     classifiers=[
         'Intended Audience :: Developers',
         'Intended Audience :: System Administrators',
-        'License :: OSI Approved :: GNU Lesser General Public License v2 or later (LGPLv2+)',
         'Operating System :: POSIX :: Linux',
         'Programming Language :: Cython',
         'Programming Language :: Python :: 3'

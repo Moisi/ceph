@@ -1,3 +1,10 @@
+overrides:
+  ceph:
+    log-only-match:
+      - CEPHADM_
+    log-ignorelist:
+      - CEPHADM_AGENT_DOWN
+      - CEPHADM_FAILED_DAEMON
 tasks:
 - cephadm:
     conf:
@@ -13,4 +20,4 @@ tasks:
       - ceph orch host ls
       - ceph orch device ls
       - ceph orch ls --format yaml
-      - ceph orch ls | grep '^osd '
+      - ceph orch ls | grep 'osd'

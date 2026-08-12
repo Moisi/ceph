@@ -87,7 +87,8 @@ Optionals are represented as a presence byte, followed by the item if it exists.
 		T  element[present? 1 : 0]; // Only if present is non-zero.
 	}
 
-Optionals are used to encode ``boost::optional``.
+Optionals are used to encode ``boost::optional`` and, since introducing
+C++17 to Ceph, ``std::optional``.
 
 Pair
 ----
@@ -135,7 +136,7 @@ Lists are represented as an element count followed by that many elements.
 	The size of the elements in the list are not necessarily uniform.
 
 Lists are used to encode ``std::list``, ``std::vector``, ``std::deque``,
-``std::set`` and ``ceph::unordered_set``.
+``std::set`` and ``std::unordered_set``.
 
 Blob
 ----
@@ -178,8 +179,8 @@ Maps are a list of pairs.
 		ceph_pair<K,V> entries[length];
 	}
 
-Maps are used to encode ``std::map``, ``std::multimap`` and
-``ceph::unordered_map``.
+Maps are used to encode ``std::map``, ``std::multimap``,
+``std::unordered_map`` and ``std::unordered_multimap``.
 
 Complex Types
 =============

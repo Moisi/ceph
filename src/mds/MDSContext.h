@@ -16,12 +16,13 @@
 #ifndef MDS_CONTEXT_H
 #define MDS_CONTEXT_H
 
-#include <vector>
 #include <deque>
+#include <ostream>
+#include <string>
+#include <vector>
 
 #include "include/Context.h"
 #include "include/elist.h"
-#include "include/spinlock.h"
 #include "common/ceph_time.h"
 
 class MDSRank;
@@ -44,7 +45,7 @@ template<template<typename> class A>
   using que_alloc = std::deque<MDSContext*, A<MDSContext*>>;
   using que = que_alloc<std::allocator>;
 
-  void complete(int r) override;
+  void finish(int r) override;
   virtual MDSRank *get_mds() = 0;
 };
 
@@ -181,13 +182,13 @@ class C_IO_Wrapper : public MDSIOContext
 {
 protected:
   bool async;
-  MDSContext *wrapped;
+  Context *wrapped;
   void finish(int r) override {
     wrapped->complete(r);
     wrapped = nullptr;
   }
 public:
-  C_IO_Wrapper(MDSRank *mds_, MDSContext *wrapped_) :
+  C_IO_Wrapper(MDSRank *mds_, Context *wrapped_) :
     MDSIOContext(mds_), async(true), wrapped(wrapped_) {
     ceph_assert(wrapped != NULL);
   }

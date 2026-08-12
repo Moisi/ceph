@@ -10,6 +10,7 @@
 #include "include/Context.h"
 #include "include/rados/librados.hpp"
 #include "Watcher.h"
+#include "Types.h"
 
 class ContextWQ;
 
@@ -30,11 +31,11 @@ public:
   };
 
   static InstanceWatcher *create(librados::IoCtx &ioctx,
-                                 Listener &listener, ContextWQ *work_queue) {
-    return new InstanceWatcher(ioctx, listener, work_queue);
+                                 Listener &listener, ErrorListener &elistener, ContextWQ *work_queue) {
+    return new InstanceWatcher(ioctx, listener, elistener, work_queue);
   }
 
-  InstanceWatcher(librados::IoCtx &ioctx, Listener &listener, ContextWQ *work_queue);
+  InstanceWatcher(librados::IoCtx &ioctx, Listener &listener, ErrorListener &elistener, ContextWQ *work_queue);
   ~InstanceWatcher();
 
   void init(Context *on_finish);
@@ -57,6 +58,7 @@ public:
 private:
   librados::IoCtx &m_ioctx;
   Listener &m_listener;
+  ErrorListener &m_elistener;
   ContextWQ *m_work_queue;
 
   ceph::mutex m_lock;

@@ -5,13 +5,12 @@ import logging
 import re
 from enum import IntEnum
 from functools import partial
-from typing import NamedTuple, Optional, no_type_check
+from typing import Any, Dict, NamedTuple, Optional, no_type_check
 
 import cherrypy
 import rbd
 
 from .. import mgr
-from ..controllers.pool import RBDPool
 from ..controllers.service import Service
 from ..security import Scope
 from ..services.ceph_service import CephService
@@ -37,6 +36,26 @@ class MirrorHealth(IntEnum):
     # extra states for the dashboard
     MIRROR_HEALTH_DISABLED = 4
     MIRROR_HEALTH_INFO = 5
+
+
+MIRROR_IMAGE_STATUS_MAP = {
+    rbd.MIRROR_IMAGE_STATUS_STATE_UNKNOWN: "Unknown",
+    rbd.MIRROR_IMAGE_STATUS_STATE_ERROR: "Error",
+    rbd.MIRROR_IMAGE_STATUS_STATE_SYNCING: "Syncing",
+    rbd.MIRROR_IMAGE_STATUS_STATE_STARTING_REPLAY: "Starting Replay",
+    rbd.MIRROR_IMAGE_STATUS_STATE_REPLAYING: "Replaying",
+    rbd.MIRROR_IMAGE_STATUS_STATE_STOPPING_REPLAY: "Stopping Replay",
+    rbd.MIRROR_IMAGE_STATUS_STATE_STOPPED: "Stopped",
+}
+
+
+def get_mirror_status_label(code: int) -> str:
+    default_code = rbd.MIRROR_IMAGE_STATUS_STATE_UNKNOWN
+    return MIRROR_IMAGE_STATUS_MAP.get(
+        code,
+        MIRROR_IMAGE_STATUS_MAP[default_code]
+    )
+
 
 # pylint: disable=not-callable
 
@@ -94,7 +113,7 @@ def get_daemons():
 
 def get_daemon_health(daemon):
     health = {
-        'health': MirrorHealth.MIRROR_HEALTH_UNKNOWN
+        'health': MirrorHealth.MIRROR_HEALTH_DISABLED
     }
     for _, pool_data in daemon['status'].items():
         if (health['health'] != MirrorHealth.MIRROR_HEALTH_ERROR
@@ -109,7 +128,7 @@ def get_daemon_health(daemon):
             health = {
                 'health': MirrorHealth.MIRROR_HEALTH_WARNING
             }
-        elif health['health'] == MirrorHealth.MIRROR_HEALTH_INFO:
+        elif health['health'] == MirrorHealth.MIRROR_HEALTH_DISABLED:
             health = {
                 'health': MirrorHealth.MIRROR_HEALTH_OK
             }
@@ -195,6 +214,8 @@ def _get_pool_stats(pool_names):
             mirror_mode = "image"
         elif mirror_mode == rbd.RBD_MIRROR_MODE_POOL:
             mirror_mode = "pool"
+        elif mirror_mode == rbd.RBD_MIRROR_MODE_INIT_ONLY:
+            mirror_mode = "init-only"
         else:
             mirror_mode = "unknown"
 
@@ -219,6 +240,31 @@ def _get_pool_stats(pool_names):
     return pool_stats
 
 
+def _get_mirroring_status(pool_name, image_name):
+    ioctx = mgr.rados.open_ioctx(pool_name)
+    mode = rbd.RBD().mirror_mode_get(ioctx)
+    status = rbd.Image(ioctx, image_name).mirror_image_get_status()
+    for remote in status.get("remote_statuses", []):
+        remote["state"] = get_mirror_status_label(remote["state"])
+        desc = remote.get("description")
+
+        if not desc.startswith("replaying, "):
+            continue
+
+        try:
+            metrics = json.loads(desc.split(", ", 1)[1])
+            remote["description"] = metrics
+        except (IndexError, json.JSONDecodeError):
+            continue
+
+        if mode == rbd.RBD_MIRROR_MODE_POOL:
+            primary_tid = metrics["primary_position"]["entry_tid"]
+            non_primary_tid = metrics["non_primary_position"]["entry_tid"]
+            percent_done = (non_primary_tid / primary_tid) * 100 if primary_tid else 0
+            remote["syncing_percent"] = round(percent_done, 2)
+    return status
+
+
 @ViewCache()
 def get_daemons_and_pools():  # pylint: disable=R0915
     daemons = get_daemons()
@@ -236,6 +282,23 @@ class ReplayingData(NamedTuple):
     seconds_until_synced: Optional[int] = None
     syncing_percent: Optional[float] = None
     entries_behind_primary: Optional[int] = None
+
+
+def _get_mirror_mode(ioctx, image_name):
+    with rbd.Image(ioctx, image_name) as img:
+        mirror_mode = None
+        mirror_mode_str = 'Disabled'
+        try:
+            mirror_mode = img.mirror_image_get_mode()
+        except rbd.InvalidArgument:
+            # Suppress exception raised when mirroring is disabled
+            pass
+
+        if mirror_mode == rbd.RBD_MIRROR_IMAGE_MODE_JOURNAL:
+            mirror_mode_str = 'journal'
+        elif mirror_mode == rbd.RBD_MIRROR_IMAGE_MODE_SNAPSHOT:
+            mirror_mode_str = 'snapshot'
+        return mirror_mode_str
 
 
 @ViewCache()
@@ -300,7 +363,8 @@ def _get_pool_datum(pool_name):
         data['mirror_images'] = sorted([
             dict({
                 'name': image['name'],
-                'description': image['description']
+                'description': image['description'],
+                'mirror_mode': _get_mirror_mode(ioctx, image['name'])
             }, **mirror_state['down' if not image['up'] else image['state']])
             for image in mirror_image_status
         ], key=lambda k: k['name'])
@@ -363,12 +427,15 @@ def _get_content_data():  # pylint: disable=R0914
                 'pool_name': pool_name,
                 'name': mirror_image['name'],
                 'state_color': mirror_image['state_color'],
-                'state': mirror_image['state']
+                'state': mirror_image['state'],
+                'mirror_mode': mirror_image['mirror_mode']
             }
 
             if mirror_image['health'] == 'ok':
+                status = _get_mirroring_status(pool_name, mirror_image['name'])
                 image.update({
-                    'description': mirror_image['description']
+                    'description': mirror_image['description'],
+                    'remote_status': status.get("remote_statuses", [])
                 })
                 image_ready.append(image)
             elif mirror_image['health'] == 'syncing':
@@ -467,6 +534,17 @@ class RbdMirroringSummary(BaseController):
                 'content_data': content_data}
 
 
+@APIRouter('/block/mirroring/{pool_name}/{image_name}/summary', Scope.RBD_MIRRORING)
+@APIDoc("RBD Mirroring Summary Management API", "RbdMirroringSummary")
+class RbdImageMirroringSummary(BaseController):
+
+    @Endpoint()
+    @handle_rbd_mirror_error()
+    @ReadPermission
+    def __call__(self, pool_name, image_name):
+        return _get_mirroring_status(pool_name, image_name)
+
+
 @APIRouter('/block/mirroring/pool', Scope.RBD_MIRRORING)
 @APIDoc("RBD Mirroring Pool Mode Management API", "RbdMirroringPoolMode")
 class RbdMirroringPoolMode(RESTController):
@@ -475,7 +553,8 @@ class RbdMirroringPoolMode(RESTController):
     MIRROR_MODES = {
         rbd.RBD_MIRROR_MODE_DISABLED: 'disabled',
         rbd.RBD_MIRROR_MODE_IMAGE: 'image',
-        rbd.RBD_MIRROR_MODE_POOL: 'pool'
+        rbd.RBD_MIRROR_MODE_POOL: 'pool',
+        rbd.RBD_MIRROR_MODE_INIT_ONLY: 'init-only'
     }
 
     @handle_rbd_mirror_error()
@@ -494,6 +573,9 @@ class RbdMirroringPoolMode(RESTController):
 
     @RbdMirroringTask('pool/edit', {'pool_name': '{pool_name}'}, 5.0)
     def set(self, pool_name, mirror_mode=None):
+        return self.set_pool_mirror_mode(pool_name, mirror_mode)
+
+    def set_pool_mirror_mode(self, pool_name, mirror_mode):
         def _edit(ioctx, mirror_mode=None):
             if mirror_mode:
                 mode_enum = {x[1]: x[0] for x in
@@ -642,22 +724,27 @@ class RbdMirroringStatus(BaseController):
     @Endpoint()
     @ReadPermission
     def status(self):
-        status = {'available': True, 'message': None}
+        status: Dict[str, Any] = {'available': True, 'message': None}
         orch_status = OrchClient.instance().status()
 
         # if the orch is not available we can't create the service
         # using dashboard.
         if not orch_status['available']:
             return status
-        if not CephService.get_service_list('rbd-mirror') or not CephService.get_pool_list('rbd'):
+        if not CephService.get_service_list('rbd-mirror') and not CephService.get_pool_list('rbd'):
             status['available'] = False
-            status['message'] = 'RBD mirroring is not configured'  # type: ignore
+            status['message'] = 'No default "rbd" pool or "rbd-mirror" service ' \
+                                'in the cluster. Please click on ' \
+                                '"Configure Block Mirroring" ' \
+                                'button to get started.'  # type: ignore
         return status
 
     @Endpoint('POST')
     @EndpointDoc('Configure RBD Mirroring')
     @CreatePermission
     def configure(self):
+        from ..controllers.pool import RBDPool  # to avoid circular import
+
         rbd_pool = RBDPool()
         service = Service()
 

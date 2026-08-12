@@ -85,7 +85,7 @@ class RGWPeriodHistory::Impl final {
   ~Impl();
 
   Cursor get_current() const { return current_cursor; }
-  Cursor attach(const DoutPrefixProvider *dpp, RGWPeriod&& period, optional_yield y);
+  Cursor attach(const DoutPrefixProvider *dpp, RGWPeriod&& period, optional_yield y, rgw::sal::ConfigStore* cfgstore);
   Cursor insert(RGWPeriod&& period);
   Cursor lookup(epoch_t realm_epoch);
 
@@ -106,7 +106,7 @@ class RGWPeriodHistory::Impl final {
   /// and return an iterator to the merged history
   Set::iterator merge(Set::iterator dst, Set::iterator src);
 
-  /// construct a Cursor object using Cursor's private constuctor
+  /// construct a Cursor object using Cursor's private constructor
   Cursor make_cursor(Set::const_iterator history, epoch_t epoch);
 
   CephContext *const cct;
@@ -133,6 +133,7 @@ RGWPeriodHistory::Impl::Impl(CephContext* cct, Puller* puller,
     history->periods.push_back(current_period);
 
     // insert as our current history
+    // coverity[leaked_storage:SUPPRESS]
     current_history = histories.insert(*history).first;
 
     // get a cursor to the current period
@@ -148,7 +149,8 @@ RGWPeriodHistory::Impl::~Impl()
   histories.clear_and_dispose(std::default_delete<History>{});
 }
 
-Cursor RGWPeriodHistory::Impl::attach(const DoutPrefixProvider *dpp, RGWPeriod&& period, optional_yield y)
+Cursor RGWPeriodHistory::Impl::attach(const DoutPrefixProvider *dpp, RGWPeriod&& period, optional_yield y,
+                                      rgw::sal::ConfigStore* cfgstore)
 {
   if (current_history == histories.end()) {
     return Cursor{-EINVAL};
@@ -184,7 +186,7 @@ Cursor RGWPeriodHistory::Impl::attach(const DoutPrefixProvider *dpp, RGWPeriod&&
     }
 
     // pull the period outside of the lock
-    int r = puller->pull(dpp, predecessor_id, period, y);
+    int r = puller->pull(dpp, predecessor_id, period, y, cfgstore);
     if (r < 0) {
       return Cursor{r};
     }
@@ -245,6 +247,7 @@ Cursor RGWPeriodHistory::Impl::insert_locked(RGWPeriod&& period)
     // create a new history for this period
     auto history = new History;
     history->periods.emplace_back(std::move(period));
+    // coverity[leaked_storage:SUPPRESS]
     histories.insert(last, *history);
 
     i = Set::s_iterator_to(*history);
@@ -294,6 +297,7 @@ Cursor RGWPeriodHistory::Impl::insert_locked(RGWPeriod&& period)
   // create a new history for this period
   auto history = new History;
   history->periods.emplace_back(std::move(period));
+  // coverity[leaked_storage:SUPPRESS]
   histories.insert(i, *history);
 
   i = Set::s_iterator_to(*history);
@@ -339,9 +343,10 @@ Cursor RGWPeriodHistory::get_current() const
 {
   return impl->get_current();
 }
-Cursor RGWPeriodHistory::attach(const DoutPrefixProvider *dpp, RGWPeriod&& period, optional_yield y)
+Cursor RGWPeriodHistory::attach(const DoutPrefixProvider *dpp, RGWPeriod&& period, optional_yield y,
+                                rgw::sal::ConfigStore* cfgstore)
 {
-  return impl->attach(dpp, std::move(period), y);
+  return impl->attach(dpp, std::move(period), y, cfgstore);
 }
 Cursor RGWPeriodHistory::insert(RGWPeriod&& period)
 {

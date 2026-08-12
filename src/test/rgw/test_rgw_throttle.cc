@@ -16,48 +16,19 @@
 
 #include <optional>
 #include <thread>
+#include <boost/asio/basic_waitable_timer.hpp>
+#include <boost/asio/error.hpp>
+#include <boost/asio/executor_work_guard.hpp>
+#include <boost/asio/io_context.hpp>
+#include <boost/asio/spawn.hpp>
 #include "include/scope_guard.h"
 
-#include <spawn/spawn.hpp>
 #include <gtest/gtest.h>
 
-struct RadosEnv : public ::testing::Environment {
- public:
-  static constexpr auto poolname = "ceph_test_rgw_throttle";
-
-  static std::optional<RGWSI_RADOS> rados;
-
-  void SetUp() override {
-    rados.emplace(g_ceph_context);
-    const NoDoutPrefix no_dpp(g_ceph_context, 1);
-    ASSERT_EQ(0, rados->start(null_yield, &no_dpp));
-    int r = rados->pool({poolname}).create(&no_dpp);
-    if (r == -EEXIST)
-      r = 0;
-    ASSERT_EQ(0, r);
-  }
-  void TearDown() override {
-    ASSERT_EQ(0, rados->get_rados_handle()->pool_delete(poolname));
-    rados->shutdown();
-    rados.reset();
-  }
-};
-std::optional<RGWSI_RADOS> RadosEnv::rados;
-
-auto *const rados_env = ::testing::AddGlobalTestEnvironment(new RadosEnv);
-
-// test fixture for global setup/teardown
-class RadosFixture : public ::testing::Test {
- protected:
-  RGWSI_RADOS::Obj make_obj(const std::string& oid) {
-    auto obj = RadosEnv::rados->obj({{RadosEnv::poolname}, oid});
-    const NoDoutPrefix no_dpp(g_ceph_context, 1);
-    ceph_assert_always(0 == obj.open(&no_dpp));
-    return obj;
-  }
-};
-
-using Aio_Throttle = RadosFixture;
+static rgw_raw_obj make_obj(const std::string& oid)
+{
+  return {{"testpool"}, oid};
+}
 
 namespace rgw {
 
@@ -90,7 +61,7 @@ auto wait_for(boost::asio::io_context& context, ceph::timespan duration) {
   };
 }
 
-TEST_F(Aio_Throttle, NoThrottleUpToMax)
+TEST(Aio_Throttle, NoThrottleUpToMax)
 {
   BlockingAioThrottle throttle(4);
   auto obj = make_obj(__PRETTY_FUNCTION__);
@@ -118,7 +89,7 @@ TEST_F(Aio_Throttle, NoThrottleUpToMax)
   }
 }
 
-TEST_F(Aio_Throttle, CostOverWindow)
+TEST(Aio_Throttle, CostOverWindow)
 {
   BlockingAioThrottle throttle(4);
   auto obj = make_obj(__PRETTY_FUNCTION__);
@@ -129,7 +100,7 @@ TEST_F(Aio_Throttle, CostOverWindow)
   EXPECT_EQ(-EDEADLK, c.front().result);
 }
 
-TEST_F(Aio_Throttle, ThrottleOverMax)
+TEST(Aio_Throttle, ThrottleOverMax)
 {
   constexpr uint64_t window = 4;
   BlockingAioThrottle throttle(window);
@@ -167,23 +138,25 @@ TEST_F(Aio_Throttle, ThrottleOverMax)
   EXPECT_EQ(window, max_outstanding);
 }
 
-TEST_F(Aio_Throttle, YieldCostOverWindow)
+TEST(Aio_Throttle, YieldCostOverWindow)
 {
   auto obj = make_obj(__PRETTY_FUNCTION__);
 
   boost::asio::io_context context;
-  spawn::spawn(context,
-    [&] (yield_context yield) {
-      YieldingAioThrottle throttle(4, context, yield);
+  boost::asio::spawn(context,
+    [&] (boost::asio::yield_context yield) {
+      YieldingAioThrottle throttle(4, yield);
       scoped_completion op;
       auto c = throttle.get(obj, wait_on(op), 8, 0);
       ASSERT_EQ(1u, c.size());
       EXPECT_EQ(-EDEADLK, c.front().result);
+    }, [] (std::exception_ptr eptr) {
+      if (eptr) std::rethrow_exception(eptr);
     });
   context.run();
 }
 
-TEST_F(Aio_Throttle, YieldingThrottleOverMax)
+TEST(Aio_Throttle, YieldingThrottleOverMax)
 {
   constexpr uint64_t window = 4;
 
@@ -195,9 +168,9 @@ TEST_F(Aio_Throttle, YieldingThrottleOverMax)
   uint64_t outstanding = 0;
 
   boost::asio::io_context context;
-  spawn::spawn(context,
-    [&] (yield_context yield) {
-      YieldingAioThrottle throttle(window, context, yield);
+  boost::asio::spawn(context,
+    [&] (boost::asio::yield_context yield) {
+      YieldingAioThrottle throttle(window, yield);
       for (uint64_t i = 0; i < total; i++) {
         using namespace std::chrono_literals;
         auto c = throttle.get(obj, wait_for(context, 10ms), 1, 0);
@@ -209,6 +182,8 @@ TEST_F(Aio_Throttle, YieldingThrottleOverMax)
       }
       auto c = throttle.drain();
       outstanding -= c.size();
+    }, [] (std::exception_ptr eptr) {
+      if (eptr) std::rethrow_exception(eptr);
     });
   context.poll(); // run until we block
   EXPECT_EQ(window, outstanding);

@@ -28,12 +28,6 @@
 #include "ceph_frag.h"
 #include "rbd_types.h"
 
-#ifdef __cplusplus
-#ifndef _BACKWARD_BACKWARD_WARNING_H
-#define _BACKWARD_BACKWARD_WARNING_H   // make gcc 4.3 shut up about hash_*
-#endif
-#endif
-
 extern "C" {
 #include <stdint.h>
 #include <sys/types.h>
@@ -41,26 +35,29 @@ extern "C" {
 #include "statlite.h"
 }
 
+#include <deque>
 #include <string>
 #include <list>
 #include <set>
+#include <span>
 #include <boost/container/flat_set.hpp>
 #include <boost/container/flat_map.hpp>
+#include "boost/tuple/tuple.hpp"
 #include <map>
 #include <vector>
 #include <optional>
 #include <ostream>
 #include <iomanip>
+#include <unordered_map>
+#include <unordered_set>
 
-
-#include "include/unordered_map.h"
+#include "common/convenience.h" // for ceph::for_each()
+#include "common/Formatter.h"
 
 #include "object.h"
 #include "intarith.h"
 
 #include "acconfig.h"
-
-#include "assert.h"
 
 // DARWIN compatibility
 #ifdef __APPLE__
@@ -91,6 +88,8 @@ template<class A, class B>
 inline std::ostream& operator<<(std::ostream&out, const std::pair<A,B>& v);
 template<class A, class Alloc>
 inline std::ostream& operator<<(std::ostream& out, const std::vector<A,Alloc>& v);
+template<class T, std::size_t Extent>
+inline std::ostream& operator<<(std::ostream& out, const std::span<T, Extent>& s);
 template<class A, std::size_t N, class Alloc>
 inline std::ostream& operator<<(std::ostream& out, const boost::container::small_vector<A,N,Alloc>& v);
 template<class A, class Comp, class Alloc>
@@ -104,9 +103,13 @@ inline std::ostream& operator<<(std::ostream& out, const std::list<A,Alloc>& ili
 template<class A, class Comp, class Alloc>
 inline std::ostream& operator<<(std::ostream& out, const std::set<A, Comp, Alloc>& iset);
 template<class A, class Comp, class Alloc>
+inline std::ostream& operator<<(std::ostream& out, const std::unordered_set<A, Comp, Alloc>& iset);
+template<class A, class Comp, class Alloc>
 inline std::ostream& operator<<(std::ostream& out, const std::multiset<A,Comp,Alloc>& iset);
 template<class A, class B, class Comp, class Alloc>
 inline std::ostream& operator<<(std::ostream& out, const std::map<A,B,Comp,Alloc>& m);
+template<class A, class B, class Hash, class KeyEqual>
+inline std::ostream& operator<<(std::ostream& out, const std::unordered_map<A,B,Hash, KeyEqual>& m);
 template<class A, class B, class Comp, class Alloc>
 inline std::ostream& operator<<(std::ostream& out, const std::multimap<A,B,Comp,Alloc>& m);
 }
@@ -134,6 +137,19 @@ inline std::ostream& operator<<(std::ostream& out, const std::vector<A,Alloc>& v
   bool first = true;
   out << "[";
   for (const auto& p : v) {
+    if (!first) out << ",";
+    out << p;
+    first = false;
+  }
+  out << "]";
+  return out;
+}
+
+template<class T, std::size_t Extent>
+inline std::ostream& operator<<(std::ostream& out, const std::span<T, Extent>& s) {
+  bool first = true;
+  out << "[";
+  for (const auto& p : s) {
     if (!first) out << ",";
     out << p;
     first = false;
@@ -210,6 +226,17 @@ inline std::ostream& operator<<(std::ostream& out, const std::set<A, Comp, Alloc
 }
 
 template<class A, class Comp, class Alloc>
+inline std::ostream& operator<<(std::ostream& out, const std::unordered_set<A, Comp, Alloc>& iset) {
+  for (auto it = iset.begin();
+       it != iset.end();
+       ++it) {
+    if (it != iset.begin()) out << ",";
+    out << *it;
+  }
+  return out;
+}
+
+template<class A, class Comp, class Alloc>
 inline std::ostream& operator<<(std::ostream& out, const std::multiset<A,Comp,Alloc>& iset) {
   for (auto it = iset.begin();
        it != iset.end();
@@ -222,6 +249,22 @@ inline std::ostream& operator<<(std::ostream& out, const std::multiset<A,Comp,Al
 
 template<class A, class B, class Comp, class Alloc>
 inline std::ostream& operator<<(std::ostream& out, const std::map<A,B,Comp,Alloc>& m)
+{
+  out << "{";
+  for (auto it = m.begin();
+       it != m.end();
+       ++it) {
+    if (it != m.begin()) out << ",";
+    out << it->first << "=" << it->second;
+  }
+  out << "}";
+  return out;
+}
+
+template <class A, class B, class Hash, class KeyEqual>
+inline std::ostream&
+operator<<(std::ostream& out,
+	   const std::unordered_map<A, B, Hash, KeyEqual>& m)
 {
   out << "{";
   for (auto it = m.begin();
@@ -289,8 +332,8 @@ inline std::ostream& operator<<(std::ostream& out, const boost::container::flat_
 /*
  * comparators for stl containers
  */
-// for ceph::unordered_map:
-//   ceph::unordered_map<const char*, long, hash<const char*>, eqstr> vals;
+// for std::unordered_map:
+//   std::unordered_map<const char*, long, hash<const char*>, eqstr> vals;
 struct eqstr
 {
   bool operator()(const char* s1, const char* s2) const
@@ -320,7 +363,6 @@ WRITE_RAW_ENCODER(ceph_file_layout)
 WRITE_RAW_ENCODER(ceph_dir_layout)
 WRITE_RAW_ENCODER(ceph_mds_session_head)
 WRITE_RAW_ENCODER(ceph_mds_request_head_legacy)
-WRITE_RAW_ENCODER(ceph_mds_request_head)
 WRITE_RAW_ENCODER(ceph_mds_request_release)
 WRITE_RAW_ENCODER(ceph_filelock)
 WRITE_RAW_ENCODER(ceph_mds_caps_head)
@@ -372,6 +414,8 @@ struct client_t {
     using ceph::decode;
     decode(v, bl);
   }
+  void dump(ceph::Formatter *f) const;
+  static std::list<client_t> generate_test_instances();
 };
 WRITE_CLASS_ENCODER(client_t)
 
@@ -385,45 +429,9 @@ static inline bool operator>=(const client_t& l, const client_t& r) { return l.v
 static inline bool operator>=(const client_t& l, int64_t o) { return l.v >= o; }
 static inline bool operator<(const client_t& l, int64_t o) { return l.v < o; }
 
-inline std::ostream& operator<<(std::ostream& out, const client_t& c) {
-  return out << c.v;
-}
-
-
+std::ostream& operator<<(std::ostream& out, const client_t& c);
 
 // --
-
-namespace {
-inline std::ostream& format_u(std::ostream& out, const uint64_t v, const uint64_t n,
-      const int index, const uint64_t mult, const char* u)
-  {
-    char buffer[32];
-
-    if (index == 0) {
-      (void) snprintf(buffer, sizeof(buffer), "%" PRId64 "%s", n, u);
-    } else if ((v % mult) == 0) {
-      // If this is an even multiple of the base, always display
-      // without any decimal fraction.
-      (void) snprintf(buffer, sizeof(buffer), "%" PRId64 "%s", n, u);
-    } else {
-      // We want to choose a precision that reflects the best choice
-      // for fitting in 5 characters.  This can get rather tricky when
-      // we have numbers that are very close to an order of magnitude.
-      // For example, when displaying 10239 (which is really 9.999K),
-      // we want only a single place of precision for 10.0K.  We could
-      // develop some complex heuristics for this, but it's much
-      // easier just to try each combination in turn.
-      int i;
-      for (i = 2; i >= 0; i--) {
-        if (snprintf(buffer, sizeof(buffer), "%.*f%s", i,
-          static_cast<double>(v) / mult, u) <= 7)
-          break;
-      }
-    }
-
-    return out << buffer;
-  }
-}
 
 /*
  * Use this struct to pretty print values that should be formatted with a
@@ -434,21 +442,7 @@ struct si_u_t {
   explicit si_u_t(uint64_t _v) : v(_v) {};
 };
 
-inline std::ostream& operator<<(std::ostream& out, const si_u_t& b)
-{
-  uint64_t n = b.v;
-  int index = 0;
-  uint64_t mult = 1;
-  const char* u[] = {"", "k", "M", "G", "T", "P", "E"};
-
-  while (n >= 1000 && index < 7) {
-    n /= 1000;
-    index++;
-    mult *= 1000;
-  }
-
-  return format_u(out, b.v, n, index, mult, u[index]);
-}
+std::ostream& operator<<(std::ostream& out, const si_u_t& b);
 
 /*
  * Use this struct to pretty print values that should be formatted with a
@@ -462,25 +456,12 @@ struct byte_u_t {
   explicit byte_u_t(uint64_t _v) : v(_v) {};
 };
 
-inline std::ostream& operator<<(std::ostream& out, const byte_u_t& b)
-{
-  uint64_t n = b.v;
-  int index = 0;
-  const char* u[] = {" B", " KiB", " MiB", " GiB", " TiB", " PiB", " EiB"};
+#if FMT_VERSION >= 90000
+template <> struct fmt::formatter<byte_u_t> : fmt::ostream_formatter {};
+#endif
 
-  while (n >= 1024 && index < 7) {
-    n /= 1024;
-    index++;
-  }
-
-  return format_u(out, b.v, n, index, 1ULL << (10 * index), u[index]);
-}
-
-inline std::ostream& operator<<(std::ostream& out, const ceph_mon_subscribe_item& i)
-{
-  return out << (long)i.start
-	     << ((i.flags & CEPH_SUBSCRIBE_ONETIME) ? "" : "+");
-}
+std::ostream& operator<<(std::ostream& out, const byte_u_t& b);
+std::ostream& operator<<(std::ostream& out, const ceph_mon_subscribe_item& i);
 
 struct weightf_t {
   float v;
@@ -488,25 +469,18 @@ struct weightf_t {
   weightf_t(float _v) : v(_v) {}
 };
 
-inline std::ostream& operator<<(std::ostream& out, const weightf_t& w)
-{
-  if (w.v < -0.01F) {
-    return out << "-";
-  } else if (w.v < 0.000001F) {
-    return out << "0";
-  } else {
-    std::streamsize p = out.precision();
-    return out << std::fixed << std::setprecision(5) << w.v << std::setprecision(p);
-  }
-}
+std::ostream& operator<<(std::ostream& out, const weightf_t& w);
 
 struct shard_id_t {
   int8_t id;
 
   shard_id_t() : id(0) {}
-  explicit shard_id_t(int8_t _id) : id(_id) {}
+  explicit constexpr shard_id_t(int8_t _id) : id(_id) {}
 
-  operator int8_t() const { return id; }
+  explicit constexpr operator int8_t() const { return id; }
+  explicit constexpr operator int64_t() const { return id; }
+  explicit constexpr operator int() const { return id; }
+  explicit constexpr operator unsigned() const { return id; }
 
   const static shard_id_t NO_SHARD;
 
@@ -518,9 +492,28 @@ struct shard_id_t {
     using ceph::decode;
     decode(id, bl);
   }
+  void dump(ceph::Formatter *f) const;
+  static std::list<shard_id_t> generate_test_instances();
+  shard_id_t& operator++() { ++id; return *this; }
+  friend constexpr std::strong_ordering operator<=>(const shard_id_t &lhs,
+                                                    const shard_id_t &rhs) {
+    return lhs.id <=> rhs.id;
+  }
 
-  bool operator==(const shard_id_t&) const = default;
-  auto operator<=>(const shard_id_t&) const = default;
+  friend constexpr std::strong_ordering operator<=>(int lhs,
+                                                    const shard_id_t &rhs) {
+    return lhs <=> rhs.id;
+  }
+  friend constexpr std::strong_ordering operator<=>(const shard_id_t &lhs,
+                                                    int rhs) {
+    return lhs.id <=> rhs;
+  }
+
+  shard_id_t& operator=(int other) { id = other; return *this; }
+  bool operator==(const shard_id_t &other) const { return id == other.id; }
+
+  shard_id_t operator+(int other) const { return shard_id_t(id + other); }
+  shard_id_t operator-(int other) const { return shard_id_t(id - other); }
 };
 WRITE_CLASS_ENCODER(shard_id_t)
 std::ostream &operator<<(std::ostream &lhs, const shard_id_t &rhs);
@@ -537,31 +530,43 @@ __s32  hostos_to_ceph_errno(__s32 e);
 #endif
 
 struct errorcode32_t {
-  int32_t code;
+  using code_t = __s32;
+  code_t code;
 
   errorcode32_t() : code(0) {}
   // cppcheck-suppress noExplicitConstructor
-  explicit errorcode32_t(int32_t i) : code(i) {}
+  explicit errorcode32_t(code_t i) : code(i) {}
 
-  operator int() const  { return code; }
-  int* operator&()      { return &code; }
-  errorcode32_t& operator=(int32_t i) {
+  operator code_t() const  { return code; }
+  code_t* operator&()      { return &code; }
+  errorcode32_t& operator=(code_t i) {
     code = i;
     return *this;
   }
   bool operator==(const errorcode32_t&) const = default;
   auto operator<=>(const errorcode32_t&) const = default;
 
+  inline code_t get_host_to_wire() const {
+    return hostos_to_ceph_errno(code);
+  }
+
+  inline void set_wire_to_host(code_t host_code) {
+    code = ceph_to_hostos_errno(host_code);
+  }
+
   void encode(ceph::buffer::list &bl) const {
     using ceph::encode;
-    __s32 newcode = hostos_to_ceph_errno(code);
-    encode(newcode, bl);
+    auto new_code = get_host_to_wire();
+    encode(new_code, bl);
   }
   void decode(ceph::buffer::list::const_iterator &bl) {
     using ceph::decode;
-    decode(code, bl);
-    code = ceph_to_hostos_errno(code);
+    code_t newcode;
+    decode(newcode, bl);
+    set_wire_to_host(newcode);
   }
+  void dump(ceph::Formatter *f) const;
+  static std::list<errorcode32_t> generate_test_instances();
 };
 WRITE_CLASS_ENCODER(errorcode32_t)
 
@@ -602,6 +607,18 @@ struct sha_digest_t {
     std::array<unsigned char, SIZE> tmparr;
     decode(tmparr, bl);
     memcpy(v, tmparr.data(), SIZE);
+  }
+  void dump(ceph::Formatter *f) const {
+    f->dump_string("sha1", to_str());
+  }
+  static std::list<sha_digest_t> generate_test_instances() {
+    std::list<sha_digest_t> ls;
+    ls.emplace_back();
+    ls.emplace_back();
+    ls.back().v[0] = 1;
+    ls.emplace_back();
+    ls.back().v[0] = 2;
+    return ls;
   }
 };
 

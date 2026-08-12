@@ -34,7 +34,6 @@ function run() {
     CEPH_ARGS+="--osd_force_auth_primary_missing_objects=1000000 "
     # use small pg_log settings, so we always do backfill instead of recovery
     CEPH_ARGS+="--osd_min_pg_log_entries=$loglen --osd_max_pg_log_entries=$loglen --osd_pg_log_trim_min=$trim "
-    CEPH_ARGS+="--osd_mclock_profile=high_recovery_ops "
 
     local funcs=${@:-$(set | sed -n -e 's/^\(TEST_[0-9a-z_]*\) .*/\1/p')}
     for func in $funcs ; do
@@ -47,7 +46,6 @@ function run() {
 
 function TEST_repeer_on_down_acting_member_coming_back() {
     local dir=$1
-    local dummyfile='/etc/fstab'
 
     local num_osds=6
     local osds="$(seq 0 $(expr $num_osds - 1))"
@@ -73,11 +71,13 @@ function TEST_repeer_on_down_acting_member_coming_back() {
     wait_for_clean || return 1
 
     echo "writing initial objects"
+    local dummyfile=$(file_with_random_data)
     # write a bunch of objects
     for i in $(seq 1 $testobjects)
     do
-      rados -p $poolname put existing_$i $dummyfile
+      rados -p $poolname put existing_$i $dummyfile || return 1
     done
+    rm -f $dummyfile
 
     WAIT_FOR_CLEAN_TIMEOUT=20 wait_for_clean
 

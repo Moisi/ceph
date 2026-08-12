@@ -1,7 +1,14 @@
 import os
 
+from ceph.fs.earmarking import (
+    CephFSVolumeEarmarking,
+    EarmarkParseError,
+    EarmarkTopScope,
+    EarmarkException
+)
+
 if 'UNITTEST' in os.environ:
-    import tests
+    import tests  # noqa
 
 import cephfs
 import contextlib
@@ -11,8 +18,10 @@ import socket
 import time
 import logging
 import sys
-from threading import Lock, Condition, Event
+from ipaddress import ip_address
+from threading import Lock, Condition
 from typing import no_type_check, NewType
+from traceback import format_exc as tb_format_exc
 import urllib
 from functools import wraps
 if sys.version_info >= (3, 3):
@@ -23,6 +32,7 @@ else:
 from typing import Tuple, Any, Callable, Optional, Dict, TYPE_CHECKING, TypeVar, List, Iterable, Generator, Generic, Iterator
 
 from ceph.deployment.utils import wrap_ipv6
+from ceph.cryptotools.select import get_crypto_caller
 
 T = TypeVar('T')
 
@@ -57,6 +67,13 @@ class PortAlreadyInUse(Exception):
     pass
 
 
+# helper function for showing a warning text in
+# the terminal
+class CLIWarning(str):
+    def __new__(cls, content: str) -> "CLIWarning":
+        return super().__new__(cls, f"WARNING: {content}")
+
+
 class CephfsConnectionException(Exception):
     def __init__(self, error_code: int, error_message: str):
         self.errno = error_code
@@ -68,6 +85,7 @@ class CephfsConnectionException(Exception):
     def __str__(self) -> str:
         return "{0} ({1})".format(self.errno, self.error_str)
 
+
 class RTimer(Timer):
     """
     recurring timer variant of Timer
@@ -78,10 +96,11 @@ class RTimer(Timer):
             while not self.finished.is_set():
                 self.finished.wait(self.interval)
                 self.function(*self.args, **self.kwargs)
-            self.finished.set()
-        except Exception as e:
-            logger.error("task exception: %s", e)
+        except Exception:
+            logger.error(f'exception encountered in RTimer instance "{self}":'
+                         f'\n{tb_format_exc()}')
             raise
+
 
 @contextlib.contextmanager
 def lock_timeout_log(lock: Lock, timeout: int = 5) -> Iterator[None]:
@@ -143,7 +162,7 @@ class CephfsConnectionPool(object):
             fs_id = None
             try:
                 fs_id = self.get_fs_id()
-            except:
+            except:  # noqa
                 # the filesystem does not exist now -- connection is not valid.
                 pass
             logger.debug("self.fs_id={0}, fs_id={1}".format(self.fs_id, fs_id))
@@ -166,7 +185,7 @@ class CephfsConnectionPool(object):
             logger.debug("CephFS mounting...")
             self.fs.mount(filesystem_name=self.fs_name.encode('utf-8'))
             logger.debug("Connection to cephfs '{0}' complete".format(self.fs_name))
-            self.mgr._ceph_register_client(self.fs.get_addrs())
+            self.mgr._ceph_register_client(None, self.fs.get_addrs(), False)
 
         def disconnect(self) -> None:
             try:
@@ -175,7 +194,7 @@ class CephfsConnectionPool(object):
                 logger.info("disconnecting from cephfs '{0}'".format(self.fs_name))
                 addrs = self.fs.get_addrs()
                 self.fs.shutdown()
-                self.mgr._ceph_unregister_client(addrs)
+                self.mgr._ceph_unregister_client(None, addrs)
                 self.fs = None
             except Exception as e:
                 logger.debug("disconnect: ({0})".format(e))
@@ -296,16 +315,10 @@ class CephfsConnectionPool(object):
 class CephfsClient(Generic[Module_T]):
     def __init__(self, mgr: Module_T):
         self.mgr = mgr
-        self.stopping = Event()
         self.connection_pool = CephfsConnectionPool(self.mgr)
-
-    def is_stopping(self) -> bool:
-        return self.stopping.is_set()
 
     def shutdown(self) -> None:
         logger.info("shutting down")
-        # first, note that we're shutting down
-        self.stopping.set()
         # second, delete all libcephfs handles from connection pool
         self.connection_pool.del_all_connections()
 
@@ -337,6 +350,92 @@ class CephfsClient(Generic[Module_T]):
         return fs_list
 
 
+class CephFSEarmarkResolver:
+    def __init__(self, mgr: Module_T, *, client: Optional[CephfsClient] = None) -> None:
+        self._mgr = mgr
+        self._cephfs_client = client or CephfsClient(mgr)
+
+    def _extract_path_component(self, path: str, index: int) -> Optional[str]:
+        """
+        Extracts a specific component from the path based on the given index.
+
+        :param path: The path in the format '/volumes/{subvolumegroup}/{subvolume}/..'
+        :param index: The index of the component to extract (1 for subvolumegroup, 2 for subvolume)
+        :return: The component at the specified index
+        """
+        parts = path.strip('/').split('/')
+        if len(parts) >= 3 and parts[0] == "volumes":
+            return parts[index]
+        return None
+
+    def _fetch_subvolumegroup_from_path(self, path: str) -> Optional[str]:
+        """
+        Extracts and returns the subvolume group name from the given path.
+
+        :param path: The path in the format '/volumes/{subvolumegroup}/{subvolume}/..'
+        :return: The subvolume group name
+        """
+        return self._extract_path_component(path, 1)
+
+    def _fetch_subvolume_from_path(self, path: str) -> Optional[str]:
+        """
+        Extracts and returns the subvolume name from the given path.
+
+        :param path: The path in the format '/volumes/{subvolumegroup}/{subvolume}/..'
+        :return: The subvolume name
+        """
+        return self._extract_path_component(path, 2)
+
+    def _manage_earmark(self, path: str, volume: str, operation: str, earmark: Optional[str] = None) -> Optional[str]:
+        """
+        Manages (get or set) the earmark for a subvolume based on the provided parameters.
+
+        :param path: The path of the subvolume
+        :param volume: The volume name
+        :param earmark: The earmark to set (None if only getting the earmark)
+        :return: The earmark if getting, otherwise None
+        """
+        with open_filesystem(self._cephfs_client, volume) as fs:
+            earmark_manager = CephFSVolumeEarmarking(fs, path)
+            try:
+                if operation == 'set' and earmark is not None:
+                    earmark_manager.set_earmark(earmark)
+                    return None
+                elif operation == 'get':
+                    return earmark_manager.get_earmark()
+            except EarmarkException as e:
+                logger.error(f"Failed to manage earmark: {e}")
+                return None
+        return None
+
+    def get_earmark(self, path: str, volume: str) -> Optional[str]:
+        """
+        Get earmark for a subvolume.
+        """
+        return self._manage_earmark(path, volume, 'get')
+
+    def set_earmark(self, path: str, volume: str, earmark: str) -> None:
+        """
+        Set earmark for a subvolume.
+        """
+        self._manage_earmark(path, volume, 'set', earmark)
+
+    def check_earmark(self, earmark: str, top_level_scope: EarmarkTopScope) -> bool:
+        """
+        Check if the earmark belongs to the mentioned top level scope.
+
+        :param earmark: The earmark string to check.
+        :param top_level_scope: The expected top level scope.
+        :return: True if the earmark matches the top level scope, False otherwise.
+        """
+        try:
+            parsed = CephFSVolumeEarmarking.parse_earmark(earmark)
+            if parsed is None:
+                return False
+            return parsed.top == top_level_scope
+        except EarmarkParseError:
+            return False
+
 
 @contextlib.contextmanager
 def open_filesystem(fsc: CephfsClient, fs_name: str) -> Generator["cephfs.LibCephFS", None, None]:
@@ -348,10 +447,6 @@ def open_filesystem(fsc: CephfsClient, fs_name: str) -> Generator["cephfs.LibCep
     :param fs_name: fs name
     :return: yields a fs handle (ceph filesystem handle)
     """
-    if fsc.is_stopping():
-        raise CephfsConnectionException(-errno.ESHUTDOWN,
-                                        "shutdown in progress")
-
     fs_handle = fsc.connection_pool.get_fs_handle(fs_name)
     try:
         yield fs_handle
@@ -422,7 +517,9 @@ def test_port_allocation(addr: str, port: int) -> None:
     If no exception is raised, the port can be assumed available
     """
     try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        ip_version = ip_address(addr).version
+        addr_family = socket.AF_INET if ip_version == 4 else socket.AF_INET6
+        sock = socket.socket(addr_family, socket.SOCK_STREAM)
         sock.bind((addr, port))
         sock.close()
     except socket.error as e:
@@ -522,7 +619,7 @@ def create_self_signed_cert(organisation: str = 'Ceph',
 
     :param organisation: String representing the Organisation(O) RDN (default='Ceph')
     :param common_name: String representing the Common Name(CN) RDN (default='mgr')
-    :param dname: Optional dictionary containing RDNs to use for crt/key generation 
+    :param dname: Optional dictionary containing RDNs to use for crt/key generation
 
     :return: ssl crt and key in utf-8 format
 
@@ -530,19 +627,8 @@ def create_self_signed_cert(organisation: str = 'Ceph',
 
     """
 
-    from OpenSSL import crypto
-    from uuid import uuid4
-
     # RDN = Relative Distinguished Name
     valid_RDN_list = ['C', 'ST', 'L', 'O', 'OU', 'CN', 'emailAddress']
-
-    # create a key pair
-    pkey = crypto.PKey()
-    pkey.generate_key(crypto.TYPE_RSA, 2048)
-
-    # Create a "subject" object
-    req = crypto.X509Req()
-    subj = req.get_subject()
 
     if dname:
         # dname received, so check it contains valid RDNs
@@ -551,43 +637,18 @@ def create_self_signed_cert(organisation: str = 'Ceph',
     else:
         dname = {"O": organisation, "CN": common_name}
 
-    # populate the subject with the dname settings
-    for k, v in dname.items():
-        setattr(subj, k, v)
-
-    # create a self-signed cert
-    cert = crypto.X509()
-    cert.set_subject(req.get_subject())
-    cert.set_serial_number(int(uuid4()))
-    cert.gmtime_adj_notBefore(0)
-    cert.gmtime_adj_notAfter(10 * 365 * 24 * 60 * 60)  # 10 years
-    cert.set_issuer(cert.get_subject())
-    cert.set_pubkey(pkey)
-    cert.sign(pkey, 'sha512')
-
-    cert = crypto.dump_certificate(crypto.FILETYPE_PEM, cert)
-    pkey = crypto.dump_privatekey(crypto.FILETYPE_PEM, pkey)
-
-    return cert.decode('utf-8'), pkey.decode('utf-8')
+    cc = get_crypto_caller()
+    pkey = cc.create_private_key()
+    cert = cc.create_self_signed_cert(dname, pkey)
+    return cert, pkey
 
 
-def verify_cacrt_content(crt):
-    # type: (str) -> None
-    from OpenSSL import crypto
+def certificate_days_to_expire(crt: str) -> int:
     try:
-        crt_buffer = crt.encode("ascii") if isinstance(crt, str) else crt
-        x509 = crypto.load_certificate(crypto.FILETYPE_PEM, crt_buffer)
-        if x509.has_expired():
-            org, cn = get_cert_issuer_info(crt)
-            no_after = x509.get_notAfter()
-            end_date = None
-            if no_after is not None:
-                end_date = datetime.datetime.strptime(no_after.decode('ascii'), '%Y%m%d%H%M%SZ')
-            msg = f'Certificate issued by "{org}/{cn}" expired on {end_date}'
-            logger.warning(msg)
-            raise ServerConfigException(msg)
-    except (ValueError, crypto.Error) as e:
-        raise ServerConfigException(f'Invalid certificate: {e}')
+        cc = get_crypto_caller()
+        return cc.certificate_days_to_expire(crt)
+    except ValueError as err:
+        raise ServerConfigException(f'Invalid certificate: {err}')
 
 
 def verify_cacrt(cert_fname):
@@ -601,58 +662,30 @@ def verify_cacrt(cert_fname):
 
     try:
         with open(cert_fname) as f:
-            verify_cacrt_content(f.read())
+            certificate_days_to_expire(f.read())
     except ValueError as e:
         raise ServerConfigException(
             'Invalid certificate {}: {}'.format(cert_fname, str(e)))
 
-def get_cert_issuer_info(crt: str) -> Tuple[Optional[str],Optional[str]]:
-    """Basic validation of a ca cert"""
 
-    from OpenSSL import crypto, SSL
+def get_cert_issuer_info(crt: str) -> Tuple[Optional[str], Optional[str]]:
+    """Basic validation of a ca cert"""
+    cc = get_crypto_caller()
     try:
-        crt_buffer = crt.encode("ascii") if isinstance(crt, str) else crt
-        (org_name, cn) = (None, None)
-        cert = crypto.load_certificate(crypto.FILETYPE_PEM, crt_buffer)
-        components = cert.get_issuer().get_components()
-        for c in components:
-            if c[0].decode() == 'O':  # org comp
-                org_name = c[1].decode()
-            elif c[0].decode() == 'CN':  # common name comp
-                cn = c[1].decode()
-        return (org_name, cn)
-    except (ValueError, crypto.Error) as e:
-        raise ServerConfigException(f'Invalid certificate key: {e}')
+        return cc.get_cert_issuer_info(crt)
+    except ValueError as err:
+        raise ServerConfigException(f'Invalid certificate key: {err}')
+
 
 def verify_tls(crt, key):
-    # type: (str, str) -> None
-    verify_cacrt_content(crt)
-
-    from OpenSSL import crypto, SSL
+    # type: (str, str) -> int
+    cc = get_crypto_caller()
     try:
-        _key = crypto.load_privatekey(crypto.FILETYPE_PEM, key)
-        _key.check()
-    except (ValueError, crypto.Error) as e:
-        raise ServerConfigException(
-            'Invalid private key: {}'.format(str(e)))
-    try:
-        crt_buffer = crt.encode("ascii") if isinstance(crt, str) else crt
-        _crt = crypto.load_certificate(crypto.FILETYPE_PEM, crt_buffer)
-    except ValueError as e:
-        raise ServerConfigException(
-            'Invalid certificate key: {}'.format(str(e))
-        )
-
-    try:
-        context = SSL.Context(SSL.TLSv1_METHOD)
-        context.use_certificate(_crt)
-        context.use_privatekey(_key)
-        context.check_privatekey()
-    except crypto.Error as e:
-        logger.warning('Private key and certificate do not match up: {}'.format(str(e)))
-    except SSL.Error as e:
-        raise ServerConfigException(f'Invalid cert/key pair: {e}')
-
+        days_to_expiration = cc.certificate_days_to_expire(crt)
+        cc.verify_tls(crt, key)
+    except ValueError as err:
+        raise ServerConfigException(str(err))
+    return days_to_expiration
 
 
 def verify_tls_files(cert_fname, pkey_fname):
@@ -680,24 +713,14 @@ def verify_tls_files(cert_fname, pkey_fname):
     if not os.path.isfile(pkey_fname):
         raise ServerConfigException('private key %s does not exist' % pkey_fname)
 
-    from OpenSSL import crypto, SSL
+    if not os.path.isfile(cert_fname):
+        raise ServerConfigException('certificate %s does not exist' % cert_fname)
 
     try:
-        with open(pkey_fname) as f:
-            pkey = crypto.load_privatekey(crypto.FILETYPE_PEM, f.read())
-            pkey.check()
-    except (ValueError, crypto.Error) as e:
-        raise ServerConfigException(
-            'Invalid private key {}: {}'.format(pkey_fname, str(e)))
-    try:
-        context = SSL.Context(SSL.TLSv1_METHOD)
-        context.use_certificate_file(cert_fname, crypto.FILETYPE_PEM)
-        context.use_privatekey_file(pkey_fname, crypto.FILETYPE_PEM)
-        context.check_privatekey()
-    except crypto.Error as e:
-        logger.warning(
-            'Private key {} and certificate {} do not match up: {}'.format(
-                pkey_fname, cert_fname, str(e)))
+        with open(pkey_fname) as key_file, open(cert_fname) as cert_file:
+            verify_tls(cert_file.read(), key_file.read())
+    except (ServerConfigException) as e:
+        raise ServerConfigException({e})
 
 
 def get_most_recent_rate(rates: Optional[List[Tuple[float, float]]]) -> float:
@@ -721,6 +744,7 @@ def get_most_recent_rate(rates: Optional[List[Tuple[float, float]]]) -> float:
     if not rates:
         return 0.0
     return rates[-1][1]
+
 
 def get_time_series_rates(data: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
     """ Rates from time series data
@@ -749,6 +773,7 @@ def get_time_series_rates(data: List[Tuple[float, float]]) -> List[Tuple[float, 
         return []
     return [(data2[0], _derivative(data1, data2) if data1 is not None else 0.0) for data1, data2 in
             _pairwise(data)]
+
 
 def name_to_config_section(name: str) -> ConfEntity:
     """
@@ -846,12 +871,12 @@ def to_pretty_timedelta(n: datetime.timedelta) -> str:
     if n < datetime.timedelta(hours=48):
         return str(int(n.total_seconds()) // 3600) + 'h'
     if n < datetime.timedelta(days=14):
-        return str(int(n.total_seconds()) // (3600*24)) + 'd'
-    if n < datetime.timedelta(days=7*12):
-        return str(int(n.total_seconds()) // (3600*24*7)) + 'w'
-    if n < datetime.timedelta(days=365*2):
-        return str(int(n.total_seconds()) // (3600*24*30)) + 'M'
-    return str(int(n.total_seconds()) // (3600*24*365)) + 'y'
+        return str(int(n.total_seconds()) // (3600 * 24)) + 'd'
+    if n < datetime.timedelta(days=7 * 12):
+        return str(int(n.total_seconds()) // (3600 * 24 * 7)) + 'w'
+    if n < datetime.timedelta(days=365 * 2):
+        return str(int(n.total_seconds()) // (3600 * 24 * 30)) + 'M'
+    return str(int(n.total_seconds()) // (3600 * 24 * 365)) + 'y'
 
 
 def profile_method(skip_attribute: bool = False) -> Callable[[Callable[..., T]], Callable[..., T]]:
@@ -873,3 +898,33 @@ def profile_method(skip_attribute: bool = False) -> Callable[[Callable[..., T]],
             return result
         return wrapper
     return outer
+
+
+def parse_combined_pem_file(pem_data: str) -> Tuple[Optional[str], Optional[str]]:
+
+    # Extract the certificate
+    cert_start = "-----BEGIN CERTIFICATE-----"
+    cert_end = "-----END CERTIFICATE-----"
+    cert = None
+    if cert_start in pem_data and cert_end in pem_data:
+        cert = pem_data[pem_data.index(cert_start):pem_data.index(cert_end) + len(cert_end)]
+
+    # Extract the private key
+    key_start = "-----BEGIN PRIVATE KEY-----"
+    key_end = "-----END PRIVATE KEY-----"
+    private_key = None
+    if key_start in pem_data and key_end in pem_data:
+        private_key = pem_data[pem_data.index(key_start):pem_data.index(key_end) + len(key_end)]
+
+    return cert, private_key
+
+
+def password_hash(password: Optional[str], salt_password: Optional[str] = None) -> Optional[str]:
+    if not password:
+        return None
+
+    if not salt_password:
+        salt_password = ''
+
+    cc = get_crypto_caller()
+    return cc.password_hash(password, salt_password)

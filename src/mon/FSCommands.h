@@ -19,22 +19,29 @@
 #include "Monitor.h"
 #include "CommandHandler.h"
 
-#include "osd/OSDMap.h"
-#include "mds/FSMap.h"
+#include "include/cephfs/types.h" // for fs_cluster_id_t"
 
+#include <iosfwd>
+#include <memory>
 #include <string>
-#include <ostream>
+#include <variant>
+
+class Filesystem;
+class FSMap;
+class OSDMap;
 
 class FileSystemCommandHandler : protected CommandHandler
 {
 protected:
   std::string prefix;
 
+  using fs_or_fscid = std::variant<Filesystem*, fs_cluster_id_t>;
   enum {
     POOL_METADATA,
     POOL_DATA_DEFAULT,
     POOL_DATA_EXTRA,
   };
+
   /**
    * Return 0 if the pool is suitable for use with CephFS, or
    * in case of errors return a negative error code, and populate
@@ -51,6 +58,8 @@ protected:
       bool allow_overlay = false) const;
 
   virtual std::string const &get_prefix() const {return prefix;}
+
+  int set_val(Monitor *mon, FSMap& fsmap, MonOpRequestRef op, const cmdmap_t& cmdmap, std::ostream &ss, fs_or_fscid fs, std::string var, std::string val);
 
 public:
   FileSystemCommandHandler(const std::string &prefix_)
@@ -79,10 +88,6 @@ public:
 
   static std::list<std::shared_ptr<FileSystemCommandHandler> > load(Paxos *paxos);
 
-  virtual bool batched_propose() {
-    return false;
-  }
-
   virtual int handle(
     Monitor *mon,
     FSMap &fsmap,
@@ -90,5 +95,13 @@ public:
     const cmdmap_t& cmdmap,
     std::ostream &ss) = 0;
 };
+
+
+static constexpr auto errmsg_for_unhealthy_mds = \
+  "MDS has one of two health warnings which could extend recovery: "
+  "MDS_TRIM or MDS_CACHE_OVERSIZED. MDS failover is not recommended "
+  "since it might cause unexpected file system unavailability. If "
+  "you wish to proceed, pass --yes-i-really-mean-it";
+
 
 #endif

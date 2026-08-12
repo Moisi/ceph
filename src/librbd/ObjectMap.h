@@ -14,6 +14,8 @@
 #include "librbd/Utils.h"
 #include <boost/optional.hpp>
 
+#include <shared_mutex> // for std::shared_lock
+
 class Context;
 namespace ZTracer { struct Trace; }
 
@@ -45,6 +47,12 @@ public:
     return m_object_map.size();
   }
 
+  template <typename F, typename... Args>
+  auto with_object_map(F&& f, Args&&... args) const {
+    std::shared_lock locker(m_lock);
+    return std::forward<F>(f)(m_object_map, std::forward<Args>(args)...);
+  }
+
   inline void set_state(uint64_t object_no, uint8_t new_state,
                         const boost::optional<uint8_t> &current_state) {
     std::unique_lock locker{m_lock};
@@ -59,7 +67,6 @@ public:
   void close(Context *on_finish);
   bool set_object_map(ceph::BitVector<2> &target_object_map);
   bool object_may_exist(uint64_t object_no) const;
-  bool object_may_not_exist(uint64_t object_no) const;
 
   void aio_save(Context *on_finish);
   void aio_resize(uint64_t new_size, uint8_t default_object_state,

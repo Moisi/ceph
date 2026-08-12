@@ -19,6 +19,7 @@
 #include "gmock/gmock-more-matchers.h"
 #include "include/compat.h"
 #include "include/cephfs/libcephfs.h"
+#include "include/fs_types.h"
 #include "mds/mdstypes.h"
 #include "include/stat.h"
 #include <errno.h>

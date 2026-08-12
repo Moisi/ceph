@@ -55,16 +55,16 @@ Possible -op commands::
 * list-slow-omap
 * fix-lost
 * list-pgs
-* dump-journal
 * dump-super
 * meta-list
 * get-osdmap
 * set-osdmap
+* get-superblock
+* set-superblock
 * get-inc-osdmap
 * set-inc-osdmap
 * mark-complete
 * reset-last-complete
-* apply-layout-settings
 * update-mon-db
 * dump-export
 * trim-pg-log
@@ -203,8 +203,6 @@ Manipulating the Object Map Header
 ----------------------------------
 The **ceph-objectstore-tool** utility will output the object map (OMAP) header with the values associated with the object's keys.
 
-Note: If using FileStore as the OSD backend object store, then add the `--journal-path $PATH_TO_JOURNAL` argument when getting or setting the object map header, where the `$PATH_TO_JOURNAL` variable is the absolute path to the OSD journal; for example `/var/lib/ceph/osd/ceph-0/journal`.
-
 Prerequisites
 ^^^^^^^^^^^^^
 
@@ -248,47 +246,56 @@ Procedure
 Manipulating the Object Map Key
 -------------------------------
 
-Use the **ceph-objectstore-tool** utility to change the object map (OMAP) key. You need to provide the data path, the placement group identifier (PG ID), the object, and the key in the OMAP.
-Note
-
-If using FileStore as the OSD backend object store, then add the `--journal-path $PATH_TO_JOURNAL` argument when getting, setting or removing the object map key, where the `$PATH_TO_JOURNAL` variable is the absolute path to the OSD journal; for example `/var/lib/ceph/osd/ceph-0/journal`.
+Use the **ceph-objectstore-tool** utility to change the object map (OMAP) key.
+Provide the data path, the placement group identifier (PG ID), the object, and
+the key in the OMAP.
 
 Prerequisites
+^^^^^^^^^^^^^
 
     * Having root access to the Ceph OSD node.
     * Stopping the ceph-osd daemon. 
 
-Procedure
+Commands
+^^^^^^^^
 
-    Get the object map key:
+Run the commands in this section as ``root`` on an OSD node.
 
-    Syntax::
+* **Getting the object map key**
+
+   Syntax:
+
+   .. code-block:: ini 
      
-       ceph-objectstore-tool --data-path $PATH_TO_OSD --pgid $PG_ID $OBJECT get-omap $KEY > $OBJECT_MAP_FILE_NAME
+      ceph-objectstore-tool --data-path $PATH_TO_OSD --pgid $PG_ID $OBJECT get-omap $KEY > $OBJECT_MAP_FILE_NAME
 
    Example::
 
-    [root@osd ~]# ceph-objectstore-tool --data-path /var/lib/ceph/osd/ceph-0 --pgid 0.1c '{"oid":"zone_info.default","key":"","snapid":-2,"hash":235010478,"max":0,"pool":11,"namespace":""}'  get-omap "" > zone_info.default.omap.txt
+    ceph-objectstore-tool --data-path /var/lib/ceph/osd/ceph-0 --pgid 0.1c '{"oid":"zone_info.default","key":"","snapid":-2,"hash":235010478,"max":0,"pool":11,"namespace":""}'  get-omap "" > zone_info.default.omap.txt
 
-   Set the object map key:
+* **Setting the object map key**
 
-   Syntax::
+   Syntax:
 
-    ceph-objectstore-tool --data-path $PATH_TO_OSD --pgid $PG_ID $OBJECT set-omap $KEY < $OBJECT_MAP_FILE_NAME
+   .. code-block:: ini 
 
-   Example::
-
-    [root@osd ~]# ceph-objectstore-tool --data-path /var/lib/ceph/osd/ceph-0 --pgid 0.1c '{"oid":"zone_info.default","key":"","snapid":-2,"hash":235010478,"max":0,"pool":11,"namespace":""}' set-omap "" < zone_info.default.omap.txt
-
-   Remove the object map key:
-
-   Syntax::
-
-    ceph-objectstore-tool --data-path $PATH_TO_OSD --pgid $PG_ID $OBJECT rm-omap $KEY
+      ceph-objectstore-tool --data-path $PATH_TO_OSD --pgid $PG_ID $OBJECT set-omap $KEY < $OBJECT_MAP_FILE_NAME
 
    Example::
 
-    [root@osd ~]# ceph-objectstore-tool --data-path /var/lib/ceph/osd/ceph-0 --pgid 0.1c '{"oid":"zone_info.default","key":"","snapid":-2,"hash":235010478,"max":0,"pool":11,"namespace":""}' rm-omap ""
+    ceph-objectstore-tool --data-path /var/lib/ceph/osd/ceph-0 --pgid 0.1c '{"oid":"zone_info.default","key":"","snapid":-2,"hash":235010478,"max":0,"pool":11,"namespace":""}' set-omap "" < zone_info.default.omap.txt
+
+* **Removing the object map key**
+
+   Syntax:
+
+   .. code-block:: ini 
+
+      ceph-objectstore-tool --data-path $PATH_TO_OSD --pgid $PG_ID $OBJECT rm-omap $KEY
+
+   Example::
+
+    ceph-objectstore-tool --data-path /var/lib/ceph/osd/ceph-0 --pgid 0.1c '{"oid":"zone_info.default","key":"","snapid":-2,"hash":235010478,"max":0,"pool":11,"namespace":""}' rm-omap ""
 
 
 Listing an Object's Attributes
@@ -296,8 +303,6 @@ Listing an Object's Attributes
 
 Use the **ceph-objectstore-tool** utility to list an object's attributes. The output provides you with the object's keys and values.
 Note
-
-If you are using FileStore as the OSD backend object store and the journal is on a different disk, you must add the `--journal-path $PATH_TO_JOURNAL` argument when listing an object's attributes, where the `$PATH_TO_JOURNAL` variable is the absolute path to the OSD journal; for example `/var/lib/ceph/osd/ceph-0/journal`.
 
 Prerequisites
 ^^^^^^^^^^^^^
@@ -334,8 +339,6 @@ MANIPULATING THE OBJECT ATTRIBUTE KEY
 
 Use the ceph-objectstore-tool utility to change an object's attributes. To manipulate the object's attributes you need the data and journal paths, the placement group identifier (PG ID), the object, and the key in the object's attribute.
 Note
-
-If you are using FileStore as the OSD backend object store and the journal is on a different disk, you must add the `--journal-path $PATH_TO_JOURNAL` argument when getting, setting or removing the object's attributes. Where the `$PATH_TO_JOURNAL` variable is the absolute path to the OSD journal, for example `/var/lib/ceph/osd/ceph-0/journal`.
 
 Prerequisites
 
@@ -394,7 +397,7 @@ Options
 
 .. option:: --type arg        
 
-   Arg is one of [bluestore (default), filestore, memstore]. This option is needed only if the tool can't tell the type from --data-path.
+   Arg is one of [bluestore (default), memstore]. This option is needed only if the tool can't tell the type from --data-path.
  
 .. option:: --data-path arg
 
@@ -406,15 +409,15 @@ Options
    
 .. option:: --pgid arg
 
-   PG id, mandatory for info, log, remove, export, export-remove, mark-complete, trim-pg-log, and mandatory for apply-layout-settings if --pool is not specified
+   PG id, mandatory for info, log, remove, export, export-remove, mark-complete, trim-pg-log
                              
 .. option:: --pool arg
 
-   Pool name, mandatory for apply-layout-settings if --pgid is not specified
+   Pool name
 
 .. option:: --op arg
 
-   Arg is one of [info, log, remove, mkfs, fsck, repair, fuse, dup, export, export-remove, import, list, fix-lost, list-pgs, dump-journal, dump-super, meta-list, get-osdmap, set-osdmap, get-inc-osdmap, set-inc-osdmap, mark-complete, reset-last-complete, apply-layout-settings, update-mon-db, dump-export, trim-pg-log]
+   Arg is one of [info, log, remove, mkfs, fsck, repair, fuse, dup, export, export-remove, import, list, fix-lost, list-pgs, dump-super, meta-list, get-osdmap, set-osdmap, get-superblock, set-superblock, get-inc-osdmap, set-inc-osdmap, mark-complete, reset-last-complete, update-mon-db, dump-export, trim-pg-log]
 
 .. option:: --epoch arg
 
@@ -422,7 +425,7 @@ Options
 
 .. option:: --file arg             
    
-   path of file to export, export-remove, import, get-osdmap, set-osdmap, get-inc-osdmap or set-inc-osdmap
+   path of file to export, export-remove, import, get-osdmap, set-osdmap, get-superblock, set-superblock, get-inc-osdmap or set-inc-osdmap
 
 .. option:: --mon-store-path arg
 
@@ -485,4 +488,4 @@ Error Codes
 Availability
 ============
 
-**ceph-objectstore-tool** is part of Ceph, a massively scalable, open-source, distributed storage system. **ceph-objectstore-tool** is provided by the package `ceph-osd`. Refer to the Ceph documentation at http://ceph.com/docs for more information.
+**ceph-objectstore-tool** is part of Ceph, a massively scalable, open-source, distributed storage system. **ceph-objectstore-tool** is provided by the package `ceph-osd`. Refer to the Ceph documentation at https://docs.ceph.com/ for more information.

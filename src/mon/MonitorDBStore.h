@@ -31,6 +31,7 @@
 #include "common/safe_io.h"
 #include "common/blkdev.h"
 #include "common/PriorityCache.h"
+#include "common/version.h"
 
 #define dout_context g_ceph_context
 
@@ -118,9 +119,11 @@ class MonitorDBStore
 	4 + bl.length();
     }
 
-    static void generate_test_instances(std::list<Op*>& ls) {
-      ls.push_back(new Op);
+    static std::list<Op> generate_test_instances() {
+      std::list<Op> ls;
+      ls.emplace_back();
       // we get coverage here from the Transaction instances
+      return ls;
     }
   };
 
@@ -204,16 +207,18 @@ class MonitorDBStore
       DECODE_FINISH(bl);
     }
 
-    static void generate_test_instances(std::list<Transaction*>& ls) {
-      ls.push_back(new Transaction);
-      ls.push_back(new Transaction);
+    static std::list<Transaction> generate_test_instances() {
+      std::list<Transaction> ls;
+      ls.emplace_back();
+      ls.emplace_back();
       ceph::buffer::list bl;
       bl.append("value");
-      ls.back()->put("prefix", "key", bl);
-      ls.back()->erase("prefix2", "key2");
-      ls.back()->erase_range("prefix3", "key3", "key4");
-      ls.back()->compact_prefix("prefix3");
-      ls.back()->compact_range("prefix4", "from", "to");
+      ls.back().put("prefix", "key", bl);
+      ls.back().erase("prefix2", "key2");
+      ls.back().erase_range("prefix3", "key3", "key4");
+      ls.back().compact_prefix("prefix3");
+      ls.back().compact_range("prefix4", "from", "to");
+      return ls;
     }
 
     void append(TransactionRef other) {
@@ -604,6 +609,14 @@ class MonitorDBStore
     return combine_strings(prefix, os.str());
   }
 
+  int clear_key(const std::string& prefix, const std::string& key) {
+    ceph_assert(!prefix.empty());
+    ceph_assert(!key.empty());
+    KeyValueDB::Transaction dbt = db->get_transaction();
+    dbt->rmkey(prefix, key);
+    return db->submit_transaction_sync(dbt);
+  }
+
   void clear(std::set<std::string>& prefixes) {
     KeyValueDB::Transaction dbt = db->get_transaction();
 
@@ -664,8 +677,8 @@ class MonitorDBStore
     std::string kv_type;
     int r = read_meta("kv_backend", &kv_type);
     if (r < 0 || kv_type.empty()) {
-      // assume old monitors that did not mark the type were leveldb.
-      kv_type = "leveldb";
+      // assume old monitors that did not mark the type were RocksDB.
+      kv_type = "rocksdb";
       r = write_meta("kv_backend", kv_type);
       if (r < 0)
 	return r;
@@ -690,9 +703,20 @@ class MonitorDBStore
   }
 
   int create_and_open(std::ostream &out) {
+    int r = write_meta("ceph_version_when_created", pretty_version_to_str());
+    if (r < 0)
+      return r;
+
+    std::ostringstream created_at;
+    utime_t now = ceph_clock_now();
+    now.gmtime(created_at);
+    r = write_meta("created_at", created_at.str());
+    if (r < 0)
+      return r;
+
     // record the type before open
     std::string kv_type;
-    int r = read_meta("kv_backend", &kv_type);
+    r = read_meta("kv_backend", &kv_type);
     if (r < 0) {
       kv_type = g_conf()->mon_keyvaluedb;
       r = write_meta("kv_backend", kv_type);
@@ -710,6 +734,7 @@ class MonitorDBStore
 
   void close() {
     // there should be no work queued!
+    ceph_assert(io_work.is_empty());
     io_work.stop();
     is_open = false;
     db.reset(NULL);

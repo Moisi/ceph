@@ -8,6 +8,7 @@
 #include <map>
 #include <set>
 #include <string>
+#include <vector>
 
 #include <iosfwd>
 
@@ -24,6 +25,7 @@ extern "C" {
 #include "include/err.h"
 #include "include/encoding.h"
 #include "include/mempool.h"
+#include "include/rados.h" // for CEPH_PG_TYPE_*
 
 namespace ceph {
   class Formatter;
@@ -93,25 +95,12 @@ public:
   CrushWrapper() {
     create();
   }
-  ~CrushWrapper() {
-    if (crush)
-      crush_destroy(crush);
-    choose_args_clear();
-  }
+  ~CrushWrapper();
 
   crush_map *get_crush_map() { return crush; }
 
   /* building */
-  void create() {
-    if (crush)
-      crush_destroy(crush);
-    crush = crush_create();
-    choose_args_clear();
-    ceph_assert(crush);
-    have_rmaps = false;
-
-    set_tunables_default();
-  }
+  void create();
 
   /// true if any buckets that aren't straw2
   bool has_non_straw2_buckets() const;
@@ -125,6 +114,7 @@ public:
     crush->chooseleaf_vary_r = 0;
     crush->chooseleaf_stable = 0;
     crush->allowed_bucket_algs = CRUSH_LEGACY_ALLOWED_BUCKET_ALGS;
+    set_default_msr_tunables();
   }
   void set_tunables_bobtail() {
     crush->choose_local_tries = 0;
@@ -134,6 +124,7 @@ public:
     crush->chooseleaf_vary_r = 0;
     crush->chooseleaf_stable = 0;
     crush->allowed_bucket_algs = CRUSH_LEGACY_ALLOWED_BUCKET_ALGS;
+    set_default_msr_tunables();
   }
   void set_tunables_firefly() {
     crush->choose_local_tries = 0;
@@ -143,6 +134,7 @@ public:
     crush->chooseleaf_vary_r = 1;
     crush->chooseleaf_stable = 0;
     crush->allowed_bucket_algs = CRUSH_LEGACY_ALLOWED_BUCKET_ALGS;
+    set_default_msr_tunables();
   }
   void set_tunables_hammer() {
     crush->choose_local_tries = 0;
@@ -156,6 +148,7 @@ public:
       (1 << CRUSH_BUCKET_LIST) |
       (1 << CRUSH_BUCKET_STRAW) |
       (1 << CRUSH_BUCKET_STRAW2);
+    set_default_msr_tunables();
   }
   void set_tunables_jewel() {
     crush->choose_local_tries = 0;
@@ -169,6 +162,7 @@ public:
       (1 << CRUSH_BUCKET_LIST) |
       (1 << CRUSH_BUCKET_STRAW) |
       (1 << CRUSH_BUCKET_STRAW2);
+    set_default_msr_tunables();
   }
 
   void set_tunables_legacy() {
@@ -233,6 +227,24 @@ public:
     crush->straw_calc_version = n;
   }
 
+  unsigned get_msr_descents() const {
+    return crush->msr_descents;
+  }
+  void set_msr_descents(unsigned n) {
+    crush->msr_descents = n;
+  }
+
+  unsigned get_msr_collision_tries() const {
+    return crush->msr_collision_tries;
+  }
+  void set_msr_collision_tries(unsigned n) {
+    crush->msr_collision_tries = n;
+  }
+  void set_default_msr_tunables() {
+    set_msr_descents(100);
+    set_msr_collision_tries(100);
+  }
+
   unsigned get_allowed_bucket_algs() const {
     return crush->allowed_bucket_algs;
   }
@@ -248,7 +260,8 @@ public:
       crush->chooseleaf_descend_once == 0 &&
       crush->chooseleaf_vary_r == 0 &&
       crush->chooseleaf_stable == 0 &&
-      crush->allowed_bucket_algs == CRUSH_LEGACY_ALLOWED_BUCKET_ALGS;
+      crush->allowed_bucket_algs == CRUSH_LEGACY_ALLOWED_BUCKET_ALGS &&
+      !has_nondefault_tunables_msr();
   }
   bool has_bobtail_tunables() const {
     return
@@ -258,7 +271,8 @@ public:
       crush->chooseleaf_descend_once == 1 &&
       crush->chooseleaf_vary_r == 0 &&
       crush->chooseleaf_stable == 0 &&
-      crush->allowed_bucket_algs == CRUSH_LEGACY_ALLOWED_BUCKET_ALGS;
+      crush->allowed_bucket_algs == CRUSH_LEGACY_ALLOWED_BUCKET_ALGS &&
+      !has_nondefault_tunables_msr();
   }
   bool has_firefly_tunables() const {
     return
@@ -268,7 +282,8 @@ public:
       crush->chooseleaf_descend_once == 1 &&
       crush->chooseleaf_vary_r == 1 &&
       crush->chooseleaf_stable == 0 &&
-      crush->allowed_bucket_algs == CRUSH_LEGACY_ALLOWED_BUCKET_ALGS;
+      crush->allowed_bucket_algs == CRUSH_LEGACY_ALLOWED_BUCKET_ALGS &&
+      !has_nondefault_tunables_msr();
   }
   bool has_hammer_tunables() const {
     return
@@ -281,7 +296,8 @@ public:
       crush->allowed_bucket_algs == ((1 << CRUSH_BUCKET_UNIFORM) |
 				      (1 << CRUSH_BUCKET_LIST) |
 				      (1 << CRUSH_BUCKET_STRAW) |
-				      (1 << CRUSH_BUCKET_STRAW2));
+				      (1 << CRUSH_BUCKET_STRAW2)) &&
+      !has_nondefault_tunables_msr();
   }
   bool has_jewel_tunables() const {
     return
@@ -294,7 +310,8 @@ public:
       crush->allowed_bucket_algs == ((1 << CRUSH_BUCKET_UNIFORM) |
 				      (1 << CRUSH_BUCKET_LIST) |
 				      (1 << CRUSH_BUCKET_STRAW) |
-				      (1 << CRUSH_BUCKET_STRAW2));
+				      (1 << CRUSH_BUCKET_STRAW2)) &&
+      !has_nondefault_tunables_msr();
   }
 
   bool has_optimal_tunables() const {
@@ -322,6 +339,11 @@ public:
     return
         crush->chooseleaf_stable != 0;
   }
+  bool has_nondefault_tunables_msr() const {
+    return
+      crush->msr_descents != 100 ||
+      crush->msr_collision_tries != 100;
+  }
 
   bool has_v2_rules() const;
   bool has_v3_rules() const;
@@ -329,13 +351,17 @@ public:
   bool has_v5_rules() const;
   bool has_choose_args() const;          // any choose_args
   bool has_incompat_choose_args() const; // choose_args that can't be made compat
+  bool has_msr_rules() const;
 
   bool is_v2_rule(unsigned ruleid) const;
   bool is_v3_rule(unsigned ruleid) const;
   bool is_v5_rule(unsigned ruleid) const;
+  bool is_msr_rule(unsigned ruleid) const;
 
   std::string get_min_required_version() const {
-    if (has_v5_rules() || has_nondefault_tunables5())
+    if (has_msr_rules() || has_nondefault_tunables_msr())
+      return "squid";
+    else if (has_v5_rules() || has_nondefault_tunables5())
       return "jewel";
     else if (has_v4_buckets())
       return "hammer";
@@ -565,6 +591,20 @@ public:
     if (have_rmaps)
       rule_name_rmap[name] = i;
   }
+  bool rule_valid_for_pool_type(int rule_id, int ptype) const {
+    auto rule_type = get_rule_type(rule_id);
+    switch (ptype) {
+    case CEPH_PG_TYPE_REPLICATED:
+      return rule_type == CRUSH_RULE_TYPE_REPLICATED ||
+	rule_type == CRUSH_RULE_TYPE_MSR_FIRSTN;
+    case CEPH_PG_TYPE_ERASURE:
+      return rule_type == CRUSH_RULE_TYPE_ERASURE ||
+	rule_type == CRUSH_RULE_TYPE_MSR_INDEP;
+    default:
+      ceph_abort_msg("impossible");
+    }
+  }
+
   bool is_shadow_item(int id) const {
     const char *name = get_item_name(id);
     return name && !is_valid_crush_name(name);
@@ -1121,6 +1161,9 @@ public:
     crush_rule *n = crush_make_rule(len, type);
     ceph_assert(n);
     ruleno = crush_add_rule(crush, n, ruleno);
+    if (ruleno < 0) {
+      free(n);
+    }
     return ruleno;
   }
   int set_rule_step(unsigned ruleno, unsigned step, int op, int arg1, int arg2) {
@@ -1151,6 +1194,14 @@ public:
   int set_rule_step_set_chooseleaf_stable(unsigned ruleno, unsigned step, int val) {
     return set_rule_step(ruleno, step, CRUSH_RULE_SET_CHOOSELEAF_STABLE, val, 0);
   }
+
+  int set_rule_step_set_msr_descents(unsigned ruleno, unsigned step, int val) {
+    return set_rule_step(ruleno, step, CRUSH_RULE_SET_MSR_DESCENTS, val, 0);
+  }
+  int set_rule_step_set_msr_collision_tries(unsigned ruleno, unsigned step, int val) {
+    return set_rule_step(ruleno, step, CRUSH_RULE_SET_MSR_COLLISION_TRIES, val, 0);
+  }
+
   int set_rule_step_choose_firstn(unsigned ruleno, unsigned step, int val, int type) {
     return set_rule_step(ruleno, step, CRUSH_RULE_CHOOSE_FIRSTN, val, type);
   }
@@ -1163,13 +1214,32 @@ public:
   int set_rule_step_choose_leaf_indep(unsigned ruleno, unsigned step, int val, int type) {
     return set_rule_step(ruleno, step, CRUSH_RULE_CHOOSELEAF_INDEP, val, type);
   }
+  int set_rule_step_choose_msr(unsigned ruleno, unsigned step, int val, int type) {
+    return set_rule_step(ruleno, step, CRUSH_RULE_CHOOSE_MSR, val, type);
+  }
   int set_rule_step_emit(unsigned ruleno, unsigned step) {
     return set_rule_step(ruleno, step, CRUSH_RULE_EMIT, 0, 0);
   }
 
   int add_simple_rule(
     std::string name, std::string root_name, std::string failure_domain_type,
+    int num_failure_domains,
     std::string device_class, std::string mode, int rule_type,
+    std::ostream *err = 0);
+  int add_simple_rule(
+    std::string name, std::string root_name, std::string failure_domain_type,
+    std::string device_class, std::string mode, int rule_type,
+    std::ostream *err = 0) {
+    return add_simple_rule(
+      name, root_name, failure_domain_type, -1,
+      device_class, mode, rule_type, err);
+  }
+
+  int add_indep_multi_osd_per_failure_domain_rule(
+    std::string name, std::string root_name, std::string failure_domain_type,
+    int osds_per_failure_domain,
+    int num_failure_domains,
+    std::string device_class,
     std::ostream *err = 0);
 
   /**
@@ -1177,8 +1247,28 @@ public:
    */
   int add_simple_rule_at(
     std::string name, std::string root_name,
-    std::string failure_domain_type, std::string device_class, std::string mode,
+    std::string failure_domain_type,
+    int num_failure_domains,
+    std::string device_class, std::string mode,
     int rule_type, int rno, std::ostream *err = 0);
+  int add_simple_rule_at(
+    std::string name, std::string root_name,
+    std::string failure_domain_type,
+    std::string device_class, std::string mode,
+    int rule_type, int rno, std::ostream *err = 0) {
+    return add_simple_rule_at(
+      name, root_name, failure_domain_type, -1,
+      device_class, mode, rule_type, rno, err);
+  }
+
+  int add_multi_osd_per_failure_domain_rule_at(
+    std::string name, std::string root_name, std::string failure_domain_type,
+    int osds_per_failure_domain,
+    int num_failure_domains,
+    std::string device_class,
+    crush_rule_type rule_type,
+    int rno,
+    std::ostream *err = 0);
 
   int remove_rule(int ruleno);
 
@@ -1512,14 +1602,14 @@ public:
   void do_rule(int rule, int x, std::vector<int>& out, int maxout,
 	       const WeightVector& weight,
 	       uint64_t choose_args_index) const {
-    int rawout[maxout];
-    char work[crush_work_size(crush, maxout)];
-    crush_init_workspace(crush, work);
+    std::vector<int> rawout(maxout);
+    std::vector<char> work(crush_work_size(crush, maxout));
+    crush_init_workspace(crush, std::data(work));
     crush_choose_arg_map arg_map = choose_args_get_with_fallback(
       choose_args_index);
-    int numrep = crush_do_rule(crush, rule, x, rawout, maxout,
+    int numrep = crush_do_rule(crush, rule, x, std::data(rawout), maxout,
 			       std::data(weight), std::size(weight),
-			       work, arg_map.args);
+			       std::data(work), arg_map.args);
     if (numrep < 0)
       numrep = 0;
     out.resize(numrep);
@@ -1570,7 +1660,7 @@ public:
   }
   void dump_tree(ceph::Formatter *f,
 		 const CrushTreeDumper::name_map_t& ws) const;
-  static void generate_test_instances(std::list<CrushWrapper*>& o);
+  static std::list<CrushWrapper> generate_test_instances();
 
   int get_osd_pool_default_crush_replicated_rule(CephContext *cct);
 

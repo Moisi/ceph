@@ -19,15 +19,51 @@ phy_tree_root_t& get_phy_tree_root<
   return r.backref_root;
 }
 
+template<>
+const get_phy_tree_root_node_ret get_phy_tree_root_node<
+  crimson::os::seastore::backref::BackrefBtree>(
+  const RootBlockRef &root_block, op_context_t c) {
+  auto backref_root = root_block->backref_root_node;
+  if (backref_root) {
+    ceph_assert(backref_root->is_initial_pending()
+      == root_block->is_pending());
+    return {true,
+            c.cache.get_extent_viewable_by_trans(c.trans, backref_root)};
+  } else if (root_block->is_pending()) {
+    auto &prior = static_cast<RootBlock&>(*root_block->get_prior_instance());
+    backref_root = prior.backref_root_node;
+    if (backref_root) {
+      return {true,
+              c.cache.get_extent_viewable_by_trans(c.trans, backref_root)};
+    } else {
+      return {false,
+              Cache::get_extent_iertr::make_ready_future<CachedExtentRef>()};
+    }
+  } else {
+    return {false,
+            Cache::get_extent_iertr::make_ready_future<CachedExtentRef>()};
+  }
+}
+
+template <typename RootT>
+class TreeRootLinker<RootBlock, RootT> {
+public:
+  static void link_root(RootBlockRef &root_block, RootT* backref_root) {
+    root_block->backref_root_node = backref_root;
+    ceph_assert(backref_root != nullptr);
+    backref_root->parent_of_root = root_block;
+  }
+  static void unlink_root(RootBlockRef &root_block) {
+    root_block->backref_root_node = nullptr;
+  }
+};
+
+template class TreeRootLinker<RootBlock, backref::BackrefInternalNode>;
+template class TreeRootLinker<RootBlock, backref::BackrefLeafNode>;
+
 }
 
 namespace crimson::os::seastore::backref {
-
-static depth_t get_depth(const CachedExtent &e)
-{
-  assert(is_backref_node(e.get_type()));
-  return e.cast<BackrefNode>()->get_node_meta().depth;
-}
 
 BtreeBackrefManager::mkfs_ret
 BtreeBackrefManager::mkfs(
@@ -36,7 +72,8 @@ BtreeBackrefManager::mkfs(
   LOG_PREFIX(BtreeBackrefManager::mkfs);
   INFOT("start", t);
   return cache.get_root(t).si_then([this, &t](auto croot) {
-    croot->get_root().backref_root = BackrefBtree::mkfs(get_context(t));
+    assert(croot->is_mutation_pending());
+    croot->get_root().backref_root = BackrefBtree::mkfs(croot, get_context(t));
     return mkfs_iertr::now();
   }).handle_error_interruptible(
     mkfs_iertr::pass_further{},
@@ -54,7 +91,7 @@ BtreeBackrefManager::get_mapping(
   LOG_PREFIX(BtreeBackrefManager::get_mapping);
   TRACET("{}", t, offset);
   auto c = get_context(t);
-  return with_btree_ret<BackrefBtree, BackrefPinRef>(
+  return with_btree<BackrefBtree>(
     cache,
     c,
     [c, offset](auto &btree) {
@@ -68,10 +105,9 @@ BtreeBackrefManager::get_mapping(
       } else {
 	TRACET("{} got {}, {}",
 	       c.trans, offset, iter.get_key(), iter.get_val());
-	auto e = iter.get_pin();
 	return get_mapping_ret(
 	  interruptible::ready_future_marker{},
-	  std::move(e));
+	  BackrefMapping::create(iter.get_cursor(c)));
       }
     });
   });
@@ -86,7 +122,7 @@ BtreeBackrefManager::get_mappings(
   LOG_PREFIX(BtreeBackrefManager::get_mappings);
   TRACET("{}~{}", t, offset, end);
   auto c = get_context(t);
-  return with_btree_state<BackrefBtree, backref_pin_list_t>(
+  return with_btree_state<BackrefBtree, backref_mapping_list_t>(
     cache,
     c,
     [c, offset, end](auto &btree, auto &ret) {
@@ -105,7 +141,7 @@ BtreeBackrefManager::get_mappings(
 	  TRACET("{}~{} got {}, {}, repeat ...",
 	         c.trans, offset, end, pos.get_key(), pos.get_val());
 	  ceph_assert((pos.get_key().add_offset(pos.get_val().len)) > offset);
-	  ret.push_back(pos.get_pin());
+	  ret.emplace_back(BackrefMapping::create(pos.get_cursor(c)));
 	  return BackrefBtree::iterate_repeat_ret_inner(
 	    interruptible::ready_future_marker{},
 	    seastar::stop_iteration::no);
@@ -123,7 +159,7 @@ BtreeBackrefManager::new_mapping(
 {
   ceph_assert(
     is_aligned(
-      key.get_addr_type() == paddr_types_t::SEGMENT ?
+      key.is_absolute_segmented() ?
 	key.as_seg_paddr().get_segment_off() :
 	key.as_blk_paddr().get_device_off(),
       cache.get_block_size()));
@@ -180,7 +216,7 @@ BtreeBackrefManager::new_mapping(
                    t, addr, len, key,
                    pos.get_key(), pos.get_val().len,
                    pos.get_val());
-	    ceph_abort("not possible for the backref tree");
+	    ceph_abort_msg("not possible for the backref tree");
 	    return BackrefBtree::iterate_repeat_ret_inner(
 	      interruptible::ready_future_marker{},
 	      seastar::stop_iteration::no);
@@ -192,16 +228,17 @@ BtreeBackrefManager::new_mapping(
 	    state.last_end,
 	    val
 	  ).si_then([&state, c, addr, len, key](auto &&p) {
-	    LOG_PREFIX(BtreeBackrefManager::alloc_extent);
+	    LOG_PREFIX(BtreeBackrefManager::new_mapping);
 	    auto [iter, inserted] = std::move(p);
-	    TRACET("{}~{}, paddr={}, inserted at {}",
-	           c.trans, addr, len, key, state.last_end);
+	    TRACET("{}~{}, paddr={}, inserted at {}, leaf {}",
+	           c.trans, addr, len, key, state.last_end, *iter.get_leaf_node());
 	    ceph_assert(inserted);
 	    state.ret = iter;
 	  });
 	});
-    }).si_then([](auto &&state) {
-      return state.ret->get_pin();
+    }).si_then([c](auto &&state) {
+      return new_mapping_iertr::make_ready_future<BackrefMapping>(
+	BackrefMapping::create(state.ret->get_cursor(c)));
     });
 }
 
@@ -298,97 +335,127 @@ BtreeBackrefManager::scan_mapped_space(
     [this, c, FNAME](auto &scan_visitor)
   {
     auto block_size = cache.get_block_size();
-    BackrefBtree::mapped_space_visitor_t f =
-      [&scan_visitor, block_size, FNAME, c](
-        paddr_t paddr, extent_len_t len,
-        depth_t depth, extent_types_t type) {
-      TRACET("tree node {}~{} {}, depth={} used",
-             c.trans, paddr, len, type, depth);
-      ceph_assert(paddr.is_absolute());
-      ceph_assert(len > 0 && len % block_size == 0);
-      ceph_assert(depth >= 1);
-      ceph_assert(is_backref_node(type));
-      return scan_visitor(paddr, len, type, L_ADDR_NULL);
-    };
-    return seastar::do_with(
-      std::move(f),
-      [this, c, &scan_visitor, block_size, FNAME](auto &tree_visitor)
+    // traverse leaf-node entries
+    return with_btree<BackrefBtree>(
+      cache, c,
+      [c, &scan_visitor, block_size, FNAME](auto &btree)
     {
-      return with_btree<BackrefBtree>(
-        cache, c,
-        [c, &scan_visitor, &tree_visitor, block_size, FNAME](auto &btree)
-      {
-        return BackrefBtree::iterate_repeat(
-          c,
-          btree.lower_bound(
-            c,
-            P_ADDR_MIN,
-            &tree_visitor),
-          [c, &scan_visitor, block_size, FNAME](auto &pos) {
-            if (pos.is_end()) {
-              return BackrefBtree::iterate_repeat_ret_inner(
-                interruptible::ready_future_marker{},
-                seastar::stop_iteration::yes);
-            }
-            TRACET("tree value {}~{} {}~{} {} used",
-                   c.trans,
-                   pos.get_key(),
-                   pos.get_val().len,
-                   pos.get_val().laddr,
-                   pos.get_val().len,
-                   pos.get_val().type);
-            ceph_assert(pos.get_key().is_absolute());
-            ceph_assert(pos.get_val().len > 0 &&
-                        pos.get_val().len % block_size == 0);
-            ceph_assert(!is_backref_node(pos.get_val().type));
-            ceph_assert(pos.get_val().laddr != L_ADDR_NULL);
-            scan_visitor(
-                pos.get_key(),
-                pos.get_val().len,
-                pos.get_val().type,
-                pos.get_val().laddr);
-            return BackrefBtree::iterate_repeat_ret_inner(
-              interruptible::ready_future_marker{},
-              seastar::stop_iteration::no);
-          },
-          &tree_visitor
-        );
-      });
+      return BackrefBtree::iterate_repeat(
+	c,
+	btree.lower_bound(
+	  c,
+	  P_ADDR_MIN),
+	[c, &scan_visitor, block_size, FNAME](auto &pos) {
+	  if (pos.is_end()) {
+	    return BackrefBtree::iterate_repeat_ret_inner(
+	      interruptible::ready_future_marker{},
+	      seastar::stop_iteration::yes);
+	  }
+	  TRACET("tree value {}~{} {}~{} {} used",
+		 c.trans,
+		 pos.get_key(),
+		 pos.get_val().len,
+		 pos.get_val().laddr,
+		 pos.get_val().len,
+		 pos.get_val().type);
+	  ceph_assert(pos.get_key().is_absolute());
+	  ceph_assert(pos.get_val().len > 0 &&
+		      pos.get_val().len % block_size == 0);
+	  ceph_assert(!is_backref_node(pos.get_val().type));
+	  ceph_assert(pos.get_val().laddr != L_ADDR_NULL);
+	  scan_visitor(
+	      pos.get_key(),
+	      P_ADDR_NULL,
+	      pos.get_val().len,
+	      pos.get_val().type,
+	      pos.get_val().laddr);
+	  return BackrefBtree::iterate_repeat_ret_inner(
+	    interruptible::ready_future_marker{},
+	    seastar::stop_iteration::no);
+	}
+      );
     }).si_then([this, &scan_visitor, c, FNAME, block_size] {
-      auto &backref_entry_mset = cache.get_backref_entry_mset();
-      DEBUGT("scan {} backref entries", c.trans, backref_entry_mset.size());
-      for (auto &backref_entry : backref_entry_mset) {
-        if (backref_entry.laddr == L_ADDR_NULL) {
-          TRACET("backref entry {}~{} {} free",
-                 c.trans,
-                 backref_entry.paddr,
-                 backref_entry.len,
-                 backref_entry.type);
-        } else {
-          TRACET("backref entry {}~{} {}~{} {} used",
-                 c.trans,
-                 backref_entry.paddr,
-                 backref_entry.len,
-                 backref_entry.laddr,
-                 backref_entry.len,
-                 backref_entry.type);
-        }
-        ceph_assert(backref_entry.paddr.is_absolute());
-        ceph_assert(backref_entry.len > 0 &&
-                    backref_entry.len % block_size == 0);
-        ceph_assert(!is_backref_node(backref_entry.type));
-        scan_visitor(
-            backref_entry.paddr,
-            backref_entry.len,
-            backref_entry.type,
-            backref_entry.laddr);
+      // traverse alloc-deltas in order
+      auto &backref_entryrefs = cache.get_backref_entryrefs_by_seq();
+      for (auto &[seq, refs] : backref_entryrefs) {
+	boost::ignore_unused(seq);
+	DEBUGT("scan {} backref entries", c.trans, refs.size());
+	for (auto &backref_entry : refs) {
+	  if (backref_entry->laddr == L_ADDR_NULL) {
+	    TRACET("backref entry {}~{} {} free",
+		   c.trans,
+		   backref_entry->paddr,
+		   backref_entry->len,
+		   backref_entry->type);
+	  } else {
+	    TRACET("backref entry {}~{} {}~{} {} used",
+		   c.trans,
+		   backref_entry->paddr,
+		   backref_entry->len,
+		   backref_entry->laddr,
+		   backref_entry->len,
+		   backref_entry->type);
+	  }
+	  ceph_assert(backref_entry->paddr.is_absolute());
+	  ceph_assert(backref_entry->len > 0 &&
+		      backref_entry->len % block_size == 0);
+	  ceph_assert(!is_backref_node(backref_entry->type));
+	  scan_visitor(
+	    backref_entry->paddr,
+	    P_ADDR_NULL,
+	    backref_entry->len,
+	    backref_entry->type,
+	    backref_entry->laddr);
+	}
       }
+    }).si_then([this, &scan_visitor, block_size, c, FNAME] {
+      BackrefBtree::mapped_space_visitor_t f =
+	[&scan_visitor, block_size, FNAME, c](
+	  paddr_t paddr, paddr_t key, extent_len_t len,
+	  depth_t depth, extent_types_t type, BackrefBtree::iterator&) {
+	TRACET("tree node {}~{} {}, depth={} used",
+	       c.trans, paddr, len, type, depth);
+	ceph_assert(paddr.is_absolute());
+	ceph_assert(len > 0 && len % block_size == 0);
+	ceph_assert(depth >= 1);
+	ceph_assert(is_backref_node(type));
+	return scan_visitor(paddr, key, len, type, L_ADDR_NULL);
+      };
+      return seastar::do_with(
+	std::move(f),
+	[this, c](auto &tree_visitor)
+      {
+	// traverse internal-node entries
+	return with_btree<BackrefBtree>(
+	  cache, c,
+	  [c, &tree_visitor](auto &btree)
+	{
+	  return BackrefBtree::iterate_repeat(
+	    c,
+	    btree.lower_bound(
+	      c,
+	      P_ADDR_MIN,
+	      &tree_visitor),
+	    [](auto &pos) {
+	      if (pos.is_end()) {
+		return BackrefBtree::iterate_repeat_ret_inner(
+		  interruptible::ready_future_marker{},
+		  seastar::stop_iteration::yes);
+	      }
+	      return BackrefBtree::iterate_repeat_ret_inner(
+		interruptible::ready_future_marker{},
+		seastar::stop_iteration::no);
+	    },
+	    &tree_visitor
+	  );
+	});
+      });
     });
   });
 }
 
-BtreeBackrefManager::base_iertr::future<> _init_cached_extent(
-  op_context_t<paddr_t> c,
+base_iertr::future<> _init_cached_extent(
+  op_context_t c,
   const CachedExtentRef &e,
   BackrefBtree &btree,
   bool &ret)
@@ -436,7 +503,7 @@ BtreeBackrefManager::remove_mapping(
   paddr_t addr)
 {
   auto c = get_context(t);
-  return with_btree_ret<BackrefBtree, remove_mapping_result_t>(
+  return with_btree<BackrefBtree>(
     cache,
     c,
     [c, addr](auto &btree) mutable {
@@ -446,7 +513,8 @@ BtreeBackrefManager::remove_mapping(
 		-> remove_mapping_ret {
 	if (iter.is_end() || iter.get_key() != addr) {
 	  LOG_PREFIX(BtreeBackrefManager::remove_mapping);
-	  DEBUGT("paddr={} doesn't exist", c.trans, addr);
+	  WARNT("paddr={} doesn't exist, state: {}, leaf {}",
+	    c.trans, addr, iter.get_key(), *iter.get_leaf_node());
 	  return remove_mapping_iertr::make_ready_future<
 	    remove_mapping_result_t>(remove_mapping_result_t());
 	}
@@ -458,45 +526,11 @@ BtreeBackrefManager::remove_mapping(
 	return btree.remove(
 	  c,
 	  iter
-	).si_then([ret] {
+	).si_then([ret](auto) {
 	  return ret;
 	});
       });
     });
-}
-
-void BtreeBackrefManager::complete_transaction(
-  Transaction &t,
-  std::vector<CachedExtentRef> &to_clear,
-  std::vector<CachedExtentRef> &to_link)
-{
-  LOG_PREFIX(BtreeBackrefManager::complete_transaction);
-  DEBUGT("start", t);
-  // need to call check_parent from leaf->parent
-  std::sort(
-    to_clear.begin(), to_clear.end(),
-    [](auto &l, auto &r) { return get_depth(*l) < get_depth(*r); });
-
-  for (auto &e: to_clear) {
-    auto &pin = e->cast<BackrefNode>()->pin;
-    DEBUGT("retiring extent {} -- {}", t, pin, *e);
-    pin_set.retire(pin);
-  }
-
-  std::sort(
-    to_link.begin(), to_link.end(),
-    [](auto &l, auto &r) -> bool { return get_depth(*l) > get_depth(*r); });
-
-  for (auto &e : to_link) {
-    DEBUGT("linking extent -- {}", t, *e);
-    pin_set.add_pin(e->cast<BackrefNode>()->pin);
-  }
-
-  for (auto &e: to_clear) {
-    auto &pin = e->cast<BackrefNode>()->pin;
-    TRACET("checking extent {} -- {}", t, pin, *e);
-    pin_set.check_parent(pin);
-  }
 }
 
 Cache::backref_entry_query_mset_t
@@ -509,9 +543,10 @@ BtreeBackrefManager::get_cached_backref_entries_in_range(
 
 void BtreeBackrefManager::cache_new_backref_extent(
   paddr_t paddr,
+  paddr_t key,
   extent_types_t type)
 {
-  return cache.add_backref_extent(paddr, type);
+  return cache.add_backref_extent(paddr, key, type);
 }
 
 BtreeBackrefManager::retrieve_backref_extents_in_range_ret
@@ -520,10 +555,11 @@ BtreeBackrefManager::retrieve_backref_extents_in_range(
   paddr_t start,
   paddr_t end)
 {
+  auto backref_extents = cache.get_backref_extents_in_range(start, end);
   return seastar::do_with(
       std::vector<CachedExtentRef>(),
-      [this, &t, start, end](auto &extents) {
-    auto backref_extents = cache.get_backref_extents_in_range(start, end);
+      std::move(backref_extents),
+      [this, &t](auto &extents, auto &backref_extents) {
     return trans_intr::parallel_for_each(
       backref_extents,
       [this, &extents, &t](auto &ent) {
@@ -531,14 +567,28 @@ BtreeBackrefManager::retrieve_backref_extents_in_range(
       // so it must be alive
       assert(is_backref_node(ent.type));
       LOG_PREFIX(BtreeBackrefManager::retrieve_backref_extents_in_range);
-      DEBUGT("getting backref extent of type {} at {}",
-        t,
-        ent.type,
-        ent.paddr);
-      return cache.get_extent_by_type(
-        t, ent.type, ent.paddr, L_ADDR_NULL, BACKREF_NODE_SIZE
-      ).si_then([&extents](auto ext) {
-        extents.emplace_back(std::move(ext));
+      DEBUGT("getting backref extent of type {} at {}, key {}",
+	t,
+	ent.type,
+	ent.paddr,
+	ent.key);
+
+      auto c = get_context(t);
+      return with_btree<BackrefBtree>(
+	cache,
+	c,
+	[c, &ent](auto &btree) {
+	if (ent.type == extent_types_t::BACKREF_INTERNAL) {
+	  return btree.get_internal_if_live(
+	    c, ent.paddr, ent.key, BACKREF_NODE_SIZE);
+	} else {
+	  assert(ent.type == extent_types_t::BACKREF_LEAF);
+	  return btree.get_leaf_if_live(
+	    c, ent.paddr, ent.key, BACKREF_NODE_SIZE);
+	}
+      }).si_then([&extents](auto ext) {
+	ceph_assert(ext);
+	extents.emplace_back(std::move(ext));
       });
     }).si_then([&extents] {
       return std::move(extents);

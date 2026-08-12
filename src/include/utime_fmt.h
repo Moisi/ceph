@@ -23,7 +23,7 @@ struct fmt::formatter<utime_t> {
   }
 
   template <typename FormatContext>
-  auto format(const utime_t& utime, FormatContext& ctx)
+  auto format(const utime_t& utime, FormatContext& ctx) const
   {
     if (utime.sec() < ((time_t)(60 * 60 * 24 * 365 * 10))) {
       // raw seconds.  this looks like a relative time.
@@ -34,7 +34,11 @@ struct fmt::formatter<utime_t> {
     // this looks like an absolute time.
     // conform to http://en.wikipedia.org/wiki/ISO_8601
     // (unless short_format is set)
-    auto aslocal = fmt::localtime(utime.sec());
+    std::time_t time = utime.sec();
+    std::tm aslocal;
+    if (!localtime_r(&time, &aslocal)) {
+      throw fmt::format_error("time_t value out of range");
+    }
     if (short_format) {
       return fmt::format_to(ctx.out(), "{:%FT%T}.{:03}", aslocal,
 			    utime.usec() / 1000);

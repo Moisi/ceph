@@ -1,10 +1,14 @@
 import json
+import re
 import logging
-from typing import TYPE_CHECKING, Iterator, Optional, Dict, Any
+from typing import TYPE_CHECKING, Iterator, Optional, Dict, Any, List
 
-from ceph.deployment.service_spec import PlacementSpec, ServiceSpec, HostPlacementSpec
+from ceph.deployment.service_spec import PlacementSpec, ServiceSpec, HostPlacementSpec, RGWSpec, CertificateSource
 from cephadm.schedule import HostAssignment
+from cephadm.utils import SpecialHostLabels
 import rados
+from mgr_util import parse_combined_pem_file, get_cert_issuer_info
+from cephadm.tlsobject_types import CertKeyPair
 
 from mgr_module import NFS_POOL_NAME
 from orchestrator import OrchestratorError, DaemonDescription
@@ -12,7 +16,7 @@ from orchestrator import OrchestratorError, DaemonDescription
 if TYPE_CHECKING:
     from .module import CephadmOrchestrator
 
-LAST_MIGRATION = 5
+LAST_MIGRATION = 9
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +39,12 @@ class Migrations:
 
         v = mgr.get_store('nfs_migration_queue')
         self.nfs_migration_queue = json.loads(v) if v else []
+
+        r = mgr.get_store('rgw_migration_queue')
+        self.rgw_migration_queue = json.loads(r) if r else []
+
+        r = mgr.get_store('rgw_ssl_migration_queue')
+        self.rgw_ssl_migration_queue = json.loads(r) if r else []
 
         # for some migrations, we don't need to do anything except for
         # incrementing migration_current.
@@ -76,6 +86,8 @@ class Migrations:
                 "cephadm migration still ongoing. Please wait, until the migration is complete.")
 
     def migrate(self, startup: bool = False) -> None:
+        logger.info('running migrations')
+
         if self.mgr.migration_current == 0:
             if self.migrate_0_1():
                 self.set(1)
@@ -95,6 +107,22 @@ class Migrations:
         if self.mgr.migration_current == 4:
             if self.migrate_4_5():
                 self.set(5)
+
+        if self.mgr.migration_current == 5:
+            if self.migrate_5_6():
+                self.set(6)
+
+        if self.mgr.migration_current == 6:
+            if self.migrate_6_7():
+                self.set(7)
+
+        if self.mgr.migration_current == 7:
+            if self.migrate_7_8():
+                self.set(8)
+
+        if self.mgr.migration_current == 8:
+            if self.migrate_8_9():
+                self.set(9)
 
     def migrate_0_1(self) -> bool:
         """
@@ -300,7 +328,7 @@ class Migrations:
         if 'client.admin' not in self.mgr.keys.keys:
             self.mgr._client_keyring_set(
                 entity='client.admin',
-                placement='label:_admin',
+                placement=f'label:{SpecialHostLabels.ADMIN}',
             )
         return True
 
@@ -335,6 +363,231 @@ class Migrations:
 
             self.mgr.log.info('Done migrating registry login info')
         return True
+
+    def migrate_rgw_spec(self, spec: Dict[Any, Any]) -> Optional[RGWSpec]:
+        """ Migrate an old rgw spec to the new format."""
+        new_spec = spec.copy()
+        field_content: List[str] = re.split(' +', new_spec['spec']['rgw_frontend_type'])
+        valid_spec = False
+        if 'beast' in field_content:
+            new_spec['spec']['rgw_frontend_type'] = 'beast'
+            field_content.remove('beast')
+            valid_spec = True
+        elif 'civetweb' in field_content:
+            new_spec['spec']['rgw_frontend_type'] = 'civetweb'
+            field_content.remove('civetweb')
+            valid_spec = True
+        else:
+            # Error: Should not happen as that would be an invalid RGW spec. In that case
+            # we keep the spec as it, mark it as unmanaged to avoid the daemons being deleted
+            # and raise a health warning so the user can fix the issue manually later.
+            self.mgr.log.error("Cannot migrate RGW spec, bad rgw_frontend_type value: {spec['spec']['rgw_frontend_type']}.")
+
+        if valid_spec:
+            new_spec['spec']['rgw_frontend_extra_args'] = []
+            new_spec['spec']['rgw_frontend_extra_args'].extend(field_content)
+
+        return RGWSpec.from_json(new_spec)
+
+    def rgw_spec_needs_migration(self, spec: Dict[Any, Any]) -> bool:
+        if 'spec' not in spec:
+            # if users allowed cephadm to set up most of the
+            # attributes, it's possible there is no "spec" section
+            # inside the spec. In that case, no migration is needed
+            return False
+        return 'rgw_frontend_type' in spec['spec'] \
+            and spec['spec']['rgw_frontend_type'] is not None \
+            and spec['spec']['rgw_frontend_type'].strip() not in ['beast', 'civetweb']
+
+    def migrate_5_6(self) -> bool:
+        """
+        Migration 5 -> 6
+
+        Old RGW spec used to allow 'bad' values on the rgw_frontend_type field. For example
+        the following value used to be valid:
+
+          rgw_frontend_type: "beast endpoint=10.16.96.54:8043 tcp_nodelay=1"
+
+        As of 17.2.6 release, these kind of entries are not valid anymore and a more strict check
+        has been added to validate this field.
+
+        This migration logic detects this 'bad' values and tries to transform them to the new
+        valid format where rgw_frontend_type field can only be either 'beast' or 'civetweb'.
+        Any extra arguments detected on rgw_frontend_type field will be parsed and passed in the
+        new spec field rgw_frontend_extra_args.
+        """
+        logger.info(f'Starting rgw migration (queue length is {len(self.rgw_migration_queue)})')
+        for s in self.rgw_migration_queue:
+            spec = s['spec']
+            if self.rgw_spec_needs_migration(spec):
+                rgw_spec = self.migrate_rgw_spec(spec)
+                if rgw_spec is not None:
+                    logger.info(f"Migrating {spec} to new RGW with extra args format {rgw_spec}")
+                    self.mgr.spec_store.save(rgw_spec)
+            else:
+                logger.info(f"No Migration is needed for rgw spec: {spec}")
+
+        self.rgw_migration_queue = []
+        return True
+
+    def migrate_6_7(self) -> bool:
+        # start by placing certs/keys from rgw, iscsi, and ingress specs into cert store
+        for spec in self.mgr.spec_store.all_specs.values():
+            if spec.service_type in ['rgw', 'ingress', 'iscsi']:
+                logger.info(f'Migrating certs/keys for {spec.service_name()} spec to cert store')
+                self.mgr.spec_store._save_certs_and_keys(spec)
+
+        # Grafana certs are stored based on the host they are placed on
+        grafana_cephadm_signed_certs = True
+        for grafana_daemon in self.mgr.cache.get_daemons_by_type('grafana'):
+            logger.info(f'Checking for cert/key for {grafana_daemon.name()}')
+            hostname = grafana_daemon.hostname
+            assert hostname is not None  # for mypy
+            grafana_cert_path = f'{hostname}/grafana_crt'
+            grafana_key_path = f'{hostname}/grafana_key'
+            grafana_cert = self.mgr.get_store(grafana_cert_path)
+            grafana_key = self.mgr.get_store(grafana_key_path)
+            if grafana_cert:
+                (org, cn) = get_cert_issuer_info(grafana_cert)
+                if org == 'Ceph':
+                    logger.info(f'Migrating {grafana_daemon.name()}/{hostname} cert/key to cert store (as cephadm-signed certs)')
+                    self.mgr.cert_mgr.register_self_signed_cert_key_pair('grafana')
+                    self.mgr.cert_mgr.save_self_signed_cert_key_pair('grafana', CertKeyPair(grafana_cert, grafana_key), host=hostname)
+                else:
+                    logger.info(f'Migrating {grafana_daemon.name()}/{hostname} cert/key to cert store (as custom-certs)')
+                    grafana_cephadm_signed_certs = False
+                    self.mgr.cert_mgr.save_cert('grafana_ssl_cert', grafana_cert, host=hostname)
+                    self.mgr.cert_mgr.save_key('grafana_ssl_key', grafana_key, host=hostname)
+
+        if not grafana_cephadm_signed_certs:
+            # Update the spec to specify the right certificate source
+            grafana_spec = self.mgr.spec_store['grafana'].spec
+            grafana_spec.certificate_source = CertificateSource.REFERENCE.value
+            self.mgr.spec_store.save(grafana_spec)
+
+        # NOTE: prometheus, alertmanager, and node-exporter certs were not stored
+        # and appeared to just be generated at daemon deploy time if secure_monitoring_stack
+        # was set to true. Therefore we have nothing to migrate for those daemons
+        return True
+
+    def migrate_7_8(self) -> bool:
+        logger.info(f'Starting rgw SSL/TLS migration (queue length is {len(self.rgw_ssl_migration_queue)})')
+        for s in self.rgw_ssl_migration_queue:
+
+            svc_spec = s['spec']  # this is the RGWspec
+
+            if 'spec' not in svc_spec:
+                logger.info(f"No SSL/TLS fields migration is needed for rgw spec: {svc_spec}")
+                continue
+
+            cert_field = svc_spec['spec'].get('rgw_frontend_ssl_certificate')
+            if not cert_field:
+                logger.info(f"No SSL/TLS fields migration is needed for rgw spec: {svc_spec}")
+                continue
+
+            cert_str = '\n'.join(cert_field) if isinstance(cert_field, list) else cert_field
+            ssl_cert, ssl_key = parse_combined_pem_file(cert_str)
+            new_spec = svc_spec.copy()
+            new_spec['spec'].update({
+                'rgw_frontend_ssl_certificate': None,
+                'certificate_source': CertificateSource.INLINE.value,
+                'ssl_cert': ssl_cert,
+                'ssl_key': ssl_key,
+            })
+
+            logger.info(f"Migrating {svc_spec} to new RGW SSL/TLS format {new_spec}")
+            self.mgr.spec_store.save(RGWSpec.from_json(new_spec))
+
+        self.rgw_ssl_migration_queue = []
+        return True
+
+    def migrate_8_9(self) -> bool:
+        """
+        Replace Promtail with Alloy.
+
+        - If mgr daemons are still being upgraded, return True WITHOUT bumping migration_current.
+        - Mark Promtail service unmanaged so cephadm won't redeploy it.
+        - Remove Promtail daemons to free ports.
+        - Deploy Alloy with Promtail's placement.
+        - Once Alloy is confirmed deployed, remove Promtail service spec.
+        """
+        try:
+            target_digests = getattr(self.mgr.upgrade.upgrade_state, "target_digests", [])
+            active_mgr_digests = self.mgr.get_active_mgr_digests()
+
+            if target_digests:
+                if not any(d in target_digests for d in active_mgr_digests):
+                    logger.info(
+                        "Promtail -> Alloy migration: mgr daemons still upgrading. "
+                        "Marking as complete without bumping migration_current."
+                    )
+                    return False
+
+            promtail_spec = self.mgr.spec_store.active_specs.get("promtail")
+            if not promtail_spec:
+                logger.info("Promtail -> Alloy migration: no Promtail \
+                    service found, nothing to do.")
+                return True
+
+            if not promtail_spec.unmanaged:
+                logger.info("Promtail -> Alloy migration: marking promtail unmanaged")
+                self.mgr.spec_store.set_unmanaged("promtail", True)
+
+            daemons = self.mgr.cache.get_daemons()
+            promtail_daemons = [d for d in daemons if d.daemon_type == "promtail"]
+            if promtail_daemons:
+                promtail_names = [d.name() for d in promtail_daemons]
+                logger.info(f"Promtail -> Alloy migration: removing daemons {promtail_names}")
+                self.mgr.remove_daemons(promtail_names)
+
+            daemons = self.mgr.cache.get_daemons()
+            if any(d.daemon_type == "promtail" for d in daemons):
+                logger.info(
+                    "Promtail -> Alloy migration: promtail daemons still present, "
+                    "skipping Alloy deployment until next run."
+                )
+                return False
+
+            alloy_spec = ServiceSpec(
+                service_type="alloy",
+                service_id="alloy",
+                placement=promtail_spec.placement
+            )
+
+            logger.info("Promtail -> Alloy migration: deploying Alloy service")
+            self.mgr.apply_alloy(alloy_spec)
+
+            logger.info("Promtail -> Alloy migration: removing promtail service spec")
+            self.mgr.remove_service("promtail")
+
+            logger.info("Promtail -> Alloy migration completed successfully.")
+            return True
+
+        except Exception as e:
+            logger.error(f"Promtail -> Alloy migration failed: {e}")
+            return False
+
+
+def queue_migrate_rgw_spec(mgr: "CephadmOrchestrator", spec_dict: Dict[Any, Any]) -> None:
+    """
+    As aprt of 17.2.6 a stricter RGW spec validation has been added so the field
+    rgw_frontend_type cannot be used to pass rgw-frontends parameters.
+    """
+    service_id = spec_dict['spec']['service_id']
+    queued = mgr.get_store('rgw_migration_queue') or '[]'
+    ls = json.loads(queued)
+    ls.append(spec_dict)
+    mgr.set_store('rgw_migration_queue', json.dumps(ls))
+    logger.info(f'Queued rgw.{service_id} for migration')
+
+
+def queue_migrate_rgw_ssl_spec(mgr: "CephadmOrchestrator", spec_dict: Dict[Any, Any]) -> None:
+    service_id = spec_dict['spec']['service_id']
+    queued = mgr.get_store('rgw_ssl_migration_queue') or '[]'
+    ls = json.loads(queued)
+    ls.append(spec_dict)
+    mgr.set_store('rgw_ssl_migration_queue', json.dumps(ls))
+    logger.info(f'Queued rgw.{service_id} for TLS migration')
 
 
 def queue_migrate_nfs_spec(mgr: "CephadmOrchestrator", spec_dict: Dict[Any, Any]) -> None:

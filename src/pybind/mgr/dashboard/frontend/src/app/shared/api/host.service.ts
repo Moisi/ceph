@@ -13,6 +13,7 @@ import { Daemon } from '../models/daemon.interface';
 import { CdDevice } from '../models/devices';
 import { SmartDataResponseV1 } from '../models/smart';
 import { DeviceService } from '../services/device.service';
+import { Host } from '../models/host.interface';
 
 @Injectable({
   providedIn: 'root'
@@ -27,11 +28,23 @@ export class HostService extends ApiClient {
     super();
   }
 
-  list(facts: string): Observable<object[]> {
-    return this.http.get<object[]>(this.baseURL, {
-      headers: { Accept: 'application/vnd.ceph.api.v1.1+json' },
-      params: { facts: facts }
-    });
+  list(params: any, facts: string): Observable<object[]> {
+    params = params.set('facts', facts);
+    params = params.set('include_service_instances', false);
+    return this.http
+      .get<object[]>(this.baseURL, {
+        headers: { Accept: this.getVersionHeaderValue(1, 2) },
+        params: params,
+        observe: 'response'
+      })
+      .pipe(
+        map((response: any) => {
+          return response['body'].map((host: any) => {
+            host['headers'] = response.headers;
+            return host;
+          });
+        })
+      );
   }
 
   create(hostname: string, addr: string, labels: string[], status: string) {
@@ -150,5 +163,9 @@ export class HostService extends ApiClient {
         return observableOf(devices);
       })
     );
+  }
+
+  getAllHosts(): Observable<Host[]> {
+    return this.http.get<Host[]>(`${this.baseUIURL}/list`);
   }
 }

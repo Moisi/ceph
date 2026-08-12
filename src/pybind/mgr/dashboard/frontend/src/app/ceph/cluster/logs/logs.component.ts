@@ -1,5 +1,5 @@
 import { DatePipe } from '@angular/common';
-import { Component, NgZone, OnDestroy, OnInit } from '@angular/core';
+import { Component, Input, NgZone, OnDestroy, OnInit } from '@angular/core';
 
 import { NgbDateStruct } from '@ng-bootstrap/ng-bootstrap';
 import { Observable } from 'rxjs';
@@ -15,6 +15,23 @@ import { Icons } from '~/app/shared/enum/icons.enum';
   styleUrls: ['./logs.component.scss']
 })
 export class LogsComponent implements OnInit, OnDestroy {
+  @Input()
+  showClusterLogs = true;
+  @Input()
+  showAuditLogs = true;
+  @Input()
+  showDaemonLogs = true;
+  @Input()
+  showNavLinks = true;
+  @Input()
+  showFilterTools = true;
+  @Input()
+  showDownloadCopyButton = true;
+  @Input()
+  defaultTab = '';
+  @Input()
+  scrollable = false;
+
   contentData: any;
   clog: Array<any>;
   audit_log: Array<any>;
@@ -22,7 +39,7 @@ export class LogsComponent implements OnInit, OnDestroy {
   clogText: string;
   auditLogText: string;
   lokiServiceStatus$: Observable<boolean>;
-  promtailServiceStatus$: Observable<boolean>;
+  alloyServiceStatus$: Observable<boolean>;
 
   interval: number;
   priorities: Array<{ name: string; value: string }> = [
@@ -72,7 +89,7 @@ export class LogsComponent implements OnInit, OnDestroy {
         return data.length > 0 && data[0].status === 1;
       })
     );
-    this.promtailServiceStatus$ = this.cephService.getDaemons('promtail').pipe(
+    this.alloyServiceStatus$ = this.cephService.getDaemons('alloy').pipe(
       map((data: any) => {
         return data.length > 0 && data[0].status === 1;
       })

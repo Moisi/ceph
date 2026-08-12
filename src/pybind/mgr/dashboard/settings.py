@@ -67,6 +67,7 @@ class Options(object):
     RGW_API_SECRET_KEY = Setting('', [dict, str])
     RGW_API_ADMIN_RESOURCE = Setting('admin', [str])
     RGW_API_SSL_VERIFY = Setting(True, [bool])
+    RGW_HOSTNAME_PER_DAEMON = Setting('', [dict, str])
 
     # Ceph Issue Tracker API Access Key
     ISSUE_TRACKER_API_KEY = Setting('', [str])
@@ -118,6 +119,10 @@ class Options(object):
                                                   'block', 'nfs', 'ceph', 'monitors',
                                                   'gateway', 'logs', 'crush', 'maps']),
                                         [str])
+
+    MULTICLUSTER_CONFIG = Setting({}, [dict, str])
+    MANAGED_BY_CLUSTERS = Setting([], [dict, list])
+    UNSAFE_TLS_v1_2 = Setting(False, [bool])
 
     @staticmethod
     def has_default_value(name):

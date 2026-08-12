@@ -380,7 +380,15 @@ class TestStrays(CephFSTestCase):
         in reintegration of inode into the previously-remote dentry,
         rather than lingering as a stray indefinitely.
         """
+
+        # stray perf count numbers in the test don't match when referent inode feature
+        # is enabled because referent inodes becomes a stray whenever hardlink is
+        # deleted or stray is reintegrated, so disable referent inodes here. The
+        # same test for referent inodes is added at qa/tasks/cephfs/test_referent.py
+        self.fs.set_allow_referent_inodes(False)
+
         # Write some bytes to file_a
+
         size_mb = 8
         self.mount_a.run_shell(["mkdir", "dir_1"])
         self.mount_a.write_n_mb("dir_1/file_a", size_mb)
@@ -542,6 +550,13 @@ class TestStrays(CephFSTestCase):
         then we make a stray for B which is then reintegrated
         into one of his hardlinks.
         """
+
+        # stray perf count numbers in the test don't match when referent inode feature
+        # is enabled because referent inodes becomes a stray whenever hardlink is
+        # deleted or stray is reintegrated, so disable referent inodes here. The
+        # same test for referent inodes is added at qa/tasks/cephfs/test_referent.py
+        self.fs.set_allow_referent_inodes(False)
+
         # Create file_a, file_b, and a hardlink to file_b
         size_mb = 8
         self.mount_a.write_n_mb("file_a", size_mb)
@@ -651,9 +666,8 @@ class TestStrays(CephFSTestCase):
         self.assertFalse(self._is_stopped(1))
 
         # Permit the daemon to start purging again
-        self.fs.mon_manager.raw_cluster_cmd('tell', 'mds.{0}'.format(rank_1_id),
-                                            'injectargs',
-                                            "--mds_max_purge_files 100")
+        self.run_ceph_cmd('tell', 'mds.{0}'.format(rank_1_id),
+                          'injectargs', "--mds_max_purge_files 100")
 
         # It should now proceed through shutdown
         self.fs.wait_for_daemons(timeout=120)
@@ -682,8 +696,8 @@ ln dir_1/original dir_2/linkto
 
         # empty mds cache. otherwise mds reintegrates stray when unlink finishes
         self.mount_a.umount_wait()
-        self.fs.mds_asok(['flush', 'journal'], rank_1_id)
-        self.fs.mds_asok(['cache', 'drop'], rank_1_id)
+        self.fs.mds_asok(['flush', 'journal'], mds_id=rank_1_id)
+        self.fs.mds_asok(['cache', 'drop'], mds_id=rank_1_id)
 
         self.mount_a.mount_wait()
         self.mount_a.run_shell(["rm", "-f", "dir_1/original"])
@@ -713,7 +727,7 @@ touch pin/placeholder
         self._force_migrate("pin")
 
         # Hold the dir open so it cannot be purged
-        p = self.mount_a.open_dir_background("pin/to-be-unlinked")
+        self.mount_a.open_dir_background("pin/to-be-unlinked")
 
         # Unlink the dentry
         self.mount_a.run_shell(["rmdir", "pin/to-be-unlinked"])
@@ -727,8 +741,8 @@ touch pin/placeholder
         self.assertEqual(self.get_mdc_stat("strays_enqueued", mds_id=rank_1_id), 0)
 
         # Test loading unlinked dir into cache
-        self.fs.mds_asok(['flush', 'journal'], rank_1_id)
-        self.fs.mds_asok(['cache', 'drop'], rank_1_id)
+        self.fs.mds_asok(['flush', 'journal'], mds_id=rank_1_id)
+        self.fs.mds_asok(['cache', 'drop'], mds_id=rank_1_id)
 
         # Shut down rank 1
         self.fs.set_max_mds(1)
@@ -736,8 +750,6 @@ touch pin/placeholder
         # Now the stray should be migrated to rank 0
         # self.assertEqual(self.get_mdc_stat("strays_created", mds_id=rank_0_id), 1)
         # https://github.com/ceph/ceph/pull/44335#issuecomment-1125940158
-
-        self.mount_a.kill_background(p)
 
     def assert_backtrace(self, ino, expected_path):
         """
@@ -816,7 +828,7 @@ touch pin/placeholder
 
         :param pool_name: Which pool (must exist)
         """
-        out = self.fs.mon_manager.raw_cluster_cmd("df", "--format=json-pretty")
+        out = self.get_ceph_cmd_stdout("df", "--format=json-pretty")
         for p in json.loads(out)['pools']:
             if p['name'] == pool_name:
                 return p['stats']
@@ -1025,3 +1037,32 @@ touch pin/placeholder
 
         duration = (end - begin).total_seconds()
         self.assertLess(duration, (file_count * tick_period) * 0.25)
+    
+    def test_asok_dump_stray_command(self):
+        """
+        Test MDS asok dump stray command
+        """
+
+        LOW_LIMIT = 50
+        # need to create more folder to force fragmentation, creating more then needed
+        # to be on the safe side.
+        # we want to test the case when dumping stray folder must wait for the next dirfrag to be fetched
+        NUM_DIRS = LOW_LIMIT * 20
+        TOP_DIR = "topdir"
+        self.config_set("mds", "mds_bal_split_size", str(LOW_LIMIT))
+        self.assertEqual(self.config_get("mds", "mds_bal_split_size"), str(LOW_LIMIT), "LOW_LIMIT was not set on mds!")
+              
+        # create 2 level tree with enough folders to force the stray folder be fragmented
+        # total of NUM_DIRS subdirs will be created
+        self.mount_a.run_shell(f"mkdir -p {TOP_DIR}/subdir{{1..{NUM_DIRS}}}")  
+        # create snapshot
+        self.mount_a.run_shell(f"mkdir {TOP_DIR}/.snap/snap1")
+
+        # delete 2nd level dirs to generate strays
+        # don't wait, we want to dump stray dir while delete runs, to make it more interesting
+        self.mount_a.run_shell(f"rm -rf {TOP_DIR}/*", wait=False)
+
+        # wait for all deleted folders to become strays
+        self.wait_until_equal(
+        lambda: len(self.fs.rank_tell(["dump", "stray"])),
+        expect_val=NUM_DIRS, timeout=60, period=1)

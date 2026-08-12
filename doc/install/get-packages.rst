@@ -25,17 +25,17 @@ There are three ways to get packages:
 Install packages with cephadm
 =============================
 
-#. Download the cephadm script
+#. Download cephadm
 
 .. prompt:: bash $
    :substitutions:
 
-   curl --silent --remote-name --location https://github.com/ceph/ceph/raw/|stable-release|/src/cephadm/cephadm
+   curl --silent --remote-name --location https://download.ceph.com/rpm-|stable-release|/el9/noarch/cephadm
    chmod +x cephadm
 
 #. Configure the Ceph repository based on the release name::
 
-     ./cephadm add-repo --release nautilus
+     ./cephadm add-repo --release |stable-release|
 
    For Octopus (15.2.0) and later releases, you can also specify a specific
    version::
@@ -47,8 +47,8 @@ Install packages with cephadm
      ./cephadm add-repo --dev my-branch
 
 #. Install the appropriate packages.  You can install them using your
-   package management tool (e.g., APT, Yum) directly, or you can also
-   use the cephadm wrapper.  For example::
+   package management tool (e.g., APT, Yum) directly, or you can
+   use the cephadm wrapper command.  For example::
 
      ./cephadm install ceph-common
    
@@ -86,7 +86,7 @@ APT
 
 To install the ``release.asc`` key, execute the following::
 
-	wget -q -O- 'https://download.ceph.com/keys/release.asc' | sudo apt-key add -
+	wget -q -O- 'https://download.ceph.com/keys/release.asc' | sudo tee /etc/apt/trusted.gpg.d/ceph.asc
 
 
 RPM
@@ -120,7 +120,7 @@ For RPMs::
 
   https://download.ceph.com/rpm-{version}
 
-The major releases of Ceph are summarized at: `Releases`_
+The major releases of Ceph are summarized at: :ref:`Releases <ceph-releases-index>`
 
 .. tip:: For non-US users: There might be a mirror close to you where
          to download Ceph from. For more information see: `Ceph Mirrors`_.
@@ -251,6 +251,17 @@ openSUSE Tumbleweed
 The newest major release of Ceph is already available through the normal Tumbleweed repositories.
 There's no need to add another package repository manually.
 
+openEuler
+^^^^^^^^^
+
+There are two Ceph releases supported in normal openEuler repositories. They are Ceph 12.2.8 in the openEuler-20.03-LTS series and Ceph 16.2.7 in the openEuler-22.03-LTS series. There’s no need to add another package repository manually.
+You can install Ceph by executing the following:
+
+.. prompt:: bash $
+
+    sudo yum -y install ceph
+
+Also you can download packages manually from https://repo.openeuler.org/openEuler-{release}/everything/{arch}/Packages/.
 
 Ceph Development Packages
 -------------------------
@@ -376,7 +387,6 @@ line to get the short codename.
 
 
 
-.. _Releases: https://docs.ceph.com/en/latest/releases/
 .. _the testing Debian repository: https://download.ceph.com/debian-testing/dists
 .. _the shaman page: https://shaman.ceph.com
 .. _Ceph Mirrors: ../mirrors

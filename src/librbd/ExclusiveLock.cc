@@ -14,7 +14,9 @@
 #include "librbd/Utils.h"
 #include "librbd/asio/ContextWQ.h"
 #include "common/ceph_mutex.h"
+#include "common/Clock.h" // for ceph_clock_now()
 #include "common/dout.h"
+#include "common/perf_counters.h"
 
 #define dout_subsys ceph_subsys_rbd
 #undef dout_prefix
@@ -95,7 +97,7 @@ void ExclusiveLock<I>::block_requests(int r) {
     m_request_blocked_ret_val = r;
   }
 
-  ldout(m_image_ctx.cct, 20) << "r=" << r << dendl;
+  ldout(m_image_ctx.cct, 20) << ": r=" << r << dendl;
 }
 
 template <typename I>

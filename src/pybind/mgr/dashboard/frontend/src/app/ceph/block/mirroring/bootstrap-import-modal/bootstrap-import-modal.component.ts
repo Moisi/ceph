@@ -1,7 +1,7 @@
-import { Component, OnDestroy, OnInit } from '@angular/core';
-import { FormControl, FormGroup, ValidatorFn, Validators } from '@angular/forms';
+import { Component, Inject, OnDestroy, OnInit, Optional } from '@angular/core';
+import { UntypedFormControl, UntypedFormGroup, ValidatorFn, Validators } from '@angular/forms';
 
-import { NgbActiveModal } from '@ng-bootstrap/ng-bootstrap';
+import { BaseModal } from 'carbon-components-angular';
 import _ from 'lodash';
 import { concat, forkJoin, Observable, Subscription } from 'rxjs';
 import { last } from 'rxjs/operators';
@@ -18,8 +18,7 @@ import { TaskWrapperService } from '~/app/shared/services/task-wrapper.service';
   templateUrl: './bootstrap-import-modal.component.html',
   styleUrls: ['./bootstrap-import-modal.component.scss']
 })
-export class BootstrapImportModalComponent implements OnInit, OnDestroy {
-  siteName: string;
+export class BootstrapImportModalComponent extends BaseModal implements OnInit, OnDestroy {
   pools: any[] = [];
   token: string;
 
@@ -33,27 +32,29 @@ export class BootstrapImportModalComponent implements OnInit, OnDestroy {
   ];
 
   constructor(
-    public activeModal: NgbActiveModal,
     public actionLabels: ActionLabelsI18n,
     private rbdMirroringService: RbdMirroringService,
-    private taskWrapper: TaskWrapperService
+    private taskWrapper: TaskWrapperService,
+
+    @Inject('siteName') @Optional() public siteName: string
   ) {
+    super();
     this.createForm();
   }
 
   createForm() {
     this.importBootstrapForm = new CdFormGroup({
-      siteName: new FormControl('', {
+      siteName: new UntypedFormControl('', {
         validators: [Validators.required]
       }),
-      direction: new FormControl('rx-tx', {}),
-      pools: new FormGroup(
+      direction: new UntypedFormControl('rx-tx', {}),
+      pools: new UntypedFormGroup(
         {},
         {
           validators: [this.validatePools()]
         }
       ),
-      token: new FormControl('', {
+      token: new UntypedFormControl('', {
         validators: [Validators.required, this.validateToken()]
       })
     });
@@ -74,7 +75,7 @@ export class BootstrapImportModalComponent implements OnInit, OnDestroy {
         return acc;
       }, []);
 
-      const poolsControl = this.importBootstrapForm.get('pools') as FormGroup;
+      const poolsControl = this.importBootstrapForm.get('pools') as UntypedFormGroup;
       _.each(this.pools, (pool) => {
         const poolName = pool['name'];
         const mirroring_disabled = pool['mirror_mode'] === 'disabled';
@@ -89,7 +90,7 @@ export class BootstrapImportModalComponent implements OnInit, OnDestroy {
         } else {
           poolsControl.addControl(
             poolName,
-            new FormControl({ value: !mirroring_disabled, disabled: !mirroring_disabled })
+            new UntypedFormControl({ value: !mirroring_disabled, disabled: !mirroring_disabled })
           );
         }
       });
@@ -103,7 +104,7 @@ export class BootstrapImportModalComponent implements OnInit, OnDestroy {
   }
 
   validatePools(): ValidatorFn {
-    return (poolsControl: FormGroup): { [key: string]: any } => {
+    return (poolsControl: UntypedFormGroup): { [key: string]: any } => {
       let checkedCount = 0;
       _.each(poolsControl.controls, (control) => {
         if (control.value === true) {
@@ -120,7 +121,7 @@ export class BootstrapImportModalComponent implements OnInit, OnDestroy {
   }
 
   validateToken(): ValidatorFn {
-    return (token: FormControl): { [key: string]: any } => {
+    return (token: UntypedFormControl): { [key: string]: any } => {
       try {
         if (JSON.parse(atob(token.value))) {
           return null;
@@ -133,7 +134,7 @@ export class BootstrapImportModalComponent implements OnInit, OnDestroy {
   import() {
     const bootstrapPoolNames: string[] = [];
     const poolNames: string[] = [];
-    const poolsControl = this.importBootstrapForm.get('pools') as FormGroup;
+    const poolsControl = this.importBootstrapForm.get('pools') as UntypedFormGroup;
     _.each(poolsControl.controls, (control, poolName) => {
       if (control.value === true) {
         bootstrapPoolNames.push(poolName);
@@ -180,7 +181,7 @@ export class BootstrapImportModalComponent implements OnInit, OnDestroy {
       error: finishHandler,
       complete: () => {
         finishHandler();
-        this.activeModal.close();
+        this.closeModal();
       }
     });
   }

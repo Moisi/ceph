@@ -79,8 +79,8 @@ a number of things:
   a ``client.admin`` user. So you must generate the admin user and keyring,
   and you must also add the ``client.admin`` user to the monitor keyring.
 
-The foregoing requirements do not imply the creation of a Ceph Configuration
-file. However, as a best practice, we recommend creating a Ceph configuration
+The foregoing requirements do not imply the creation of a :ref:`Ceph Configuration
+file <configuring-ceph>`. However, as a best practice, we recommend creating a Ceph configuration
 file and populating it with the ``fsid``, the ``mon initial members`` and the
 ``mon host`` settings.
 
@@ -132,24 +132,24 @@ The procedure is as follows:
 
 #. Add the initial monitor(s) to your Ceph configuration file. ::
 
-	mon initial members = {hostname}[,{hostname}]
+	mon_initial_members = {hostname}[,{hostname}]
 
    For example::
 
-	mon initial members = mon-node1
+	mon_initial_members = mon-node1
 
 
 #. Add the IP address(es) of the initial monitor(s) to your Ceph configuration
    file and save the file. ::
 
-	mon host = {ip-address}[,{ip-address}]
+	mon_host = {ip-address}[,{ip-address}]
 
    For example::
 
-	mon host = 192.168.0.1
+	mon_host = 192.168.0.1
 
    **Note:** You may use IPv6 addresses instead of IPv4 addresses, but
-   you must set ``ms bind ipv6`` to ``true``. See `Network Configuration
+   you must set ``ms_bind_ipv6`` to ``true``. See `Network Configuration
    Reference`_ for details about network configuration.
 
 #. Create a keyring for your cluster and generate a monitor secret key. ::
@@ -210,37 +210,33 @@ The procedure is as follows:
 
 	[global]
 	fsid = {cluster-id}
-	mon initial members = {hostname}[, {hostname}]
-	mon host = {ip-address}[, {ip-address}]
-	public network = {network}[, {network}]
-	cluster network = {network}[, {network}]
-	auth cluster required = cephx
-	auth service required = cephx
-	auth client required = cephx
-	osd journal size = {n}
-	osd pool default size = {n}  # Write an object n times.
-	osd pool default min size = {n} # Allow writing n copies in a degraded state.
-	osd pool default pg num = {n}
-	osd pool default pgp num = {n}
-	osd crush chooseleaf type = {n}
+	mon_initial_members = {hostname}[, {hostname}]
+	mon_host = {ip-address}[, {ip-address}]
+	public_network = {network}[, {network}]
+	cluster_network = {network}[, {network}]
+	auth_cluster required = cephx
+	auth_service required = cephx
+	auth_client required = cephx
+	osd_pool_default_size = {n}  # Write an object n times.
+	osd_pool_default_min_size = {n} # Allow writing n copies in a degraded state.
+	osd_pool_default_pg_num = {n}
+	osd_crush_chooseleaf_type = {n}
 
    In the foregoing example, the ``[global]`` section of the configuration might
    look like this::
 
 	[global]
 	fsid = a7f64266-0894-4f1e-a635-d0aeaca0e993
-	mon initial members = mon-node1
-	mon host = 192.168.0.1
-	public network = 192.168.0.0/24
-	auth cluster required = cephx
-	auth service required = cephx
-	auth client required = cephx
-	osd journal size = 1024
-	osd pool default size = 3
-	osd pool default min size = 2
-	osd pool default pg num = 333
-	osd pool default pgp num = 333
-	osd crush chooseleaf type = 1
+	mon_initial_members = mon-node1
+	mon_host = 192.168.0.1
+	public_network = 192.168.0.0/24
+	auth_cluster_required = cephx
+	auth_service_required = cephx
+	auth_client_required = cephx
+	osd_pool_default_size = 3
+	osd_pool_default_min_size = 2
+	osd_pool_default_pg_num = 333
+	osd_crush_chooseleaf_type = 1
 
 
 #. Start the monitor(s).
@@ -295,7 +291,7 @@ Adding OSDs
 
 Once you have your initial monitor(s) running, you should add OSDs. Your cluster
 cannot reach an ``active + clean`` state until you have enough OSDs to handle the
-number of copies of an object (e.g., ``osd pool default size = 2`` requires at
+number of copies of an object (e.g., ``osd_pool_default_size = 2`` requires at
 least two OSDs). After bootstrapping your monitor, your cluster has a default
 CRUSH map; however, the CRUSH map doesn't have any Ceph OSD Daemons mapped to
 a Ceph Node.
@@ -311,8 +307,6 @@ CRUSH map under the host for you. Execute ``ceph-volume -h`` for CLI details.
 The ``ceph-volume`` utility automates the steps of the `Long Form`_ below. To
 create the first two OSDs with the short form procedure, execute the following for each OSD:
 
-bluestore
-^^^^^^^^^
 #. Create the OSD. ::
 
 	copy /var/lib/ceph/bootstrap-osd/ceph.keyring from monitor node (mon-node1) to /var/lib/ceph/bootstrap-osd/ceph.keyring on osd node (osd-node1)
@@ -351,45 +345,6 @@ activate):
    For example::
 
 	sudo ceph-volume lvm activate 0 a7f64266-0894-4f1e-a635-d0aeaca0e993
-
-
-filestore
-^^^^^^^^^
-#. Create the OSD. ::
-
-	ssh {osd node}
-	sudo ceph-volume lvm create --filestore --data {data-path} --journal {journal-path}
-
-   For example::
-
-	ssh osd-node1
-	sudo ceph-volume lvm create --filestore --data /dev/hdd1 --journal /dev/hdd2
-
-Alternatively, the creation process can be split in two phases (prepare, and
-activate):
-
-#. Prepare the OSD. ::
-
-	ssh {node-name}
-	sudo ceph-volume lvm prepare --filestore --data {data-path} --journal {journal-path}
-
-   For example::
-
-	ssh osd-node1
-	sudo ceph-volume lvm prepare --filestore --data /dev/hdd1 --journal /dev/hdd2
-
-   Once prepared, the ``ID`` and ``FSID`` of the prepared OSD are required for
-   activation. These can be obtained by listing OSDs in the current server::
-
-    sudo ceph-volume lvm list
-
-#. Activate the OSD::
-
-	sudo ceph-volume lvm activate --filestore {ID} {FSID}
-
-   For example::
-
-	sudo ceph-volume lvm activate --filestore 0 a7f64266-0894-4f1e-a635-d0aeaca0e993
 
 
 Long Form
@@ -506,6 +461,52 @@ In the below instructions, ``{id}`` is an arbitrary name, such as the hostname o
 
 #. Now you are ready to `create a Ceph file system`_.
 
+Manually Installing RADOSGW
+===========================
+
+For a more involved discussion of the procedure presented here, see `this
+thread on the ceph-users mailing list
+<https://lists.ceph.io/hyperkitty/list/ceph-users@ceph.io/message/LB3YRIKAPOHXYCW7MKLVUJPYWYRQVARU/>`_.
+
+#. Install ``radosgw`` packages on the nodes that will be the RGW nodes.
+
+#. From a monitor or from a node with admin privileges, run a command of the
+   following form:
+
+   .. prompt:: bash #
+      
+      ceph auth get-or-create client.$(hostname -s) mon 'allow rw' osd 'allow rwx'
+
+#. On one of the RGW nodes, do the following:
+
+   a. Create a ``ceph-user``-owned directory. For example: 
+
+      .. prompt:: bash #
+
+         install -d -o ceph -g ceph /var/lib/ceph/radosgw/ceph-$(hostname -s)
+
+   b. Enter the directory just created and create a ``keyring`` file: 
+
+      .. prompt:: bash #
+
+         touch /var/lib/ceph/radosgw/ceph-$(hostname -s)/keyring
+
+      Use a command similar to this one to put the key from the earlier ``ceph
+      auth get-or-create`` step in the ``keyring`` file. Use your preferred
+      editor:
+
+      .. prompt:: bash #
+
+         $EDITOR /var/lib/ceph/radosgw/ceph-$(hostname -s)/keyring
+
+   c. Repeat these steps on every RGW node.
+
+#. Start the RADOSGW service by running the following command:
+
+   .. prompt:: bash #
+
+      systemctl start ceph-radosgw@$(hostname -s).service
+
 
 Summary
 =======
@@ -528,11 +529,10 @@ You should see output that looks something like this::
 	-3	1		host osd-node2
 	1	1			osd.1	up	1
 
-To add (or remove) additional monitors, see `Add/Remove Monitors`_.
+To add (or remove) additional monitors, see :ref:`adding-and-removing-monitors`.
 To add (or remove) additional Ceph OSD Daemons, see `Add/Remove OSDs`_.
 
 
-.. _Add/Remove Monitors: ../../rados/operations/add-or-rm-mons
 .. _Add/Remove OSDs: ../../rados/operations/add-or-rm-osds
 .. _Network Configuration Reference: ../../rados/configuration/network-config-ref
 .. _Monitor Config Reference - Data: ../../rados/configuration/mon-config-ref#data

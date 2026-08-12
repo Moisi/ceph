@@ -173,7 +173,7 @@ class DeltaRecorderT final: public DeltaRecorder {
         auto p_addr = reinterpret_cast<laddr_packed_t*>(
             mut.get_write() + update_offset);
         SUBDEBUG(seastore_onode,
-            "apply {:#x} to offset {:#x} ...",
+            "apply {} to offset {:#x} ...",
             new_addr, update_offset);
         layout_t::update_child_addr(mut, new_addr, p_addr);
         break;
@@ -207,13 +207,13 @@ class DeltaRecorderT final: public DeltaRecorder {
         SUBERROR(seastore_onode,
             "got unknown op {} when replay {}",
             op, node);
-        ceph_abort("fatal error");
+        ceph_abort_msg("fatal error");
       }
     } catch (buffer::error& e) {
       SUBERROR(seastore_onode,
           "got decode error {} when replay {}",
           e.what(), node);
-      ceph_abort("fatal error");
+      ceph_abort_msg("fatal error");
     }
   }
 
@@ -245,7 +245,7 @@ class DeltaRecorderT final: public DeltaRecorder {
       // NODE_TYPE == node_type_t::LEAF
       value.encode(encoded);
     } else {
-      ceph_abort("impossible path");
+      ceph_abort_msg("impossible path");
     }
   }
 
@@ -259,7 +259,7 @@ class DeltaRecorderT final: public DeltaRecorder {
       // NODE_TYPE == node_type_t::LEAF
       return value_config_t::decode(delta);
     } else {
-      ceph_abort("impossible path");
+      ceph_abort_msg("impossible path");
     }
   }
 
@@ -305,7 +305,8 @@ class NodeExtentAccessorT {
       assert(p_recorder->node_type() == NODE_TYPE);
       assert(p_recorder->field_type() == FIELD_TYPE);
       recorder = static_cast<recorder_t*>(p_recorder);
-    } else if (!extent->is_pending() && extent->is_valid()) {
+    } else if (extent->is_stable()) {
+      assert(extent->is_stable_ready());
       state = nextent_state_t::READ_ONLY;
       // mut is empty
       assert(extent->get_recorder() == nullptr ||
@@ -313,7 +314,7 @@ class NodeExtentAccessorT {
       recorder = nullptr;
     } else {
       // extent is invalid or retired
-      ceph_abort("impossible path");
+      ceph_abort_msg("impossible path");
     }
 #ifndef NDEBUG
     auto ref_recorder = recorder_t::create_for_replay();
@@ -355,7 +356,8 @@ class NodeExtentAccessorT {
   void prepare_mutate(context_t c) {
     assert(!is_retired());
     if (state == nextent_state_t::READ_ONLY) {
-      assert(!extent->is_pending());
+      assert(extent->is_stable());
+      assert(extent->is_stable_ready());
       auto ref_recorder = recorder_t::create_for_encode(c.vb);
       recorder = static_cast<recorder_t*>(ref_recorder.get());
       extent = extent->mutate(c, std::move(ref_recorder));
@@ -366,7 +368,7 @@ class NodeExtentAccessorT {
       assert(recorder == static_cast<recorder_t*>(extent->get_recorder()));
       mut.emplace(extent->get_mutable());
     }
-    assert(extent->is_pending());
+    assert(extent->is_mutable());
   }
 
   template <KeyT KT>
@@ -376,7 +378,7 @@ class NodeExtentAccessorT {
       position_t& insert_pos,
       match_stage_t& insert_stage,
       node_offset_t& insert_size) {
-    assert(extent->is_pending());
+    assert(extent->is_mutable());
     assert(state != nextent_state_t::READ_ONLY);
     if (state == nextent_state_t::MUTATION_PENDING) {
       recorder->template encode_insert<KT>(
@@ -397,7 +399,7 @@ class NodeExtentAccessorT {
   }
 
   void split_replayable(StagedIterator& split_at) {
-    assert(extent->is_pending());
+    assert(extent->is_mutable());
     assert(state != nextent_state_t::READ_ONLY);
     if (state == nextent_state_t::MUTATION_PENDING) {
       recorder->encode_split(split_at, read().p_start());
@@ -420,7 +422,7 @@ class NodeExtentAccessorT {
       position_t& insert_pos,
       match_stage_t& insert_stage,
       node_offset_t& insert_size) {
-    assert(extent->is_pending());
+    assert(extent->is_mutable());
     assert(state != nextent_state_t::READ_ONLY);
     if (state == nextent_state_t::MUTATION_PENDING) {
       recorder->template encode_split_insert<KT>(
@@ -444,7 +446,7 @@ class NodeExtentAccessorT {
 
   void update_child_addr_replayable(
       const laddr_t new_addr, laddr_packed_t* p_addr) {
-    assert(extent->is_pending());
+    assert(extent->is_mutable());
     assert(state != nextent_state_t::READ_ONLY);
     if (state == nextent_state_t::MUTATION_PENDING) {
       recorder->encode_update_child_addr(
@@ -462,7 +464,7 @@ class NodeExtentAccessorT {
   }
 
   std::tuple<match_stage_t, position_t> erase_replayable(const position_t& pos) {
-    assert(extent->is_pending());
+    assert(extent->is_mutable());
     assert(state != nextent_state_t::READ_ONLY);
     if (state == nextent_state_t::MUTATION_PENDING) {
       recorder->encode_erase(pos);
@@ -479,7 +481,7 @@ class NodeExtentAccessorT {
   }
 
   position_t make_tail_replayable() {
-    assert(extent->is_pending());
+    assert(extent->is_mutable());
     assert(state != nextent_state_t::READ_ONLY);
     if (state == nextent_state_t::MUTATION_PENDING) {
       recorder->encode_make_tail();
@@ -523,16 +525,12 @@ class NodeExtentAccessorT {
     return c.nm.alloc_extent(c.t, hint, alloc_size
     ).handle_error_interruptible(
       eagain_iertr::pass_further{},
-      crimson::ct_error::input_output_error::handle(
-          [FNAME, c, alloc_size, l_to_discard = extent->get_laddr()] {
-        SUBERRORT(seastore_onode,
-            "EIO during allocate -- node_size={}, to_discard={:x}",
-            c.t, alloc_size, l_to_discard);
-        ceph_abort("fatal error");
-      })
+      crimson::ct_error::input_output_error::assert_failure(fmt::format(
+        "{} during allocate -- node_size={}, to_discard={}",
+        FNAME, alloc_size, extent->get_laddr()).c_str())
     ).si_then([this, c, FNAME] (auto fresh_extent) {
       SUBDEBUGT(seastore_onode,
-          "update addr from {:#x} to {:#x} ...",
+          "update addr from {} to {} ...",
           c.t, extent->get_laddr(), fresh_extent->get_laddr());
       assert(fresh_extent);
       assert(fresh_extent->is_initial_pending());
@@ -552,22 +550,9 @@ class NodeExtentAccessorT {
       return c.nm.retire_extent(c.t, to_discard
       ).handle_error_interruptible(
         eagain_iertr::pass_further{},
-        crimson::ct_error::input_output_error::handle(
-            [FNAME, c, l_to_discard = to_discard->get_laddr(),
-             l_fresh = fresh_extent->get_laddr()] {
-          SUBERRORT(seastore_onode,
-              "EIO during retire -- to_disgard={:x}, fresh={:x}",
-              c.t, l_to_discard, l_fresh);
-          ceph_abort("fatal error");
-        }),
-        crimson::ct_error::enoent::handle(
-            [FNAME, c, l_to_discard = to_discard->get_laddr(),
-             l_fresh = fresh_extent->get_laddr()] {
-          SUBERRORT(seastore_onode,
-              "ENOENT during retire -- to_disgard={:x}, fresh={:x}",
-              c.t, l_to_discard, l_fresh);
-          ceph_abort("fatal error");
-        })
+        crimson::ct_error::assert_all(fmt::format(
+          "{} during retire -- to_disgard={}, fresh={}",
+          FNAME, to_discard->get_laddr(), fresh_extent->get_laddr()).c_str())
       );
     }).si_then([this, c] {
       boost::ignore_unused(c);  // avoid clang warning;
@@ -583,16 +568,8 @@ class NodeExtentAccessorT {
     return c.nm.retire_extent(c.t, std::move(extent)
     ).handle_error_interruptible(
       eagain_iertr::pass_further{},
-      crimson::ct_error::input_output_error::handle(
-          [FNAME, c, addr] {
-        SUBERRORT(seastore_onode, "EIO -- addr={:x}", c.t, addr);
-        ceph_abort("fatal error");
-      }),
-      crimson::ct_error::enoent::handle(
-          [FNAME, c, addr] {
-        SUBERRORT(seastore_onode, "ENOENT -- addr={:x}", c.t, addr);
-        ceph_abort("fatal error");
-      })
+      crimson::ct_error::assert_all(fmt::format(
+        "{} addr={}", FNAME, addr).c_str())
 #ifndef NDEBUG
     ).si_then([c] {
       assert(!c.t.is_conflicted());

@@ -12,6 +12,8 @@
 #include "librbd/Utils.h"
 #include "osdc/Striper.h"
 
+#include <shared_mutex> // for std::shared_lock
+
 #define dout_subsys ceph_subsys_rbd
 #undef dout_prefix
 #define dout_prefix *_dout << "librbd::deep_copy::SnapshotCreateRequest: " \
@@ -33,6 +35,14 @@ SnapshotCreateRequest<I>::SnapshotCreateRequest(
     m_snap_namespace(snap_namespace), m_size(size),
     m_parent_spec(spec), m_parent_overlap(parent_overlap),
     m_on_finish(on_finish), m_cct(dst_image_ctx->cct) {
+
+  ldout(m_cct, 20) << "dst_image_id=" << m_dst_image_ctx->id
+                   << ", snap_name=" << m_snap_name
+                   << ", snap_namespace=" << m_snap_namespace
+                   << ", size=" << m_size
+                   << ", parent_spec=" << m_parent_spec
+                   << ", parent_overlap=" << m_parent_overlap
+		   << dendl;
 }
 
 template <typename I>

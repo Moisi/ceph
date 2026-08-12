@@ -16,6 +16,10 @@
 #include <ostream>
 #include "include/ceph_assert.h"
 #include "bluestore_types.h"
+#include "common/ceph_mutex.h"
+
+typedef interval_set<uint64_t> release_set_t;
+typedef release_set_t::value_type release_set_entry_t;
 
 class Allocator {
 public:
@@ -49,7 +53,7 @@ public:
 
   /* Bulk release. Implementations may override this method to handle the whole
    * set at once. This could save e.g. unnecessary mutex dance. */
-  virtual void release(const interval_set<uint64_t>& release_set) = 0;
+  virtual void release(const release_set_t& release_set) = 0;
   void release(const PExtentVector& release_set);
 
   virtual void dump() = 0;
@@ -72,13 +76,11 @@ public:
     std::string_view type,
     int64_t size,
     int64_t block_size,
-    int64_t zone_size = 0,
-    int64_t firs_sequential_zone = 0,
     const std::string_view name = ""
     );
 
 
-  const std::string& get_name() const;
+  virtual const std::string& get_name() const = 0;
   int64_t get_capacity() const
   {
     return device_size;
@@ -88,9 +90,6 @@ public:
     return block_size;
   }
 
-private:
-  class SocketHook;
-  SocketHook* asok_hook = nullptr;
 protected:
   const int64_t device_size = 0;
   const int64_t block_size = 0;

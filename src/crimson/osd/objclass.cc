@@ -276,7 +276,7 @@ int cls_cxx_setxattr(cls_method_context_t hctx,
 
 int cls_cxx_snap_revert(cls_method_context_t hctx, snapid_t snapid)
 {
-  OSDOp op{op = CEPH_OSD_OP_ROLLBACK};
+  OSDOp op{CEPH_OSD_OP_ROLLBACK};
   op.op.snap.snapid = snapid;
   return execute_osd_op(hctx, op);
 }
@@ -550,17 +550,6 @@ int cls_get_manifest_ref_count(cls_method_context_t hctx, string fp_oid)
 uint64_t cls_get_osd_min_alloc_size(cls_method_context_t hctx) {
   // FIXME
   return 4096;
-}
-
-int cls_cxx_gather(cls_method_context_t hctx, const std::set<std::string> &src_objs, const std::string& pool,
-		   const char *cls, const char *method, bufferlist& inbl)
-{
-  return 0;
-}
-
-int cls_cxx_get_gathered_data(cls_method_context_t hctx, std::map<std::string, bufferlist> *results)
-{
-  return 0;
 }
 
 // although at first glance the implementation looks the same as in

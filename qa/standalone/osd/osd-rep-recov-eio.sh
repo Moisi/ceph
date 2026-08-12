@@ -29,7 +29,6 @@ function run() {
     export CEPH_ARGS
     CEPH_ARGS+="--fsid=$(uuidgen) --auth-supported=none "
     CEPH_ARGS+="--mon-host=$CEPH_MON "
-    CEPH_ARGS+="--osd-mclock-profile=high_recovery_ops "
 
 
     local funcs=${@:-$(set | sed -n -e 's/^\(TEST_[0-9a-z_]*\) .*/\1/p')}
@@ -220,6 +219,18 @@ function TEST_rados_repair_warning() {
     ceph health | $(! grep -q "Too many repaired reads on 1 OSDs") || return 1
     set +o pipefail
 
+    ceph health unmute OSD_TOO_MANY_REPAIRS
+    ceph tell osd.$primary clear_shards_repaired
+    sleep 10
+
+    set -o pipefail
+    # Should clear this
+    ceph health | $(! grep -q "Too many repaired reads on 1 OSDs") || return 1
+    set +o pipefail
+
+    ceph tell osd.$primary clear_shards_repaired $OBJS
+    sleep 10
+
     for i in $(seq 1 $OBJS)
      do
        inject_$inject rep data $poolname ${objbase}-$i $dir 0 || return 1
@@ -236,7 +247,7 @@ function TEST_rados_repair_warning() {
     COUNT=$(ceph pg dump --format=json-pretty | jq ".pg_map.osd_stats_sum.num_shards_repaired")
     test "$COUNT" = "$(expr $OBJS \* 3)" || return 1
 
-    # Give mon a chance to notice additional OSD and unmute
+    # Give mon a chance to notice additional OSD and reset num_shards_repaired
     # The default tick time is 5 seconds
     CHECKTIME=10
     LOOPS=0
@@ -414,55 +425,6 @@ function TEST_rep_recovery_unfound() {
     rm -f ${dir}/ORIGINAL ${dir}/CHECK
 
     delete_pool $poolname
-}
-
-# This is a filestore only test because it requires data digest in object info
-function TEST_rep_read_unfound() {
-    local dir=$1
-    local objname=myobject
-
-    setup_osds 3 _filestore || return 1
-
-    ceph osd pool delete foo foo --yes-i-really-really-mean-it || return 1
-    local poolname=test-pool
-    create_pool $poolname 1 1 || return 1
-    ceph osd pool set $poolname size 2
-    wait_for_clean || return 1
-
-    ceph pg dump pgs
-
-    dd if=/dev/urandom bs=8k count=1 of=$dir/ORIGINAL
-    rados -p $poolname put $objname $dir/ORIGINAL
-
-    local primary=$(get_primary $poolname $objname)
-    local other=$(get_not_primary $poolname $objname)
-
-    dd if=/dev/urandom bs=8k count=1 of=$dir/CORRUPT
-    objectstore_tool $dir $primary $objname set-bytes $dir/CORRUPT || return 1
-    objectstore_tool $dir $other $objname set-bytes $dir/CORRUPT || return 1
-
-    timeout 30 rados -p $poolname get $objname $dir/tmp &
-
-    sleep 5
-
-    flush_pg_stats
-    ceph --format=json pg dump pgs | jq '.'
-
-    if ! ceph --format=json pg dump pgs | jq '.pg_stats | .[0].state' | grep -q recovery_unfound
-    then
-      echo "Failure to get to recovery_unfound state"
-      return 1
-    fi
-
-    objectstore_tool $dir $other $objname set-bytes $dir/ORIGINAL || return 1
-
-    wait
-
-    if ! cmp $dir/ORIGINAL $dir/tmp
-    then
-       echo "Bad data after primary repair"
-       return 1
-    fi
 }
 
 main osd-rep-recov-eio.sh "$@"

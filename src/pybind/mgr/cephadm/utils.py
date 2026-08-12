@@ -5,6 +5,7 @@ from enum import Enum
 from functools import wraps
 from typing import Optional, Callable, TypeVar, List, NewType, TYPE_CHECKING, Any, NamedTuple
 from orchestrator import OrchestratorError
+import hashlib
 
 if TYPE_CHECKING:
     from cephadm import CephadmOrchestrator
@@ -23,15 +24,20 @@ class CephadmNoImage(Enum):
 # NOTE: order important here as these are used for upgrade order
 CEPH_TYPES = ['mgr', 'mon', 'crash', 'osd', 'mds', 'rgw',
               'rbd-mirror', 'cephfs-mirror', 'ceph-exporter']
-GATEWAY_TYPES = ['iscsi', 'nfs']
+GATEWAY_TYPES = ['iscsi', 'nfs', 'nvmeof', 'smb']
 MONITORING_STACK_TYPES = ['node-exporter', 'prometheus',
-                          'alertmanager', 'grafana', 'loki', 'promtail']
-RESCHEDULE_FROM_OFFLINE_HOSTS_TYPES = ['nfs']
+                          'alertmanager', 'grafana', 'loki', 'promtail', 'alloy']
+RESCHEDULE_FROM_OFFLINE_HOSTS_TYPES = ['haproxy', 'nfs']
 
 CEPH_UPGRADE_ORDER = CEPH_TYPES + GATEWAY_TYPES + MONITORING_STACK_TYPES
 
 # these daemon types use the ceph container image
-CEPH_IMAGE_TYPES = CEPH_TYPES + ['iscsi', 'nfs']
+CEPH_IMAGE_TYPES = CEPH_TYPES + ['iscsi', 'nfs', 'node-proxy']
+
+# these daemons do not use the ceph image. There are other daemons
+# that also don't use the ceph image, but we only care about those
+# that are part of the upgrade order here
+NON_CEPH_IMAGE_TYPES = MONITORING_STACK_TYPES + ['nvmeof', 'smb']
 
 # Used for _run_cephadm used for check-host etc that don't require an --image parameter
 cephadmNoImage = CephadmNoImage.token
@@ -43,12 +49,25 @@ class ContainerInspectInfo(NamedTuple):
     repo_digests: Optional[List[str]]
 
 
+class SpecialHostLabels(str, Enum):
+    ADMIN: str = '_admin'
+    NO_MEMORY_AUTOTUNE: str = '_no_autotune_memory'
+    DRAIN_DAEMONS: str = '_no_schedule'
+    DRAIN_CONF_KEYRING: str = '_no_conf_keyring'
+
+    def to_json(self) -> str:
+        return self.value
+
+    def __str__(self) -> str:
+        return self.value
+
+
 def name_to_config_section(name: str) -> ConfEntity:
     """
     Map from daemon names to ceph entity names (as seen in config)
     """
     daemon_type = name.split('.', 1)[0]
-    if daemon_type in ['rgw', 'rbd-mirror', 'nfs', 'crash', 'iscsi', 'ceph-exporter']:
+    if daemon_type in ['rgw', 'rbd-mirror', 'nfs', 'crash', 'iscsi', 'ceph-exporter', 'nvmeof', 'smb']:
         return ConfEntity('client.' + name)
     elif daemon_type in ['mon', 'osd', 'mds', 'mgr', 'client']:
         return ConfEntity(name)
@@ -61,7 +80,7 @@ def forall_hosts(f: Callable[..., T]) -> Callable[..., List[T]]:
     def forall_hosts_wrapper(*args: Any) -> List[T]:
         from cephadm.module import CephadmOrchestrator
 
-        # Some weired logic to make calling functions with multiple arguments work.
+        # Some weird logic to make calling functions with multiple arguments work.
         if len(args) == 1:
             vals = args[0]
             self = None
@@ -136,3 +155,9 @@ def file_mode_to_str(mode: int) -> str:
             f'{"x" if (mode >> shift) & 1 else "-"}'
         ) + r
     return r
+
+
+def md5_hash(input_value: str) -> str:
+    input_str = str(input_value).encode('utf-8')
+    hash_object = hashlib.md5(input_str)
+    return hash_object.hexdigest()

@@ -79,7 +79,7 @@ const char* find_device_path(
 {
   for (auto& i : devs) {
     bluestore_bdev_label_t label;
-    int r = BlueStore::_read_bdev_label(cct, i, &label);
+    int r = BlueStore::read_bdev_label(cct, i, &label);
     if (r < 0) {
       cerr << "unable to read label for " << i << ": "
 	   << cpp_strerror(r) << std::endl;
@@ -111,7 +111,7 @@ void parse_devices(
   }
   for (auto& d : devs) {
     bluestore_bdev_label_t label;
-    int r = BlueStore::_read_bdev_label(cct, d, &label);
+    int r = BlueStore::read_bdev_label(cct, d, &label);
     if (r < 0) {
       cerr << "unable to read label for " << d << ": "
 	   << cpp_strerror(r) << std::endl;
@@ -214,6 +214,25 @@ void log_dump(
   delete fs;
 }
 
+void super_dump(
+  CephContext *cct,
+  const string& path,
+  const vector<string>& devs)
+{
+  validate_path(cct, path, true);
+  BlueFS *fs = new BlueFS(cct);
+
+  add_devices(fs, cct, devs);
+  int r = fs->super_dump();
+  if (r < 0) {
+    cerr << "super_dump failed" << ": "
+         << cpp_strerror(r) << std::endl;
+    exit(EXIT_FAILURE);
+  }
+
+  delete fs;
+}
+
 void inferring_bluefs_devices(vector<string>& devs, std::string& path)
 {
   cout << "inferring bluefs devices from bluestore path" << std::endl;
@@ -242,7 +261,7 @@ static void bluefs_import(
   }
   BlueStore bluestore(cct, path);
   KeyValueDB *db_ptr;
-  r = bluestore.open_db_environment(&db_ptr, false);
+  r = bluestore.open_db_environment(&db_ptr, false, false);
   if (r < 0) {
     cerr << "error preparing db environment: " << cpp_strerror(r) << std::endl;
     exit(EXIT_FAILURE);
@@ -278,23 +297,27 @@ int main(int argc, char **argv)
   vector<string> devs;
   vector<string> devs_source;
   string dev_target;
-  string path;
-  string action;
+  string path, path_aux;
+  string action, action_aux;
   string log_file;
   string input_file;
   string dest_file;
   string key, value;
   vector<string> allocs_name;
+  vector<string> bdev_type;
   string empty_sharding(1, '\0');
   string new_sharding = empty_sharding;
   string resharding_ctrl;
   int log_level = 30;
   bool fsck_deep = false;
+  uint64_t disk_offset;
   po::options_description po_options("Options");
   po_options.add_options()
     ("help,h", "produce help message")
     (",i", po::value<string>(&osd_instance), "OSD instance. Requires access to monitor/ceph.conf")
     ("path", po::value<string>(&path), "bluestore path")
+    ("data-path", po::value<string>(&path_aux),
+      "--path alias, ignored if the latter is present")
     ("out-dir", po::value<string>(&out_dir), "output directory")
     ("input-file", po::value<string>(&input_file), "import file")
     ("dest-file", po::value<string>(&dest_file), "destination file")
@@ -307,8 +330,13 @@ int main(int argc, char **argv)
     ("key,k", po::value<string>(&key), "label metadata key name")
     ("value,v", po::value<string>(&value), "label metadata value")
     ("allocator", po::value<vector<string>>(&allocs_name), "allocator to inspect: 'block'/'bluefs-wal'/'bluefs-db'")
+    ("bdev-type", po::value<vector<string>>(&bdev_type), "bdev type to inspect: 'bdev-block'/'bdev-wal'/'bdev-db'")
+    ("yes-i-really-really-mean-it", "additional confirmation for dangerous commands")
     ("sharding", po::value<string>(&new_sharding), "new sharding to apply")
     ("resharding-ctrl", po::value<string>(&resharding_ctrl), "gives control over resharding procedure details")
+    ("offset", po::value<uint64_t>(&disk_offset), "disk location")
+    ("op", po::value<string>(&action_aux),
+      "--command alias, ignored if the latter is present")
     ;
   po::options_description po_positional("Positional options");
   po_positional.add_options()
@@ -327,17 +355,23 @@ int main(int argc, char **argv)
         "bluefs-bdev-new-wal, "
         "bluefs-bdev-migrate, "
         "show-label, "
+        "show-label-at, "
         "set-label-key, "
+	"create-bdev-labels, "
         "rm-label-key, "
         "prime-osd-dir, "
+        "bluefs-super-dump, "
         "bluefs-log-dump, "
         "free-dump, "
         "free-score, "
         "free-fragmentation, "
         "bluefs-stats, "
         "reshard, "
-        "show-sharding")
-    ;
+        "show-sharding, "
+        "trim, "
+        "zap-device, "
+        "revert-wal-to-plain"
+    );
   po::options_description po_all("All options");
   po_all.add(po_options).add(po_positional);
 
@@ -345,7 +379,11 @@ int main(int argc, char **argv)
   po::variables_map vm;
   try {
     po::parsed_options parsed =
-      po::command_line_parser(argc, argv).options(po_all).allow_unregistered().run();
+      po::command_line_parser(argc, argv).options(po_all)
+        .allow_unregistered()
+        .style(po::command_line_style::default_style &
+               ~po::command_line_style::allow_guessing)
+        .run();
     po::store( parsed, vm);
     po::notify(vm);
     ceph_option_strings = po::collect_unrecognized(parsed.options,
@@ -354,6 +392,26 @@ int main(int argc, char **argv)
     std::cerr << e.what() << std::endl;
     exit(EXIT_FAILURE);
   }
+  if (action != action_aux && !action.empty() && !action_aux.empty()) {
+    std::cerr
+      << " Ambiguous --op and --command options, please provide a single one."
+      << std::endl;
+    exit(EXIT_FAILURE);
+  }
+  if (action.empty()) {
+    action.swap(action_aux);
+  }
+  if (!path_aux.empty()) {
+    if (path.empty()) {
+      path.swap(path_aux);
+    } else if (path != path_aux) {
+      std::cerr
+	<< " Ambiguous --data-path and --path options, please provide a single one."
+	<< std::endl;
+      exit(EXIT_FAILURE);
+    }
+  };
+
   // normalize path (remove ending '/' if any)
   if (path.size() > 1 && *(path.end() - 1) == '/') {
     path.resize(path.size() - 1);
@@ -369,6 +427,8 @@ int main(int argc, char **argv)
     args.push_back(log_file.c_str());
     static char ll[10];
     snprintf(ll, sizeof(ll), "%d", log_level);
+    args.push_back("--debug-bdev");
+    args.push_back(ll);
     args.push_back("--debug-bluestore");
     args.push_back(ll);
     args.push_back("--debug-bluefs");
@@ -427,7 +487,10 @@ int main(int argc, char **argv)
     }
   }
 
-  if (action == "fsck" || action == "repair" || action == "quick-fix" || action == "allocmap" || action == "qfsck" || action == "restore_cfb") {
+  if (action == "fsck" || action == "repair" ||
+      action == "quick-fix" || action == "allocmap" ||
+      action == "qfsck" || action == "restore_cfb" ||
+      action == "revert-wal-to-plain") {
     if (path.empty()) {
       cerr << "must specify bluestore path" << std::endl;
       exit(EXIT_FAILURE);
@@ -458,6 +521,16 @@ int main(int argc, char **argv)
       exit(EXIT_FAILURE);
     }
   }
+  if (action == "create-bdev-labels") {
+    if (path.empty()) {
+      cerr << "must specify bluestore path" << std::endl;
+      exit(EXIT_FAILURE);
+    }
+    if (devs.size() != 1) {
+      cerr << "must specify the main bluestore device" << std::endl;
+      exit(EXIT_FAILURE);
+    }
+  }
   if (action == "show-label") {
     if (devs.empty() && path.empty()) {
       cerr << "must specify bluestore path *or* raw device(s)" << std::endl;
@@ -466,8 +539,15 @@ int main(int argc, char **argv)
     if (devs.empty())
       inferring_bluefs_devices(devs, path);
   }
+  if (action == "show-label-at") {
+    if (devs.empty()) {
+      cerr << "must specify bluestore raw device" << std::endl;
+      exit(EXIT_FAILURE);
+    }
+  }
   if (action == "bluefs-export" || 
       action == "bluefs-import" || 
+      action == "bluefs-super-dump" ||
       action == "bluefs-log-dump") {
     if (path.empty()) {
       cerr << "must specify bluestore path" << std::endl;
@@ -546,6 +626,41 @@ int main(int argc, char **argv)
       exit(EXIT_FAILURE);
     }
   }
+  if (action == "trim") {
+    if (path.empty()) {
+      cerr << "must specify bluestore path" << std::endl;
+      exit(EXIT_FAILURE);
+    }
+    if (!vm.count("yes-i-really-really-mean-it")) {
+      cerr << "Trimming a non healthy bluestore is a dangerous operation which could cause data loss, "
+           << "please run fsck and confirm with --yes-i-really-really-mean-it option"
+           << std::endl;
+      exit(EXIT_FAILURE);
+    }
+    for (auto type : bdev_type) {
+      if (!type.empty() &&
+          type != "bdev-block" &&
+          type != "bdev-db" &&
+          type != "bdev-wal") {
+        cerr << "unknown bdev type '" << type << "'" << std::endl;
+        exit(EXIT_FAILURE);
+      }
+    }
+    if (bdev_type.empty())
+      bdev_type = vector<string>{"bdev-block", "bdev-db", "bdev-wal"};
+  }
+  if (action == "zap-device") {
+    if (devs.empty()) {
+      cerr << "must specify device(s) with --dev option" << std::endl;
+      exit(EXIT_FAILURE);
+    }
+    if (!vm.count("yes-i-really-really-mean-it")) {
+      cerr << "zap-osd is a DESTRUCTIVE operation, it causes OSD data loss, "
+           << "please confirm with --yes-i-really-really-mean-it option"
+           << std::endl;
+      exit(EXIT_FAILURE);
+    }
+  }
 
   if (action == "restore_cfb") {
 #ifndef CEPH_BLUESTORE_TOOL_RESTORE_ALLOCATION
@@ -600,7 +715,8 @@ int main(int argc, char **argv)
   }
   else if (action == "fsck" ||
       action == "repair" ||
-      action == "quick-fix") {
+      action == "quick-fix" ||
+      action == "revert-wal-to-plain") {
     validate_path(cct.get(), path, false);
     BlueStore bluestore(cct.get(), path);
     int r;
@@ -608,6 +724,8 @@ int main(int argc, char **argv)
       r = bluestore.fsck(fsck_deep);
     } else if (action == "repair") {
       r = bluestore.repair(fsck_deep);
+    } else if (action == "revert-wal-to-plain") {
+      r = bluestore.revert_wal_to_plain();
     } else {
       r = bluestore.quick_fix();
     }
@@ -623,7 +741,7 @@ int main(int argc, char **argv)
   }
   else if (action == "prime-osd-dir") {
     bluestore_bdev_label_t label;
-    int r = BlueStore::_read_bdev_label(cct.get(), devs.front(), &label);
+    int r = BlueStore::read_bdev_label(cct.get(), devs.front(), &label);
     if (r < 0) {
       cerr << "failed to read label for " << devs.front() << ": "
 	   << cpp_strerror(r) << std::endl;
@@ -675,24 +793,94 @@ int main(int argc, char **argv)
   else if (action == "show-label") {
     JSONFormatter jf(true);
     jf.open_object_section("devices");
+    bool any_success = false;
     for (auto& i : devs) {
-      bluestore_bdev_label_t label;
-      int r = BlueStore::_read_bdev_label(cct.get(), i, &label);
-      if (r < 0) {
-	cerr << "unable to read label for " << i << ": "
-	     << cpp_strerror(r) << std::endl;
-	exit(EXIT_FAILURE);
-      }
       jf.open_object_section(i.c_str());
-      label.dump(&jf);
+      bluestore_bdev_label_t label;
+      std::vector<uint64_t> valid_positions;
+      int r = BlueStore::read_bdev_label(cct.get(), i, &label, &valid_positions);
+      if (r < 0) {
+        cerr << "unable to read label for " << i << ": "
+             << cpp_strerror(r) << std::endl;
+      } else {
+        any_success = true;
+        label.dump(&jf);
+        jf.open_array_section("locations");
+        for (int64_t pos : valid_positions) {
+          jf.dump_format("", "0x%llx", pos);
+        }
+        jf.close_section();
+      }
       jf.close_section();
     }
     jf.close_section();
     jf.flush(cout);
+    if (!any_success) {
+      exit(EXIT_FAILURE);
+    }
+  }
+  else if (action == "show-label-at") {
+    JSONFormatter jf(true);
+    bluestore_bdev_label_t label;
+    bool valid_offset = false;
+    for (auto o : bdev_label_positions) {
+      if (disk_offset == o) {
+        valid_offset = true;
+        break;
+      }
+    }
+    if (!valid_offset) {
+      cerr << "Suspicious offset: " << disk_offset
+           << ", expected locations: " << bdev_label_positions
+           << std::endl;
+    }
+    int r = BlueStore::read_bdev_label_at_pos(cct.get(), devs[0], disk_offset, &label);
+    if (r < 0) {
+      cerr << "unable to read label for " << devs[0] << ": "
+           << cpp_strerror(r) << std::endl;
+      exit(EXIT_FAILURE);
+    }
+    jf.open_object_section(devs[0].c_str());
+    label.dump(&jf);
+    jf.open_array_section("locations");
+    jf.dump_format("", "0x%llx", disk_offset);
+    jf.close_section();
+    jf.close_section();
+    jf.flush(cout);
+  }
+  else if (action == "create-bdev-labels") {
+
+    std::vector<uint64_t> valid_positions = {0};
+
+    bool force = vm.count("yes-i-really-really-mean-it");
+    int r = BlueStore::create_bdev_labels(cct.get(), path, devs, &valid_positions, force);
+    if (r == -EPERM && !force) {
+      cerr << "device " << devs.front()
+           << " already supports bdev label refusing to create a new label without --yes-i-really-really-mean-it"
+           << std::endl;
+      exit(EXIT_FAILURE);
+    }
+
+    if (r == -EEXIST && !force) {
+      cerr << "device " << devs.front() << " already has a label" << std::endl;
+      cerr << "Creating a new label on top of an existing one is a dangerous operation "
+	   << "which could cause data loss.\n"
+	   << "Please confirm with --yes-i-really-really-mean-it option" << std::endl;
+      exit(EXIT_FAILURE);
+    }
+
+    if (r < 0) {
+      cerr << "Failed to create bdev label: " << cpp_strerror(r) << std::endl;
+      exit(EXIT_FAILURE);
+    }
   }
   else if (action == "set-label-key") {
     bluestore_bdev_label_t label;
-    int r = BlueStore::_read_bdev_label(cct.get(), devs.front(), &label);
+    std::vector<uint64_t> valid_positions;
+    bool is_multi = false;
+    int64_t epoch = -1;
+    int r = BlueStore::read_bdev_label(cct.get(), devs.front(), &label,
+      &valid_positions, &is_multi, &epoch);
     if (r < 0) {
       cerr << "unable to read label for " << devs.front() << ": "
 	   << cpp_strerror(r) << std::endl;
@@ -714,16 +902,32 @@ int main(int argc, char **argv)
     } else {
       label.meta[key] = value;
     }
-    r = BlueStore::_write_bdev_label(cct.get(), devs.front(), label);
-    if (r < 0) {
-      cerr << "unable to write label for " << devs.front() << ": "
-	   << cpp_strerror(r) << std::endl;
-      exit(EXIT_FAILURE);
+    if (is_multi) {
+      epoch++;
+      label.meta["epoch"] = std::to_string(epoch);
+    }
+    bool wrote_at_least_one = false;
+    for (uint64_t position : valid_positions) {
+      r = BlueStore::write_bdev_label(cct.get(), devs.front(), label, position);
+      if (r < 0) {
+        cerr << "unable to write label for " << devs.front()
+             << " at 0x" << std::hex << position << std::dec
+             << ": " << cpp_strerror(r) << std::endl;
+      } else {
+        wrote_at_least_one = true;
+      }
+    }
+    if (!wrote_at_least_one) {
+        exit(EXIT_FAILURE);
     }
   }
   else if (action == "rm-label-key") {
     bluestore_bdev_label_t label;
-    int r = BlueStore::_read_bdev_label(cct.get(), devs.front(), &label);
+    std::vector<uint64_t> valid_positions;
+    bool is_multi = false;
+    int64_t epoch = -1;
+    int r = BlueStore::read_bdev_label(cct.get(), devs.front(), &label,
+      &valid_positions, &is_multi, &epoch);
     if (r < 0) {
       cerr << "unable to read label for " << devs.front() << ": "
 	   << cpp_strerror(r) << std::endl;
@@ -734,11 +938,23 @@ int main(int argc, char **argv)
       exit(EXIT_FAILURE);
     }
     label.meta.erase(key);
-    r = BlueStore::_write_bdev_label(cct.get(), devs.front(), label);
-    if (r < 0) {
-      cerr << "unable to write label for " << devs.front() << ": "
-	   << cpp_strerror(r) << std::endl;
-      exit(EXIT_FAILURE);
+    if (is_multi) {
+      epoch++;
+      label.meta["epoch"] = std::to_string(epoch);
+    }
+    bool wrote_at_least_one = false;
+    for (uint64_t position : valid_positions) {
+      r = BlueStore::write_bdev_label(cct.get(), devs.front(), label, position);
+      if (r < 0) {
+        cerr << "unable to write label for " << devs.front()
+             << " at 0x" << std::hex << position << std::dec
+             << ": " << cpp_strerror(r) << std::endl;
+      } else {
+        wrote_at_least_one = true;
+      }
+    }
+    if (!wrote_at_least_one) {
+        exit(EXIT_FAILURE);
     }
   }
   else if (action == "bluefs-bdev-sizes") {
@@ -849,6 +1065,8 @@ int main(int argc, char **argv)
     delete fs;
   } else if (action == "bluefs-log-dump") {
     log_dump(cct.get(), path, devs);
+  } else if (action == "bluefs-super-dump") {
+    super_dump(cct.get(), path, devs);
   } else if (action == "bluefs-bdev-new-db" || action == "bluefs-bdev-new-wal") {
     map<string, int> cur_devs_map;
     bool need_db = action == "bluefs-bdev-new-db";
@@ -878,17 +1096,17 @@ int main(int argc, char **argv)
 	return {"", false};
       }
       std::error_code ec;
-      fs::path target_path = fs::weakly_canonical(fs::path{dev_target}, ec);
+      fs::path target = fs::weakly_canonical(fs::path{dev_target}, ec);
       if (ec) {
 	cerr << "failed to retrieve absolute path for " << dev_target
 	     << ": " << ec.message()
 	     << std::endl;
 	exit(EXIT_FAILURE);
       }
-      return {target_path.native(),
-              (fs::exists(target_path) &&
-	       fs::is_regular_file(target_path) &&
-	       fs::file_size(target_path) > 0)};
+      return {target.native(),
+              fs::exists(target) &&
+               (fs::is_block_file(target) ||
+	         (fs::is_regular_file(target) && fs::file_size(target) > 0))};
     }();
     // Attach either DB or WAL volume, create if needed
     // check if we need additional size specification
@@ -1028,7 +1246,7 @@ int main(int argc, char **argv)
       }
       return r;
     }
-  } else  if (action == "free-dump" || action == "free-score" || action == "fragmentation") {
+  } else  if (action == "free-dump" || action == "free-score" || action == "free-fragmentation") {
     AdminSocket *admin_socket = g_ceph_context->get_admin_socket();
     ceph_assert(admin_socket);
     std::string action_name = action == "free-dump" ? "dump" :
@@ -1082,7 +1300,28 @@ int main(int argc, char **argv)
       exit(EXIT_FAILURE);
     }
     cout << std::string(out.c_str(), out.length()) << std::endl;
-     bluestore.cold_close();
+    bluestore.cold_close();
+  } else  if (action == "bluefs-files") {
+    AdminSocket* admin_socket = g_ceph_context->get_admin_socket();
+    ceph_assert(admin_socket);
+    validate_path(cct.get(), path, false);
+    BlueStore bluestore(cct.get(), path);
+    int r = bluestore.cold_open();
+    if (r < 0) {
+      cerr << "error from cold_open: " << cpp_strerror(r) << std::endl;
+      exit(EXIT_FAILURE);
+    }
+    ceph::bufferlist in, out;
+    ostringstream err;
+    r = admin_socket->execute_command(
+      { "{\"prefix\": \"bluefs files list\"}" },
+      in, err, &out);
+    if (r != 0) {
+      cerr << "failure querying bluefs stats: " << cpp_strerror(r) << std::endl;
+      exit(EXIT_FAILURE);
+    }
+    cout << std::string(out.c_str(), out.length()) << std::endl;
+    bluestore.cold_close();
   } else if (action == "reshard") {
     auto get_ctrl = [&](size_t& val) {
       if (!resharding_ctrl.empty()) {
@@ -1115,7 +1354,7 @@ int main(int argc, char **argv)
 	exit(EXIT_FAILURE);
       }
     }
-    int r = bluestore.open_db_environment(&db_ptr, true);
+    int r = bluestore.open_db_environment(&db_ptr, false, true);
     if (r < 0) {
       cerr << "error preparing db environment: " << cpp_strerror(r) << std::endl;
       exit(EXIT_FAILURE);
@@ -1133,7 +1372,7 @@ int main(int argc, char **argv)
   } else if (action == "show-sharding") {
     BlueStore bluestore(cct.get(), path);
     KeyValueDB *db_ptr;
-    int r = bluestore.open_db_environment(&db_ptr, false);
+    int r = bluestore.open_db_environment(&db_ptr, false, false);
     if (r < 0) {
       cerr << "error preparing db environment: " << cpp_strerror(r) << std::endl;
       exit(EXIT_FAILURE);
@@ -1149,6 +1388,28 @@ int main(int argc, char **argv)
       exit(EXIT_FAILURE);
     }
     cout << sharding << std::endl;
+  } else if (action == "trim") {
+    BlueStore bluestore(cct.get(), path);
+    int r = bluestore.cold_open();
+    if (r < 0) {
+      cerr << "error from cold_open: " << cpp_strerror(r) << std::endl;
+      exit(EXIT_FAILURE);
+    }
+    for (auto type : bdev_type) {
+      cout << "trimming: " << type << std::endl;
+      ostringstream outss;
+      bluestore.trim_free_space(type, outss);
+      cout << "status: " << outss.str() << std::endl;
+    }
+    bluestore.cold_close();
+  } else if (action == "zap-device") {
+    for(auto& dev : devs) {
+      int r = BlueStore::zap_device(cct.get(), dev);
+      if (r < 0) {
+        cerr << "error from zap: " << cpp_strerror(r) << std::endl;
+        exit(EXIT_FAILURE);
+      }
+    }
   } else {
     cerr << "unrecognized action " << action << std::endl;
     return 1;

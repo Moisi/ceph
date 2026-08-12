@@ -46,35 +46,28 @@ void MetaRequest::dump(Formatter *f) const
   f->dump_unsigned("oldest_client_tid", head.oldest_client_tid);
   f->dump_unsigned("mdsmap_epoch", head.mdsmap_epoch);
   f->dump_unsigned("flags", head.flags);
-  f->dump_unsigned("num_retry", head.num_retry);
-  f->dump_unsigned("num_fwd", head.num_fwd);
+  f->dump_unsigned("num_retry", head.ext_num_retry);
+  f->dump_unsigned("num_fwd", head.ext_num_fwd);
   f->dump_unsigned("num_releases", head.num_releases);
 
   f->dump_int("abort_rc", abort_rc);
+
+  f->dump_unsigned("owner_uid", head.owner_uid);
+  f->dump_unsigned("owner_gid", head.owner_gid);
 }
 
-MetaRequest::~MetaRequest()
-{
-  if (_dentry)
-    _dentry->put();
-  if (_old_dentry)
-    _old_dentry->put();
-}
-
-void MetaRequest::set_dentry(Dentry *d) {
-  ceph_assert(_dentry == NULL);
-  _dentry = d;
-  _dentry->get();
+void MetaRequest::set_dentry(DentryRef dn) {
+  ceph_assert(_dentry.get() == NULL);
+  _dentry = std::move(dn);
 }
 Dentry *MetaRequest::dentry() {
-  return _dentry;
+  return _dentry.get();
 }
 
-void MetaRequest::set_old_dentry(Dentry *d) {
-  ceph_assert(_old_dentry == NULL);
-  _old_dentry = d;
-  _old_dentry->get();
+void MetaRequest::set_old_dentry(DentryRef dn) {
+  ceph_assert(_old_dentry.get() == NULL);
+  _old_dentry = std::move(dn);
 }
 Dentry *MetaRequest::old_dentry() {
-  return _old_dentry;
+  return _old_dentry.get();
 }

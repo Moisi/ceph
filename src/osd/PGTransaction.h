@@ -17,10 +17,14 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <variant>
 
 #include "common/hobject.h"
-#include "osd/osd_types.h"
+#ifndef WITH_CRIMSON
 #include "osd/osd_internal_types.h"
+#else
+#include "crimson/osd/object_context.h"
+#endif
 #include "common/interval_map.h"
 #include "common/inline_variant.h"
 
@@ -52,7 +56,7 @@ public:
 	hobject_t source; // must be temp object
       };
     };
-    using InitType = boost::variant<
+    using InitType = std::variant<
       Init::None,
       Init::Create,
       Init::Clone,
@@ -88,16 +92,16 @@ public:
       return delete_first;
     }
     bool is_delete() const {
-      return boost::get<Init::None>(&init_type) != nullptr && delete_first;
+      return std::holds_alternative<Init::None>(init_type) && delete_first;
     }
     bool is_none() const {
-      return boost::get<Init::None>(&init_type) != nullptr && !delete_first;
+      return std::holds_alternative<Init::None>(init_type) && !delete_first;
     }
     bool is_fresh_object() const {
-      return boost::get<Init::None>(&init_type) == nullptr;
+      return !std::holds_alternative<Init::None>(init_type);
     }
     bool is_rename() const {
-      return boost::get<Init::Rename>(&init_type) != nullptr;
+      return std::holds_alternative<Init::Rename>(init_type);
     }
     bool has_source(hobject_t *source = nullptr) const {
       return match(
@@ -160,7 +164,7 @@ public:
 	uint64_t len;
       };
     };
-    using BufferUpdateType = boost::variant<
+    using BufferUpdateType = std::variant<
       BufferUpdate::Write,
       BufferUpdate::Zero,
       BufferUpdate::CloneRange>;
@@ -205,12 +209,11 @@ public:
 	return match(
 	  left,
 	  [&](const BufferUpdate::Write &w) -> bool {
-	    auto r = boost::get<BufferUpdate::Write>(&right);
+	    auto r = std::get_if<BufferUpdate::Write>(&right);
 	    return r != nullptr && (w.fadvise_flags == r->fadvise_flags);
 	  },
 	  [&](const BufferUpdate::Zero &) -> bool {
-	    auto r = boost::get<BufferUpdate::Zero>(&right);
-	    return r != nullptr;
+	    return std::holds_alternative<BufferUpdate::Zero>(right);
 	  },
 	  [&](const BufferUpdate::CloneRange &c) -> bool {
 	    return false;
@@ -222,15 +225,15 @@ public:
 	return match(
 	  left,
 	  [&](const BufferUpdate::Write &w) -> BufferUpdateType {
-	    auto r = boost::get<BufferUpdate::Write>(&right);
+	    auto r = std::get_if<BufferUpdate::Write>(&right);
 	    ceph_assert(r && w.fadvise_flags == r->fadvise_flags);
 	    ceph::buffer::list bl = w.buffer;
 	    bl.append(r->buffer);
 	    return BufferUpdate::Write{bl, w.fadvise_flags};
 	  },
 	  [&](const BufferUpdate::Zero &z) -> BufferUpdateType {
-	    auto r = boost::get<BufferUpdate::Zero>(&right);
-	    ceph_assert(r);
+	    auto r = std::get_if<BufferUpdate::Zero>(&right);
+	    ceph_assert(r != nullptr);
 	    return BufferUpdate::Zero{z.len + r->len};
 	  },
 	  [&](const BufferUpdate::CloneRange &c) -> BufferUpdateType {

@@ -25,12 +25,17 @@ class SharedLRU {
   SimpleLRU<K, shared_ptr_t, false> cache;
   std::map<K, std::pair<weak_ptr_t, V*>> weak_refs;
 
+  // Once all of the shared pointers are destoryed,
+  // erase the tracked object from the weak_ref map
+  // before actually destorying it
   struct Deleter {
-    SharedLRU<K,V>* cache;
+    SharedLRU<K,V>* shared_lru_ptr;
     const K key;
-    void operator()(V* ptr) {
-      cache->_erase_weak(key);
-      delete ptr;
+    void operator()(V* value_ptr) {
+      if (shared_lru_ptr) {
+        shared_lru_ptr->_erase_weak(key);
+      }
+      delete value_ptr;
     }
   };
   void _erase_weak(const K& key) {
@@ -42,9 +47,19 @@ public:
   {}
   ~SharedLRU() {
     cache.clear();
+
     // initially, we were assuming that no pointer obtained from SharedLRU
     // can outlive the lru itself. However, since going with the interruption
     // concept for handling shutdowns, this is no longer valid.
+    // Moreover, before clearing weak_refs, invalidate each deleter
+    // cache pointer as this SharedLRU is being destoryed.
+    for (const auto& [key, value] : weak_refs) {
+      shared_ptr_t val;
+      val = value.first.lock();
+      auto this_deleter = get_deleter<Deleter>(val);
+      this_deleter->shared_lru_ptr = nullptr;
+    }
+
     weak_refs.clear();
   }
   /**
@@ -83,6 +98,7 @@ public:
     cache.clear();
   }
   shared_ptr_t find(const K& key);
+  K cached_key_lower_bound();
   // return the last element that is not greater than key
   shared_ptr_t lower_bound(const K& key);
   // return the first element that is greater than key
@@ -144,6 +160,15 @@ SharedLRU<K,V>::find(const K& key)
     cache.insert(key, val);
   }
   return val;
+}
+
+template<class K, class V>
+K SharedLRU<K,V>::cached_key_lower_bound()
+{
+  if (weak_refs.empty()) {
+    return {};
+  }
+  return weak_refs.begin()->first;
 }
 
 template<class K, class V>

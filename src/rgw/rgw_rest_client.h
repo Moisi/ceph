@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "include/expected.hpp"
 #include "rgw_http_client.h"
 
 class RGWGetDataCB;
@@ -24,6 +25,7 @@ protected:
   bufferlist response;
 
   virtual int handle_header(const std::string& name, const std::string& val);
+  virtual int handle_headers(const std::map<std::string, std::string>& headers, int http_status) { return 0; }
   void get_params_str(std::map<std::string, std::string>& extra_args, std::string& dest);
 
 public:
@@ -65,7 +67,9 @@ public:
                        param_vec_t *_headers, param_vec_t *_params,
                        std::optional<std::string> _api_name) : RGWHTTPSimpleRequest(_cct, _method, _url, _headers, _params), api_name(_api_name) {}
 
-  int forward_request(const DoutPrefixProvider *dpp, const RGWAccessKey& key, req_info& info, size_t max_response, bufferlist *inbl, bufferlist *outbl, optional_yield y, std::string service="");
+  // return the http status of the response or an error code from the transport
+  auto forward_request(const DoutPrefixProvider *dpp, const RGWAccessKey& key, const req_info& info, size_t max_response, bufferlist *inbl, bufferlist *outbl, optional_yield y, std::string service="")
+    -> tl::expected<int, int>;
 };
 
 class RGWWriteDrainCB {
@@ -94,7 +98,7 @@ public:
   void set_extra_headers(const std::map<std::string, std::string>& extra_headers);
   int set_obj_attrs(const DoutPrefixProvider *dpp, std::map<std::string, bufferlist>& rgw_attrs);
   void set_http_attrs(const std::map<std::string, std::string>& http_attrs);
-  void set_policy(RGWAccessControlPolicy& policy);
+  void set_policy(const RGWAccessControlPolicy& policy);
   int sign(const DoutPrefixProvider *dpp, RGWAccessKey& key, const bufferlist *opt_content);
 
   const std::string& get_url() { return url; }
@@ -123,6 +127,7 @@ protected:
   bufferlist outbl;
 
   int handle_header(const std::string& name, const std::string& val) override;
+  int handle_headers(const std::map<std::string, std::string>& headers, int http_status) override;
 public:
   int send_data(void *ptr, size_t len, bool *pause) override;
   int receive_data(void *ptr, size_t len, bool *pause) override;
@@ -134,6 +139,7 @@ public:
       ReceiveCB() = default;
       virtual ~ReceiveCB() = default;
       virtual int handle_data(bufferlist& bl, bool *pause = nullptr) = 0;
+      virtual int handle_headers(const std::map<std::string, std::string>& headers, int http_status) { return 0; }
       virtual void set_extra_data_len(uint64_t len) {
         extra_data_len = len;
       }
@@ -168,7 +174,7 @@ public:
 
   virtual int send(RGWHTTPManager *mgr);
 
-  int complete_request(optional_yield y,
+  int complete_request(const DoutPrefixProvider* dpp, optional_yield y,
                        std::string *etag = nullptr,
                        real_time *mtime = nullptr,
                        uint64_t *psize = nullptr,
@@ -245,13 +251,13 @@ public:
                 out_cb(NULL), new_info(cct, &new_env), headers_gen(_cct, &new_env, &new_info) {}
   ~RGWRESTStreamS3PutObj() override;
 
-  void send_init(rgw::sal::Object* obj);
+  void send_init(const rgw_obj& obj);
   void send_ready(const DoutPrefixProvider *dpp, RGWAccessKey& key, std::map<std::string, bufferlist>& rgw_attrs);
   void send_ready(const DoutPrefixProvider *dpp, RGWAccessKey& key, const std::map<std::string, std::string>& http_attrs,
                   RGWAccessControlPolicy& policy);
   void send_ready(const DoutPrefixProvider *dpp, RGWAccessKey& key);
 
-  void put_obj_init(const DoutPrefixProvider *dpp, RGWAccessKey& key, rgw::sal::Object* obj, std::map<std::string, bufferlist>& attrs);
+  void put_obj_init(const DoutPrefixProvider *dpp, RGWAccessKey& key, const rgw_obj& obj, std::map<std::string, bufferlist>& attrs);
 
   RGWGetDataCB *get_out_cb() { return out_cb; }
 };

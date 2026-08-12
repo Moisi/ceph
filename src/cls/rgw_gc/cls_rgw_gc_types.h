@@ -30,5 +30,24 @@ struct cls_rgw_gc_urgent_data
     decode(num_xattr_urgent_entries, bl);
     DECODE_FINISH(bl);
   }
+  void dump(ceph::Formatter *f) const {
+    f->open_object_section("urgent_data_map");
+    for (auto& i : urgent_data_map) {
+      f->dump_string(i.first.c_str(), i.first);
+    }
+    f->close_section();
+    f->dump_unsigned("num_urgent_data_entries", num_urgent_data_entries);
+    f->dump_unsigned("num_head_urgent_entries", num_head_urgent_entries);
+    f->dump_unsigned("num_xattr_urgent_entries", num_xattr_urgent_entries);
+  }
+  static std::list<cls_rgw_gc_urgent_data> generate_test_instances() {
+    std::list<cls_rgw_gc_urgent_data> o;
+    o.emplace_back();
+    o.emplace_back();
+    o.back().num_urgent_data_entries = 1024;
+    o.back().num_head_urgent_entries = 512;
+    o.back().num_xattr_urgent_entries = 512;
+    return o;
+  }
 };
 WRITE_CLASS_ENCODER(cls_rgw_gc_urgent_data)

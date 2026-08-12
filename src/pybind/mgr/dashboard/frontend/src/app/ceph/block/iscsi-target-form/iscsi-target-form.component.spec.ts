@@ -6,7 +6,6 @@ import { RouterTestingModule } from '@angular/router/testing';
 
 import { ToastrModule } from 'ngx-toastr';
 
-import { LoadingPanelComponent } from '~/app/shared/components/loading-panel/loading-panel.component';
 import { SelectOption } from '~/app/shared/components/select/select-option.model';
 import { CdFormGroup } from '~/app/shared/forms/cd-form-group';
 import { SharedModule } from '~/app/shared/shared.module';
@@ -137,25 +136,22 @@ describe('IscsiTargetFormComponent', () => {
     }
   ];
 
-  configureTestBed(
-    {
-      declarations: [IscsiTargetFormComponent],
-      imports: [
-        SharedModule,
-        ReactiveFormsModule,
-        HttpClientTestingModule,
-        RouterTestingModule,
-        ToastrModule.forRoot()
-      ],
-      providers: [
-        {
-          provide: ActivatedRoute,
-          useValue: new ActivatedRouteStub({ target_iqn: undefined })
-        }
-      ]
-    },
-    [LoadingPanelComponent]
-  );
+  configureTestBed({
+    declarations: [IscsiTargetFormComponent],
+    imports: [
+      SharedModule,
+      ReactiveFormsModule,
+      HttpClientTestingModule,
+      RouterTestingModule,
+      ToastrModule.forRoot()
+    ],
+    providers: [
+      {
+        provide: ActivatedRoute,
+        useValue: new ActivatedRouteStub({ target_iqn: undefined })
+      }
+    ]
+  });
 
   beforeEach(() => {
     fixture = TestBed.createComponent(IscsiTargetFormComponent);
@@ -167,7 +163,7 @@ describe('IscsiTargetFormComponent', () => {
     httpTesting.expectOne('ui-api/iscsi/settings').flush(SETTINGS);
     httpTesting.expectOne('ui-api/iscsi/portals').flush(PORTALS);
     httpTesting.expectOne('ui-api/iscsi/version').flush(VERSION);
-    httpTesting.expectOne('api/block/image?offset=0&limit=-1&search=&sort=+name').flush(RBD_LIST);
+    httpTesting.expectOne('api/block/image?offset=0&limit=-1&search=&sort=%2Bname').flush(RBD_LIST);
     httpTesting.expectOne('api/iscsi/target').flush(LIST_TARGET);
     httpTesting.verify();
   });

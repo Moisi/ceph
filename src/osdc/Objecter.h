@@ -15,21 +15,25 @@
 #ifndef CEPH_OBJECTER_H
 #define CEPH_OBJECTER_H
 
-#include <condition_variable>
 #include <list>
 #include <map>
 #include <mutex>
 #include <memory>
-#include <sstream>
 #include <string>
 #include <string_view>
 #include <type_traits>
 #include <variant>
 
 #include <boost/container/small_vector.hpp>
-#include <boost/asio.hpp>
-
-#include <fmt/format.h>
+#include <boost/asio/bind_executor.hpp>
+#include <boost/asio/any_completion_handler.hpp>
+#include <boost/asio/append.hpp>
+#include <boost/asio/async_result.hpp>
+#include <boost/asio/consign.hpp>
+#include <boost/asio/defer.hpp>
+#include <boost/asio/io_context.hpp>
+#include <boost/asio/io_context_strand.hpp>
+#include <boost/asio/post.hpp>
 
 #include "include/buffer.h"
 #include "include/ceph_assert.h"
@@ -42,14 +46,16 @@
 #include "include/neorados/RADOS_Decodable.hpp"
 
 #include "common/admin_socket.h"
-#include "common/async/completion.h"
 #include "common/ceph_time.h"
 #include "common/ceph_mutex.h"
 #include "common/ceph_timer.h"
 #include "common/config_obs.h"
 #include "common/shunique_lock.h"
+#include "common/snap_types.h" // for class SnapContext
 #include "common/zipkin_trace.h"
+#include "common/tracer.h"
 #include "common/Throttle.h"
+#include "crush/crush.h" // for CRUSH_ITEM_NONE
 
 #include "mon/MonClient.h"
 
@@ -57,6 +63,7 @@
 #include "msg/Dispatcher.h"
 
 #include "osd/OSDMap.h"
+#include "osd/error_code.h"
 
 class Context;
 class Messenger;
@@ -427,19 +434,41 @@ struct ObjectOperation {
   struct CB_ObjectOperation_cmpext {
     int* prval = nullptr;
     boost::system::error_code* ec = nullptr;
-    std::size_t* s = nullptr;
+    uint64_t* mismatch_offset = nullptr;
     explicit CB_ObjectOperation_cmpext(int *prval)
       : prval(prval) {}
-    CB_ObjectOperation_cmpext(boost::system::error_code* ec, std::size_t* s)
-      : ec(ec), s(s) {}
+    CB_ObjectOperation_cmpext(boost::system::error_code* ec,
+			      uint64_t* mismatch_offset)
+      : ec(ec), mismatch_offset(mismatch_offset) {}
 
-    void operator()(boost::system::error_code ec, int r, const ceph::buffer::list&) {
+    void operator()(boost::system::error_code ec, int r,
+		    const ceph::buffer::list&) {
       if (prval)
         *prval = r;
-      if (this->ec)
-	*this->ec = ec;
-      if (s)
-	*s = static_cast<std::size_t>(-(MAX_ERRNO - r));
+
+      if (r <= -MAX_ERRNO) {
+	if (this->ec) {
+	  *this->ec = make_error_code(osd_errc::cmpext_mismatch);
+	}
+	if (mismatch_offset) {
+	  *mismatch_offset = -MAX_ERRNO - r;
+	}
+	throw boost::system::system_error(osd_errc::cmpext_mismatch);
+      } else if (r < 0) {
+	if (this->ec) {
+	  *this->ec = ec;
+	}
+	if (mismatch_offset) {
+	  *mismatch_offset = -1;
+	}
+      } else {
+	if (this->ec) {
+	  this->ec->clear();
+	}
+	if (mismatch_offset) {
+	  *mismatch_offset = -1;
+	}
+      }
     }
   };
 
@@ -450,9 +479,9 @@ struct ObjectOperation {
   }
 
   void cmpext(uint64_t off, ceph::buffer::list&& cmp_bl, boost::system::error_code* ec,
-	      std::size_t* s) {
+	      uint64_t* mismatch_offset) {
     add_data(CEPH_OSD_OP_CMPEXT, off, cmp_bl.length(), cmp_bl);
-    set_handler(CB_ObjectOperation_cmpext(ec, s));
+    set_handler(CB_ObjectOperation_cmpext(ec, mismatch_offset));
     out_ec.back() = ec;
   }
 
@@ -549,13 +578,25 @@ struct ObjectOperation {
   void write(uint64_t off, ceph::buffer::list& bl) {
     write(off, bl, 0, 0);
   }
+  void write(uint64_t off, ceph::buffer::list&& bl) {
+    write(off, bl, 0, 0);
+  }
   void write_full(ceph::buffer::list& bl) {
+    add_data(CEPH_OSD_OP_WRITEFULL, 0, bl.length(), bl);
+  }
+  void write_full(ceph::buffer::list&& bl) {
     add_data(CEPH_OSD_OP_WRITEFULL, 0, bl.length(), bl);
   }
   void writesame(uint64_t off, uint64_t write_len, ceph::buffer::list& bl) {
     add_writesame(CEPH_OSD_OP_WRITESAME, off, write_len, bl);
   }
+  void writesame(uint64_t off, uint64_t write_len, ceph::buffer::list&& bl) {
+    add_writesame(CEPH_OSD_OP_WRITESAME, off, write_len, bl);
+  }
   void append(ceph::buffer::list& bl) {
+    add_data(CEPH_OSD_OP_APPEND, 0, bl.length(), bl);
+  }
+  void append(ceph::buffer::list&& bl) {
     add_data(CEPH_OSD_OP_APPEND, 0, bl.length(), bl);
   }
   void zero(uint64_t off, uint64_t len) {
@@ -593,6 +634,23 @@ struct ObjectOperation {
     out_bl[p] = pbl;
     out_rval[p] = prval;
     set_handler(ctx);
+  }
+
+  void checksum(uint8_t type, ceph::buffer::list&& init_value,
+		uint64_t off, uint64_t len, size_t chunk_size,
+		fu2::unique_function<void(boost::system::error_code, int,
+					  const ceph::buffer::list&) &&> f,
+		boost::system::error_code* ec) {
+    OSDOp& osd_op = add_op(CEPH_OSD_OP_CHECKSUM);
+    osd_op.op.checksum.offset = off;
+    osd_op.op.checksum.length = len;
+    osd_op.op.checksum.type = type;
+    osd_op.op.checksum.chunk_size = chunk_size;
+    osd_op.indata.append(std::move(init_value));
+
+    unsigned p = ops.size() - 1;
+    out_ec[p] = ec;
+    set_handler(std::move(f));
   }
 
   // object attrs
@@ -1016,18 +1074,18 @@ struct ObjectOperation {
     }
   }
 
-  void omap_cmp(const boost::container::flat_map<
-		std::string, std::pair<ceph::buffer::list, int>>& assertions,
-		boost::system::error_code *ec) {
+  void omap_cmp(ceph::buffer::list&& assertions,
+		int *prval) {
+    using ceph::encode;
     OSDOp &op = add_op(CEPH_OSD_OP_OMAP_CMP);
-    ceph::buffer::list bl;
-    encode(assertions, bl);
     op.op.extent.offset = 0;
-    op.op.extent.length = bl.length();
-    op.indata.claim_append(bl);
-    out_ec.back() = ec;
+    op.op.extent.length = assertions.length();
+    op.indata.claim_append(assertions);
+    if (prval) {
+      unsigned p = ops.size() - 1;
+      out_rval[p] = prval;
+    }
   }
-
   struct C_ObjectOperation_copyget : public Context {
     ceph::buffer::list bl;
     object_copy_cursor_t *cursor;
@@ -1310,7 +1368,11 @@ struct ObjectOperation {
     add_data(CEPH_OSD_OP_OMAPSETVALS, 0, bl.length(), bl);
   }
 
-  void omap_set_header(ceph::buffer::list &bl) {
+  void omap_set_header(ceph::buffer::list& bl) {
+    add_data(CEPH_OSD_OP_OMAPSETHEADER, 0, bl.length(), bl);
+  }
+
+  void omap_set_header(ceph::buffer::list&& bl) {
     add_data(CEPH_OSD_OP_OMAPSETHEADER, 0, bl.length(), bl);
   }
 
@@ -1626,10 +1688,10 @@ class Objecter : public md_config_obs_t, public Dispatcher {
   using MOSDOp = _mosdop::MOSDOp<osdc_opvec>;
 public:
   using OpSignature = void(boost::system::error_code);
-  using OpCompletion = ceph::async::Completion<OpSignature>;
+  using OpCompletion = boost::asio::any_completion_handler<OpSignature>;
 
   // config observer bits
-  const char** get_tracked_conf_keys() const override;
+  std::vector<std::string> get_tracked_keys() const noexcept override;
   void handle_conf_change(const ConfigProxy& conf,
                           const std::set <std::string> &changed) override;
 
@@ -1639,7 +1701,8 @@ public:
   boost::asio::io_context& service;
   // The guaranteed sequenced, one-at-a-time execution and apparently
   // people sometimes depend on this.
-  boost::asio::io_context::strand finish_strand{service};
+  boost::asio::strand<boost::asio::io_context::executor_type>
+      finish_strand{service.get_executor()};
   ZTracer::Endpoint trace_endpoint{"0.0.0.0", 0, "Objecter"};
 private:
   std::unique_ptr<OSDMap> osdmap{std::make_unique<OSDMap>()};
@@ -1651,6 +1714,7 @@ public:
 
 private:
   std::atomic<uint64_t> last_tid{0};
+  std::atomic<uint64_t> last_subsystem{0};
   std::atomic<unsigned> inflight_ops{0};
   std::atomic<int> client_inc{-1};
   uint64_t max_linger_id{0};
@@ -1658,6 +1722,8 @@ private:
   std::atomic<int> global_op_flags{0}; // flags which are applied to each IO op
   bool keep_balanced_budget = false;
   bool honor_pool_full = true;
+
+  std::atomic<int> extra_read_flags{0};
 
   // If this is true, accumulate a set of blocklisted entities
   // to be drained by consume_blocklist_events.
@@ -1731,6 +1797,11 @@ public:
   void maybe_request_map();
 
   void enable_blocklist_events();
+
+  uint64_t unique_subsystem_id() {
+    return ++last_subsystem;
+  }
+
 private:
 
   void _maybe_request_map();
@@ -1792,6 +1863,7 @@ public:
     int min_size = -1; ///< the min size of the pool when were were last mapped
     bool sort_bitwise = false; ///< whether the hobject_t sort order is bitwise
     bool recovery_deletes = false; ///< whether the deletes are performed during recovery instead of peering
+    bool allows_ecoptimizations = false; ///< whether EC plugin optimizations are enabled.
     uint32_t peering_crush_bucket_count = 0;
     uint32_t peering_crush_bucket_target = 0;
     uint32_t peering_crush_bucket_barrier = 0;
@@ -1842,53 +1914,65 @@ public:
     void dump(ceph::Formatter *f) const;
   };
 
-  std::unique_ptr<ceph::async::Completion<void(boost::system::error_code)>>
+  boost::asio::any_completion_handler<void(boost::system::error_code)>
   OpContextVert(Context* c) {
-    if (c)
-      return ceph::async::Completion<void(boost::system::error_code)>::create(
+    if (c) {
+      auto e = boost::asio::prefer(
 	service.get_executor(),
+	boost::asio::execution::outstanding_work.tracked);
+
+      return boost::asio::bind_executor(
+	std::move(e),
 	[c = std::unique_ptr<Context>(c)]
 	(boost::system::error_code e) mutable {
 	  c.release()->complete(e);
 	});
+    }
     else
       return nullptr;
   }
 
   template<typename T>
-  std::unique_ptr<ceph::async::Completion<void(boost::system::error_code, T)>>
+  boost::asio::any_completion_handler<void(boost::system::error_code, T)>
   OpContextVert(Context* c, T* p) {
 
-    if (c || p)
+    if (c || p) {
+      auto e = boost::asio::prefer(
+	service.get_executor(),
+	boost::asio::execution::outstanding_work.tracked);
       return
-	ceph::async::Completion<void(boost::system::error_code, T)>::create(
-	  service.get_executor(),
+	boost::asio::bind_executor(
+	  e,
 	  [c = std::unique_ptr<Context>(c), p]
 	  (boost::system::error_code e, T r) mutable {
 	      if (p)
 		*p = std::move(r);
 	      if (c)
 		c.release()->complete(ceph::from_error_code(e));
-	    });
-    else
+	  });
+    } else {
       return nullptr;
+    }
   }
 
   template<typename T>
-  std::unique_ptr<ceph::async::Completion<void(boost::system::error_code, T)>>
+  boost::asio::any_completion_handler<void(boost::system::error_code, T)>
   OpContextVert(Context* c, T& p) {
-    if (c)
-      return ceph::async::Completion<
-	void(boost::system::error_code, T)>::create(
-	  service.get_executor(),
-	  [c = std::unique_ptr<Context>(c), &p]
-	  (boost::system::error_code e, T r) mutable {
-	    p = std::move(r);
-	    if (c)
-	      c.release()->complete(ceph::from_error_code(e));
-	  });
-    else
+    if (c) {
+      auto e = boost::asio::prefer(
+	service.get_executor(),
+	boost::asio::execution::outstanding_work.tracked);
+      return boost::asio::bind_executor(
+	e,
+	[c = std::unique_ptr<Context>(c), &p]
+	(boost::system::error_code e, T r) mutable {
+	  p = std::move(r);
+	  if (c)
+	    c.release()->complete(ceph::from_error_code(e));
+	});
+    } else {
       return nullptr;
+    }
   }
 
   struct Op : public RefCountedObject {
@@ -1918,7 +2002,7 @@ public:
 
     int priority = 0;
     using OpSig = void(boost::system::error_code);
-    using OpComp = ceph::async::Completion<OpSig>;
+    using OpComp = boost::asio::any_completion_handler<OpSig>;
     // Due to an irregularity of cmpxattr, we actualy need the 'int'
     // value for onfinish for legacy librados users. As such just
     // preserve the Context* in this one case. That way we can have
@@ -1928,7 +2012,7 @@ public:
     //
     // Add a function for the linger case, where we want better
     // semantics than Context, but still need to be under the completion_lock.
-    std::variant<std::unique_ptr<OpComp>, fu2::unique_function<OpSig>,
+    std::variant<OpComp, fu2::unique_function<OpSig>,
 		 Context*> onfinish;
     uint64_t ontimeout = 0;
 
@@ -1957,6 +2041,8 @@ public:
 
     osd_reqid_t reqid; // explicitly setting reqid
     ZTracer::Trace trace;
+    std::uint64_t subsystem = 0;
+    const jspan_context* otel_trace = nullptr;
 
     static bool has_completion(decltype(onfinish)& f) {
       return std::visit([](auto&& arg) { return bool(arg);}, f);
@@ -1966,8 +2052,8 @@ public:
     }
 
     static void complete(decltype(onfinish)&& f, boost::system::error_code ec,
-			 int r) {
-      std::visit([ec, r](auto&& arg) {
+			 int r, boost::asio::io_context::executor_type e) {
+      std::visit([ec, r, e](auto&& arg) {
 		   if constexpr (std::is_same_v<std::decay_t<decltype(arg)>,
 				 Context*>) {
 		     arg->complete(r);
@@ -1975,18 +2061,19 @@ public:
 			      fu2::unique_function<OpSig>>) {
 		     std::move(arg)(ec);
                    } else {
-		     arg->defer(std::move(arg), ec);
+		     boost::asio::defer(e,
+					boost::asio::append(std::move(arg), ec));
 		   }
 		 }, std::move(f));
     }
-    void complete(boost::system::error_code ec, int r) {
-      complete(std::move(onfinish), ec, r);
+    void complete(boost::system::error_code ec, int r,
+		  boost::asio::io_context::executor_type e) {
+      complete(std::move(onfinish), ec, r, e);
     }
 
     Op(const object_t& o, const object_locator_t& ol,  osdc_opvec&& _ops,
-       int f, std::unique_ptr<OpComp>&& fin,
-       version_t *ov, int *offset = nullptr,
-       ZTracer::Trace *parent_trace = nullptr) :
+       int f, OpComp fin, version_t *ov, int *offset = nullptr,
+       ZTracer::Trace *parent_trace = nullptr, uint64_t subsystem = 0) :
       target(o, ol, f),
       ops(std::move(_ops)),
       out_bl(ops.size(), nullptr),
@@ -1995,7 +2082,7 @@ public:
       out_ec(ops.size(), nullptr),
       onfinish(std::move(fin)),
       objver(ov),
-      data_offset(offset) {
+      data_offset(offset), subsystem(subsystem) {
       if (target.base_oloc.key == o)
 	target.base_oloc.key.clear();
       if (parent_trace && parent_trace->valid()) {
@@ -2006,7 +2093,8 @@ public:
 
     Op(const object_t& o, const object_locator_t& ol, osdc_opvec&& _ops,
        int f, Context* fin, version_t *ov, int *offset = nullptr,
-       ZTracer::Trace *parent_trace = nullptr) :
+       ZTracer::Trace *parent_trace = nullptr, const jspan_context *otel_trace = nullptr,
+       uint64_t subsystem = 0) :
       target(o, ol, f),
       ops(std::move(_ops)),
       out_bl(ops.size(), nullptr),
@@ -2015,27 +2103,9 @@ public:
       out_ec(ops.size(), nullptr),
       onfinish(fin),
       objver(ov),
-      data_offset(offset) {
-      if (target.base_oloc.key == o)
-	target.base_oloc.key.clear();
-      if (parent_trace && parent_trace->valid()) {
-        trace.init("op", nullptr, parent_trace);
-        trace.event("start");
-      }
-    }
-
-    Op(const object_t& o, const object_locator_t& ol, osdc_opvec&&  _ops,
-       int f, fu2::unique_function<OpSig>&& fin, version_t *ov, int *offset = nullptr,
-       ZTracer::Trace *parent_trace = nullptr) :
-      target(o, ol, f),
-      ops(std::move(_ops)),
-      out_bl(ops.size(), nullptr),
-      out_handler(ops.size()),
-      out_rval(ops.size(), nullptr),
-      out_ec(ops.size(), nullptr),
-      onfinish(std::move(fin)),
-      objver(ov),
-      data_offset(offset) {
+      data_offset(offset),
+      subsystem(subsystem),
+      otel_trace(otel_trace) {
       if (target.base_oloc.key == o)
 	target.base_oloc.key.clear();
       if (parent_trace && parent_trace->valid()) {
@@ -2167,8 +2237,8 @@ public:
     using OpSig = void(boost::system::error_code,
 		       boost::container::flat_map<std::string, pool_stat_t>,
 		       bool);
-    using OpComp = ceph::async::Completion<OpSig>;
-    std::unique_ptr<OpComp> onfinish;
+    using OpComp = boost::asio::any_completion_handler<OpSig>;
+    OpComp onfinish;
     std::uint64_t ontimeout;
     ceph::coarse_mono_time last_submit;
   };
@@ -2178,9 +2248,9 @@ public:
     std::optional<int64_t> data_pool;
     using OpSig = void(boost::system::error_code,
 		       const struct ceph_statfs);
-    using OpComp = ceph::async::Completion<OpSig>;
+    using OpComp = boost::asio::any_completion_handler<OpSig>;
 
-    std::unique_ptr<OpComp> onfinish;
+    OpComp onfinish;
     uint64_t ontimeout;
 
     ceph::coarse_mono_time last_submit;
@@ -2191,8 +2261,8 @@ public:
     int64_t pool = 0;
     std::string name;
     using OpSig = void(boost::system::error_code, ceph::buffer::list);
-    using OpComp = ceph::async::Completion<OpSig>;
-    std::unique_ptr<OpComp> onfinish;
+    using OpComp = boost::asio::any_completion_handler<OpSig>;
+    OpComp onfinish;
     uint64_t ontimeout = 0;
     int pool_op = 0;
     int16_t crush_rule = 0;
@@ -2221,8 +2291,8 @@ public:
 
     using OpSig = void(boost::system::error_code, std::string,
 		       ceph::buffer::list);
-    using OpComp = ceph::async::Completion<OpSig>;
-    std::unique_ptr<OpComp> onfinish;
+    using OpComp = boost::asio::any_completion_handler<OpSig>;
+    OpComp onfinish;
 
     uint64_t ontimeout = 0;
     ceph::coarse_mono_time last_submit;
@@ -2288,9 +2358,9 @@ public:
     bool registered{false};
     bool canceled{false};
     using OpSig = void(boost::system::error_code, ceph::buffer::list);
-    using OpComp = ceph::async::Completion<OpSig>;
-    std::unique_ptr<OpComp> on_reg_commit;
-    std::unique_ptr<OpComp> on_notify_finish;
+    using OpComp = boost::asio::any_completion_handler<OpSig>;
+    OpComp on_reg_commit;
+    OpComp on_notify_finish;
     uint64_t notify_id{0};
 
     fu2::unique_function<void(boost::system::error_code,
@@ -2298,6 +2368,11 @@ public:
 			      uint64_t cookie,
 			      uint64_t notifier_id,
 			      ceph::buffer::list&& bl)> handle;
+    // I am sorely tempted to replace function2 with cxx_function, as
+    // cxx_function has the `target` method from `std::function` and I
+    // keep having to do annoying circumlocutions like this one to be
+    // able to access function object data with function2.
+    ceph::unique_any user_data;
     OSDSession *session{nullptr};
 
     int ctx_budget{-1};
@@ -2431,7 +2506,7 @@ public:
 
   std::map<uint64_t, LingerOp*> linger_ops;
   // we use this just to confirm a cookie is valid before dereferencing the ptr
-  std::set<LingerOp*> linger_ops_set;
+  std::unordered_set<LingerOp*> linger_ops_set;
 
   std::map<ceph_tid_t,PoolStatOp*> poolstat_ops;
   std::map<ceph_tid_t,StatfsOp*> statfs_ops;
@@ -2448,11 +2523,14 @@ public:
   std::map<ceph_tid_t, CommandOp*> check_latest_map_commands;
 
   std::map<epoch_t,
-	   std::vector<std::pair<std::unique_ptr<OpCompletion>,
+	   std::vector<std::pair<OpCompletion,
 				 boost::system::error_code>>> waiting_for_map;
 
   ceph::timespan mon_timeout;
   ceph::timespan osd_timeout;
+
+  // last time osdmap was requested
+  ceph::coarse_mono_time last_osdmap_request_time;
 
   MOSDOp *_prepare_osd_op(Op *op);
   void _send_op(Op *op);
@@ -2513,11 +2591,21 @@ public:
   friend class CB_Objecter_GetVersion;
   friend class CB_DoWatchError;
 public:
+
+  bool is_valid_watch(LingerOp* op) {
+    std::shared_lock l(rwlock);
+    return linger_ops_set.contains(op);
+  }
+
   template<typename CT>
   auto linger_callback_flush(CT&& ct) {
-    boost::asio::async_completion<CT, void(void)> init(ct);
-    boost::asio::defer(finish_strand, std::move(init.completion_handler));
-    return init.result.get();
+    auto consigned = boost::asio::consign(
+      std::forward<CT>(ct), boost::asio::make_work_guard(
+	service.get_executor()));
+    return boost::asio::async_initiate<decltype(consigned), void()>(
+      [this](auto handler) {
+	boost::asio::defer(finish_strand, std::move(handler));
+      }, consigned);
   }
 
 private:
@@ -2605,7 +2693,7 @@ private:
   // here or you will have great woe and misery.
 
   template<typename Callback, typename...Args>
-  decltype(auto) with_osdmap(Callback&& cb, Args&&... args) {
+  decltype(auto) with_osdmap(Callback&& cb, Args&&... args) const {
     std::shared_lock l(rwlock);
     return std::forward<Callback>(cb)(*osdmap, std::forward<Args>(args)...);
   }
@@ -2641,7 +2729,8 @@ private:
 
   // messages
  public:
-  bool ms_dispatch(Message *m) override;
+  Dispatcher::dispatch_result_t ms_dispatch2(const MessageRef &m) override;
+
   bool ms_can_fast_dispatch_any() const override {
     return true;
   }
@@ -2654,10 +2743,8 @@ private:
       return false;
     }
   }
-  void ms_fast_dispatch(Message *m) override {
-    if (!ms_dispatch(m)) {
-      m->put();
-    }
+  void ms_fast_dispatch2(const MessageRef& m) override {
+    [[maybe_unused]] auto s = ms_dispatch2(m);
   }
 
   void handle_osd_op_reply(class MOSDOpReply *m);
@@ -2668,22 +2755,28 @@ private:
 
   template<typename CompletionToken>
   auto wait_for_osd_map(CompletionToken&& token) {
-    boost::asio::async_completion<CompletionToken, void()> init(token);
-    std::unique_lock l(rwlock);
-    if (osdmap->get_epoch()) {
-      l.unlock();
-      boost::asio::post(std::move(init.completion_handler));
-    } else {
-      waiting_for_map[0].emplace_back(
-	OpCompletion::create(
-	  service.get_executor(),
-	  [c = std::move(init.completion_handler)]
-	  (boost::system::error_code) mutable {
-	    std::move(c)();
-	  }), boost::system::error_code{});
-      l.unlock();
-    }
-    return init.result.get();
+    auto consigned = boost::asio::consign(
+      std::forward<CompletionToken>(token), boost::asio::make_work_guard(
+	service.get_executor()));
+    return boost::asio::async_initiate<decltype(consigned), void()>(
+      [this](auto handler) {
+	std::unique_lock l(rwlock);
+	if (osdmap->get_epoch()) {
+	  l.unlock();
+	  boost::asio::post(std::move(handler));
+	} else {
+	  auto e = boost::asio::get_associated_executor(
+	    handler, service.get_executor());
+	  waiting_for_map[0].emplace_back(
+	    boost::asio::bind_executor(
+	      e, [c = std::move(handler)]
+	      (boost::system::error_code) mutable {
+		boost::asio::dispatch(std::move(c));
+	      }),
+	    boost::system::error_code{});
+	  l.unlock();
+	}
+      }, consigned);
   }
 
 
@@ -2750,9 +2843,9 @@ public:
 
   struct CB_Objecter_GetVersion {
     Objecter *objecter;
-    std::unique_ptr<OpCompletion> fin;
+    OpCompletion fin;
 
-    CB_Objecter_GetVersion(Objecter *o, std::unique_ptr<OpCompletion> c)
+    CB_Objecter_GetVersion(Objecter *o, OpCompletion c)
       : objecter(o), fin(std::move(c)) {}
     void operator()(boost::system::error_code ec, version_t newest,
 		    version_t oldest) {
@@ -2760,7 +2853,8 @@ public:
 	// try again as instructed
 	objecter->_wait_for_latest_osdmap(std::move(*this));
       } else if (ec) {
-	ceph::async::post(std::move(fin), ec);
+	boost::asio::post(objecter->service.get_executor(),
+			  boost::asio::append(std::move(fin), ec));
       } else {
 	auto l = std::unique_lock(objecter->rwlock);
 	objecter->_get_latest_version(oldest, newest, std::move(fin),
@@ -2771,24 +2865,23 @@ public:
 
   template<typename CompletionToken>
   auto wait_for_map(epoch_t epoch, CompletionToken&& token) {
-    boost::asio::async_completion<CompletionToken, OpSignature> init(token);
-
-    if (osdmap->get_epoch() >= epoch) {
-      boost::asio::post(service,
-			ceph::async::bind_handler(
-			  std::move(init.completion_handler),
-			  boost::system::error_code()));
-    } else {
-      monc->get_version("osdmap",
-			CB_Objecter_GetVersion(
-			  this,
-			  OpCompletion::create(service.get_executor(),
-					       std::move(init.completion_handler))));
-    }
-    return init.result.get();
+    auto consigned = boost::asio::consign(
+      std::forward<CompletionToken>(token), boost::asio::make_work_guard(
+	service.get_executor()));
+    return boost::asio::async_initiate<decltype(consigned), OpSignature>(
+      [epoch, this](auto handler) {
+	if (osdmap->get_epoch() >= epoch) {
+	  boost::asio::post(boost::asio::append(
+			      std::move(handler),
+			      boost::system::error_code{}));
+	} else {
+	  monc->get_version(
+	    "osdmap",
+	    CB_Objecter_GetVersion(this, std::move(handler)));
+	}
+      }, consigned);
   }
-
-  void _wait_for_new_map(std::unique_ptr<OpCompletion>, epoch_t epoch,
+  void _wait_for_new_map(OpCompletion, epoch_t epoch,
 			 boost::system::error_code = {});
 
 private:
@@ -2800,38 +2893,40 @@ public:
 
   template<typename CompletionToken>
   auto wait_for_latest_osdmap(CompletionToken&& token) {
-    boost::asio::async_completion<CompletionToken, OpSignature> init(token);
-
-    monc->get_version("osdmap",
-		      CB_Objecter_GetVersion(
-			this,
-			OpCompletion::create(service.get_executor(),
-					     std::move(init.completion_handler))));
-    return init.result.get();
+    auto consigned = boost::asio::consign(
+      std::forward<CompletionToken>(token), boost::asio::make_work_guard(
+	service.get_executor()));
+    boost::asio::async_initiate<decltype(consigned), OpSignature>(
+      [this](auto handler) {
+	monc->get_version("osdmap",
+			  CB_Objecter_GetVersion(
+			    this,
+			    std::move(handler)));
+      }, consigned);
   }
 
-  void wait_for_latest_osdmap(std::unique_ptr<OpCompletion> c) {
-    monc->get_version("osdmap",
-		      CB_Objecter_GetVersion(this, std::move(c)));
+  auto wait_for_latest_osdmap(boost::asio::any_completion_handler<OpSignature> c) {
+    wait_for_latest_osdmap([c = std::move(c)](boost::system::error_code e) mutable {
+      boost::asio::dispatch(boost::asio::append(std::move(c), e));
+    });
   }
 
   template<typename CompletionToken>
   auto get_latest_version(epoch_t oldest, epoch_t newest,
 			  CompletionToken&& token) {
-    boost::asio::async_completion<CompletionToken, OpSignature> init(token);
-    {
-      std::unique_lock wl(rwlock);
-      _get_latest_version(oldest, newest,
-			  OpCompletion::create(
-			    service.get_executor(),
-			    std::move(init.completion_handler)),
-			  std::move(wl));
-    }
-    return init.result.get();
+    auto consigned = boost::asio::consign(
+      std::forward<CompletionToken>(token), boost::asio::make_work_guard(
+	service.get_executor()));
+    return boost::asio::async_initiate<decltype(consigned), OpSignature>(
+      [oldest, newest, this](auto handler) {
+	std::unique_lock wl(rwlock);
+	_get_latest_version(oldest, newest,
+			    std::move(handler), std::move(wl));
+      }, consigned);
   }
 
   void _get_latest_version(epoch_t oldest, epoch_t neweset,
-			   std::unique_ptr<OpCompletion> fin,
+			   OpCompletion fin,
 			   std::unique_lock<ceph::shared_mutex>&& ul);
 
   /** Get the current set of global op flags */
@@ -2847,10 +2942,25 @@ public:
 
   /// cancel an in-progress request with the given return code
 private:
-  int op_cancel(OSDSession *s, ceph_tid_t tid, int r);
+  int op_cancel(OSDSession *s, ceph_tid_t tid, int r,
+		boost::system::error_code ec);
   int _op_cancel(ceph_tid_t tid, int r);
+
+  int get_read_flags(int flags) {
+    int ret = flags | global_op_flags |
+              extra_read_flags.load(std::memory_order_relaxed) |
+              CEPH_OSD_FLAG_READ;
+
+    // If the op is rwordered, strip out the balanced and localized flags.
+    if (flags & CEPH_OSD_FLAG_RWORDERED) {
+      ret &= ~(CEPH_OSD_FLAG_BALANCE_READS | CEPH_OSD_FLAG_LOCALIZE_READS);
+    }
+    return ret;
+  }
+
 public:
   int op_cancel(ceph_tid_t tid, int r);
+  void subsystem_cancel(uint64_t subsystem, boost::system::error_code e);
   int op_cancel(const std::vector<ceph_tid_t>& tidls, int r);
 
   /**
@@ -2864,7 +2974,7 @@ public:
   epoch_t op_cancel_writes(int r, int64_t pool=-1);
 
   // commands
-  void osd_command(int osd, std::vector<std::string> cmd,
+  void osd_command_(int osd, std::vector<std::string> cmd,
 		   ceph::buffer::list inbl, ceph_tid_t *ptid,
 		   decltype(CommandOp::onfinish)&& onfinish) {
     ceph_assert(osd >= 0);
@@ -2879,17 +2989,20 @@ public:
   auto osd_command(int osd, std::vector<std::string> cmd,
 		   ceph::buffer::list inbl, ceph_tid_t *ptid,
 		   CompletionToken&& token) {
-    boost::asio::async_completion<CompletionToken,
-				  CommandOp::OpSig> init(token);
-    osd_command(osd, std::move(cmd), std::move(inbl), ptid,
-		CommandOp::OpComp::create(service.get_executor(),
-					  std::move(init.completion_handler)));
-    return init.result.get();
+    auto consigned = boost::asio::consign(
+      std::forward<CompletionToken>(token), boost::asio::make_work_guard(
+	service.get_executor()));
+    return boost::asio::async_initiate<decltype(consigned), CommandOp::OpSig>(
+      [osd, cmd = std::move(cmd), inbl = std::move(inbl), ptid, this]
+      (auto handler) {
+	osd_command_(osd, std::move(cmd), std::move(inbl), ptid,
+		     std::move(handler));
+      }, consigned);
   }
 
-  void pg_command(pg_t pgid, std::vector<std::string> cmd,
-		  ceph::buffer::list inbl, ceph_tid_t *ptid,
-		  decltype(CommandOp::onfinish)&& onfinish) {
+  void pg_command_(pg_t pgid, std::vector<std::string> cmd,
+		   ceph::buffer::list inbl, ceph_tid_t *ptid,
+		   decltype(CommandOp::onfinish)&& onfinish) {
     auto *c = new CommandOp(
       pgid,
       std::move(cmd),
@@ -2902,12 +3015,14 @@ public:
   auto pg_command(pg_t pgid, std::vector<std::string> cmd,
 		  ceph::buffer::list inbl, ceph_tid_t *ptid,
 		  CompletionToken&& token) {
-    boost::asio::async_completion<CompletionToken,
-				  CommandOp::OpSig> init(token);
-    pg_command(pgid, std::move(cmd), std::move(inbl), ptid,
-	       CommandOp::OpComp::create(service.get_executor(),
-					 std::move(init.completion_handler)));
-    return init.result.get();
+    auto consigned = boost::asio::consign(
+      std::forward<CompletionToken>(token), boost::asio::make_work_guard(service.get_executor()));
+    return async_initiate<decltype(consigned), CommandOp::OpSig> (
+      [pgid, cmd = std::move(cmd), inbl = std::move(inbl), ptid, this]
+      (auto handler) {
+	pg_command_(pgid, std::move(cmd), std::move(inbl), ptid,
+		    std::move(handler));
+      }, consigned);
   }
 
   // mid-level helpers
@@ -2917,10 +3032,11 @@ public:
     ceph::real_time mtime, int flags,
     Context *oncommit, version_t *objver = NULL,
     osd_reqid_t reqid = osd_reqid_t(),
-    ZTracer::Trace *parent_trace = nullptr) {
+    ZTracer::Trace *parent_trace = nullptr,
+    const jspan_context *otel_trace = nullptr) {
     Op *o = new Op(oid, oloc, std::move(op.ops), flags | global_op_flags |
 		   CEPH_OSD_FLAG_WRITE, oncommit, objver,
-		   nullptr, parent_trace);
+		   nullptr, nullptr, otel_trace);
     o->priority = op.priority;
     o->mtime = mtime;
     o->snapc = snapc;
@@ -2948,12 +3064,12 @@ public:
   void mutate(const object_t& oid, const object_locator_t& oloc,
 	      ObjectOperation&& op, const SnapContext& snapc,
 	      ceph::real_time mtime, int flags,
-	      std::unique_ptr<Op::OpComp>&& oncommit,
+	      Op::OpComp oncommit,
 	      version_t *objver = NULL, osd_reqid_t reqid = osd_reqid_t(),
-	      ZTracer::Trace *parent_trace = nullptr) {
+	      ZTracer::Trace *parent_trace = nullptr, uint32_t subsystem = 0) {
     Op *o = new Op(oid, oloc, std::move(op.ops), flags | global_op_flags |
 		   CEPH_OSD_FLAG_WRITE, std::move(oncommit), objver,
-		   nullptr, parent_trace);
+		   nullptr, parent_trace, subsystem);
     o->priority = op.priority;
     o->mtime = mtime;
     o->snapc = snapc;
@@ -2969,13 +3085,13 @@ public:
   Op *prepare_read_op(
     const object_t& oid, const object_locator_t& oloc,
     ObjectOperation& op,
-    snapid_t snapid, ceph::buffer::list *pbl, int flags,
+    snapid_t snapid, ceph::buffer::list *pbl,
+    int flags, int flags_mask,
     Context *onack, version_t *objver = NULL,
     int *data_offset = NULL,
     uint64_t features = 0,
     ZTracer::Trace *parent_trace = nullptr) {
-    Op *o = new Op(oid, oloc, std::move(op.ops), flags | global_op_flags |
-		   CEPH_OSD_FLAG_READ, onack, objver,
+    Op *o = new Op(oid, oloc, std::move(op.ops), get_read_flags(flags) & flags_mask, onack, objver,
 		   data_offset, parent_trace);
     o->priority = op.priority;
     o->snapid = snapid;
@@ -2996,7 +3112,7 @@ public:
     Context *onack, version_t *objver = NULL,
     int *data_offset = NULL,
     uint64_t features = 0) {
-    Op *o = prepare_read_op(oid, oloc, op, snapid, pbl, flags, onack, objver,
+    Op *o = prepare_read_op(oid, oloc, op, snapid, pbl, flags, -1, onack, objver,
 			    data_offset);
     if (features)
       o->features = features;
@@ -3007,12 +3123,13 @@ public:
 
   void read(const object_t& oid, const object_locator_t& oloc,
 	    ObjectOperation&& op, snapid_t snapid, ceph::buffer::list *pbl,
-	    int flags, std::unique_ptr<Op::OpComp>&& onack,
+	    int flags, Op::OpComp onack,
 	    version_t *objver = nullptr, int *data_offset = nullptr,
-	    uint64_t features = 0, ZTracer::Trace *parent_trace = nullptr) {
-    Op *o = new Op(oid, oloc, std::move(op.ops), flags | global_op_flags |
-		   CEPH_OSD_FLAG_READ, std::move(onack), objver,
-		   data_offset, parent_trace);
+	    uint64_t features = 0, ZTracer::Trace *parent_trace = nullptr,
+	    uint64_t subsystem = 0) {
+    Op *o = new Op(oid, oloc, std::move(op.ops), get_read_flags(flags),
+		   std::move(onack), objver,
+		   data_offset, parent_trace, subsystem);
     o->priority = op.priority;
     o->snapid = snapid;
     o->outbl = pbl;
@@ -3030,7 +3147,6 @@ public:
     op_submit(o);
   }
 
-
   Op *prepare_pg_read_op(
     uint32_t hash, object_locator_t oloc,
     ObjectOperation& op, ceph::buffer::list *pbl, int flags,
@@ -3038,7 +3154,7 @@ public:
     int *ctx_budget) {
     Op *o = new Op(object_t(), oloc,
 		   std::move(op.ops),
-		   flags | global_op_flags | CEPH_OSD_FLAG_READ |
+		   get_read_flags(flags) |
 		   CEPH_OSD_FLAG_IGNORE_OVERLAY,
 		   onack, NULL);
     o->target.precalc_pgid = true;
@@ -3073,7 +3189,7 @@ public:
   ceph_tid_t pg_read(
     uint32_t hash, object_locator_t oloc,
     ObjectOperation& op, ceph::buffer::list *pbl, int flags,
-    std::unique_ptr<Op::OpComp>&& onack, epoch_t *reply_epoch, int *ctx_budget) {
+    Op::OpComp onack, epoch_t *reply_epoch, int *ctx_budget) {
     ceph_tid_t tid;
     Op *o = new Op(object_t(), oloc,
 		   std::move(op.ops),
@@ -3178,8 +3294,8 @@ public:
     int i = init_ops(ops, 1, extra_ops);
     ops[i].op.op = CEPH_OSD_OP_STAT;
     C_Stat *fin = new C_Stat(psize, pmtime, onfinish);
-    Op *o = new Op(oid, oloc, std::move(ops), flags | global_op_flags |
-		   CEPH_OSD_FLAG_READ, fin, objver);
+    Op *o = new Op(oid, oloc, std::move(ops),
+		   get_read_flags(flags), fin, objver);
     o->snapid = snap;
     o->outbl = &fin->bl;
     return o;
@@ -3210,8 +3326,7 @@ public:
     ops[i].op.extent.truncate_size = 0;
     ops[i].op.extent.truncate_seq = 0;
     ops[i].op.flags = op_flags;
-    Op *o = new Op(oid, oloc, std::move(ops), flags | global_op_flags |
-		   CEPH_OSD_FLAG_READ, onfinish, objver,
+    Op *o = new Op(oid, oloc, std::move(ops), get_read_flags(flags), onfinish, objver,
 		   nullptr, parent_trace);
     o->snapid = snap;
     o->outbl = pbl;
@@ -3243,8 +3358,7 @@ public:
     ops[i].op.extent.truncate_seq = 0;
     ops[i].indata = cmp_bl;
     ops[i].op.flags = op_flags;
-    Op *o = new Op(oid, oloc, std::move(ops), flags | global_op_flags |
-		   CEPH_OSD_FLAG_READ, onfinish, objver);
+    Op *o = new Op(oid, oloc, std::move(ops), get_read_flags(flags), onfinish, objver);
     o->snapid = snap;
     return o;
   }
@@ -3275,8 +3389,7 @@ public:
     ops[i].op.extent.truncate_size = trunc_size;
     ops[i].op.extent.truncate_seq = trunc_seq;
     ops[i].op.flags = op_flags;
-    Op *o = new Op(oid, oloc, std::move(ops), flags | global_op_flags |
-		   CEPH_OSD_FLAG_READ, onfinish, objver);
+    Op *o = new Op(oid, oloc, std::move(ops), get_read_flags(flags), onfinish, objver);
     o->snapid = snap;
     o->outbl = pbl;
     ceph_tid_t tid;
@@ -3294,8 +3407,7 @@ public:
     ops[i].op.extent.length = len;
     ops[i].op.extent.truncate_size = 0;
     ops[i].op.extent.truncate_seq = 0;
-    Op *o = new Op(oid, oloc, std::move(ops), flags | global_op_flags |
-		   CEPH_OSD_FLAG_READ, onfinish, objver);
+    Op *o = new Op(oid, oloc, std::move(ops), get_read_flags(flags), onfinish, objver);
     o->snapid = snap;
     o->outbl = pbl;
     ceph_tid_t tid;
@@ -3313,8 +3425,7 @@ public:
     ops[i].op.xattr.value_len = 0;
     if (name)
       ops[i].indata.append(name, ops[i].op.xattr.name_len);
-    Op *o = new Op(oid, oloc, std::move(ops), flags | global_op_flags |
-		   CEPH_OSD_FLAG_READ, onfinish, objver);
+    Op *o = new Op(oid, oloc, std::move(ops), get_read_flags(flags), onfinish, objver);
     o->snapid = snap;
     o->outbl = pbl;
     ceph_tid_t tid;
@@ -3330,8 +3441,7 @@ public:
     int i = init_ops(ops, 1, extra_ops);
     ops[i].op.op = CEPH_OSD_OP_GETXATTRS;
     C_GetAttrs *fin = new C_GetAttrs(attrset, onfinish);
-    Op *o = new Op(oid, oloc, std::move(ops), flags | global_op_flags |
-		   CEPH_OSD_FLAG_READ, fin, objver);
+    Op *o = new Op(oid, oloc, std::move(ops), get_read_flags(flags), fin, objver);
     o->snapid = snap;
     o->outbl = &fin->bl;
     ceph_tid_t tid;
@@ -3713,9 +3823,9 @@ public:
 		     OpContextVert<ceph::buffer::list>(c, nullptr));
   }
   void allocate_selfmanaged_snap(int64_t pool,
-				 std::unique_ptr<ceph::async::Completion<
+				 boost::asio::any_completion_handler<
 				 void(boost::system::error_code,
-				      snapid_t)>> onfinish);
+				      snapid_t)> onfinish);
   void allocate_selfmanaged_snap(int64_t pool, snapid_t* psnapid,
 				 Context* c) {
     allocate_selfmanaged_snap(pool,
@@ -3771,18 +3881,18 @@ private:
   void _poolstat_submit(PoolStatOp *op);
 public:
   void handle_get_pool_stats_reply(MGetPoolStatsReply *m);
-  void get_pool_stats(const std::vector<std::string>& pools,
-		      decltype(PoolStatOp::onfinish)&& onfinish);
+  void get_pool_stats_(const std::vector<std::string>& pools,
+		       decltype(PoolStatOp::onfinish)&& onfinish);
   template<typename CompletionToken>
-  auto get_pool_stats(const std::vector<std::string>& pools,
+  auto get_pool_stats(std::vector<std::string> pools,
 		      CompletionToken&& token) {
-    boost::asio::async_completion<CompletionToken,
-				  PoolStatOp::OpSig> init(token);
-    get_pool_stats(pools,
-		   PoolStatOp::OpComp::create(
-		     service.get_executor(),
-		     std::move(init.completion_handler)));
-    return init.result.get();
+    auto consigned = boost::asio::consign(
+      std::forward<CompletionToken>(token), boost::asio::make_work_guard(
+	service.get_executor()));
+    return boost::asio::async_initiate<decltype(consigned), PoolStatOp::OpSig>(
+      [pools = std::move(pools), this](auto handler) {
+	get_pool_stats_(pools, std::move(handler));
+      }, consigned);
   }
   int pool_stat_op_cancel(ceph_tid_t tid, int r);
   void _finish_pool_stat_op(PoolStatOp *op, int r);
@@ -3793,20 +3903,22 @@ private:
   void _fs_stats_submit(StatfsOp *op);
 public:
   void handle_fs_stats_reply(MStatfsReply *m);
-  void get_fs_stats(std::optional<int64_t> poolid,
-		    decltype(StatfsOp::onfinish)&& onfinish);
+  void get_fs_stats_(std::optional<int64_t> poolid,
+		     decltype(StatfsOp::onfinish)&& onfinish);
   template<typename CompletionToken>
   auto get_fs_stats(std::optional<int64_t> poolid,
 		    CompletionToken&& token) {
-    boost::asio::async_completion<CompletionToken, StatfsOp::OpSig> init(token);
-    get_fs_stats(poolid,
-		 StatfsOp::OpComp::create(service.get_executor(),
-					  std::move(init.completion_handler)));
-    return init.result.get();
+    auto consigned = boost::asio::consign(
+      std::forward<CompletionToken>(token), boost::asio::make_work_guard(
+	service.get_executor()));
+    return boost::asio::async_initiate<decltype(consigned), StatfsOp::OpSig>(
+      [poolid, this](auto handler) {
+	get_fs_stats_(poolid, std::move(handler));
+      }, consigned);
   }
   void get_fs_stats(struct ceph_statfs& result, std::optional<int64_t> poolid,
 		    Context *onfinish) {
-    get_fs_stats(poolid, OpContextVert(onfinish, result));
+    get_fs_stats_(poolid, OpContextVert(onfinish, result));
   }
   int statfs_op_cancel(ceph_tid_t tid, int r);
   void _finish_statfs_op(StatfsOp *op, int r);

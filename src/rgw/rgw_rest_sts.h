@@ -40,7 +40,9 @@ class WebTokenEngine : public rgw::auth::Engine {
 
   bool is_cert_valid(const std::vector<std::string>& thumbprints, const std::string& cert) const;
 
-  std::unique_ptr<rgw::sal::RGWOIDCProvider> get_provider(const DoutPrefixProvider *dpp, const std::string& role_arn, const std::string& iss) const;
+  int load_provider(const DoutPrefixProvider *dpp, optional_yield y,
+                    const std::string& role_arn, const std::string& iss,
+                    RGWOIDCProviderInfo& info) const;
 
   std::string get_role_tenant(const std::string& role_arn) const;
 
@@ -51,6 +53,8 @@ class WebTokenEngine : public rgw::auth::Engine {
   std::tuple<boost::optional<WebTokenEngine::token_t>, boost::optional<WebTokenEngine::principal_tags_t>>
   get_from_jwt(const DoutPrefixProvider* dpp, const std::string& token, const req_state* const s, optional_yield y) const;
 
+ bool validate_signature_using_n_e(const DoutPrefixProvider* dpp, const jwt::decoded_jwt& decoded, const std::string &algorithm, const std::string& n, const std::string& e) const;
+
   void validate_signature (const DoutPrefixProvider* dpp, const jwt::decoded_jwt& decoded, const std::string& algorithm, const std::string& iss, const std::vector<std::string>& thumbprints, optional_yield y) const;
 
   result_t authenticate(const DoutPrefixProvider* dpp,
@@ -60,6 +64,14 @@ class WebTokenEngine : public rgw::auth::Engine {
   template <typename T>
   void recurse_and_insert(const string& key, const jwt::claim& c, T& t) const;
   WebTokenEngine::token_t get_token_claims(const jwt::decoded_jwt& decoded) const;
+
+  int create_connection(const DoutPrefixProvider* dpp, const std::string& hostname, int port) const;
+  std::string connect_to_host_get_cert_chain(const DoutPrefixProvider* dpp, const std::string& hostname, int port = 443) const;
+  std::string get_top_level_domain_from_host(const DoutPrefixProvider* dpp, const std::string& hostname) const;
+  std::string extract_last_certificate(const DoutPrefixProvider* dpp, const std::string& pem_chain) const;
+  bool verify_oidc_thumbprint(const DoutPrefixProvider* dpp, const std::string& cert_url,
+      const std::vector<std::string>& thumbprints) const;
+  void shutdown_ssl(const DoutPrefixProvider* dpp, SSL* ssl, SSL_CTX* ctx) const;
 
 public:
   WebTokenEngine(CephContext* const cct,
@@ -99,13 +111,17 @@ class DefaultStrategy : public rgw::auth::Strategy,
 
   aplptr_t create_apl_web_identity( CephContext* cct,
                                     const req_state* s,
+                                    const std::string& role_id,
                                     const std::string& role_session,
                                     const std::string& role_tenant,
                                     const std::unordered_multimap<std::string, std::string>& token,
                                     boost::optional<std::multimap<std::string, std::string>> role_tags,
-                                    boost::optional<std::set<std::pair<std::string, std::string>>> principal_tags) const override {
+                                    boost::optional<std::set<std::pair<std::string, std::string>>> principal_tags,
+                                    std::optional<RGWAccountInfo> account) const override {
     auto apl = rgw::auth::add_sysreq(cct, driver, s,
-      rgw::auth::WebIdentityApplier(cct, driver, role_session, role_tenant, token, role_tags, principal_tags));
+      rgw::auth::WebIdentityApplier(cct, driver, role_id, role_session,
+                                    role_tenant, token, role_tags,
+                                    principal_tags, std::move(account)));
     return aplptr_t(new decltype(apl)(std::move(apl)));
   }
 
@@ -189,6 +205,15 @@ public:
   RGWOpType get_type() override { return RGW_STS_GET_SESSION_TOKEN; }
 };
 
+class RGWSTSGetCallerIdentity : public RGWREST_STS {
+public:
+  RGWSTSGetCallerIdentity() = default;
+  void execute(optional_yield y) override;
+  int verify_permission(optional_yield y) override;
+  const char* name() const override { return "get_caller_identity"; }
+  RGWOpType get_type() override { return RGW_STS_GET_CALLER_IDENTITY; }
+};
+
 class RGW_Auth_STS {
 public:
   static int authorize(const DoutPrefixProvider *dpp,
@@ -199,17 +224,14 @@ public:
 
 class RGWHandler_REST_STS : public RGWHandler_REST {
   const rgw::auth::StrategyRegistry& auth_registry;
-  const std::string& post_body;
   RGWOp *op_post() override;
-  void rgw_sts_parse_input();
 public:
 
-  static int init_from_header(req_state *s, RGWFormat default_formatter, bool configurable_format);
+  static bool action_exists(const req_state* s);
 
-  RGWHandler_REST_STS(const rgw::auth::StrategyRegistry& auth_registry, const std::string& post_body="")
+  RGWHandler_REST_STS(const rgw::auth::StrategyRegistry& auth_registry)
     : RGWHandler_REST(),
-      auth_registry(auth_registry),
-      post_body(post_body) {}
+      auth_registry(auth_registry) {}
   ~RGWHandler_REST_STS() override = default;
 
   int init(rgw::sal::Driver* driver,

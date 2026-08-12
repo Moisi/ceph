@@ -5,7 +5,7 @@ from cephadm.tuned_profiles import TunedProfileUtils, SYSCTL_DIR
 from cephadm.inventory import TunedProfileStore
 from ceph.utils import datetime_now
 from ceph.deployment.service_spec import TunedProfileSpec, PlacementSpec
-from cephadm.ssh import SSHManager
+from cephadm.ssh import SSHManager, RemoteCommand, Executables
 from orchestrator import HostSpec
 
 from typing import List, Dict
@@ -36,6 +36,15 @@ class FakeCache:
 
     def get_draining_hosts(self):
         return []
+
+    def is_host_unreachable(self, hostname: str):
+        return hostname in [h.hostname for h in self.get_unreachable_hosts()]
+
+    def is_host_schedulable(self, hostname: str):
+        return hostname in [h.hostname for h in self.get_schedulable_hosts()]
+
+    def is_host_draining(self, hostname: str):
+        return hostname in [h.hostname for h in self.get_draining_hosts()]
 
     @property
     def networks(self):
@@ -139,10 +148,26 @@ class TestTunedProfiles:
         tp = TunedProfileUtils(mgr)
         tp._remove_stray_tuned_profiles('a', self.profiles_to_calls(tp, [self.tspec1, self.tspec2]))
         calls = [
-            mock.call('a', ['ls', SYSCTL_DIR], log_command=False),
-            mock.call('a', ['rm', '-f', f'{SYSCTL_DIR}/p3-cephadm-tuned-profile.conf']),
-            mock.call('a', ['rm', '-f', f'{SYSCTL_DIR}/who-cephadm-tuned-profile.conf']),
-            mock.call('a', ['sysctl', '--system'])
+            mock.call(
+                'a', RemoteCommand(Executables.LS, [SYSCTL_DIR]), log_command=False
+            ),
+            mock.call(
+                'a',
+                RemoteCommand(
+                    Executables.RM,
+                    ['-f', f'{SYSCTL_DIR}/p3-cephadm-tuned-profile.conf']
+                )
+            ),
+            mock.call(
+                'a',
+                RemoteCommand(
+                    Executables.RM,
+                    ['-f', f'{SYSCTL_DIR}/who-cephadm-tuned-profile.conf']
+                )
+            ),
+            mock.call(
+                'a', RemoteCommand(Executables.SYSCTL, ['--system'])
+            ),
         ]
         _check_execute_command.assert_has_calls(calls, any_order=True)
 
@@ -161,9 +186,37 @@ class TestTunedProfiles:
                       profiles)
         tp = TunedProfileUtils(mgr)
         tp._write_tuned_profiles('a', self.profiles_to_calls(tp, [self.tspec1, self.tspec2]))
-        _check_execute_command.assert_called_with('a', ['sysctl', '--system'])
+        _check_execute_command.assert_called_with(
+            'a', RemoteCommand(Executables.SYSCTL, ['--system'])
+        )
         _write_remote_file.assert_called_with(
             'a', f'{SYSCTL_DIR}/p2-cephadm-tuned-profile.conf', tp._profile_to_str(self.tspec2).encode('utf-8'))
+
+    def test_dont_write_to_unreachable_hosts(self):
+        profiles = {'p1': self.tspec1, 'p2': self.tspec2, 'p3': self.tspec3}
+
+        # list host "a" and "b" as hosts that exist, "a" will be
+        # a normal, schedulable host and "b" is considered unreachable
+        mgr = FakeMgr(['a', 'b'],
+                      ['a'],
+                      ['b'],
+                      profiles)
+        tp = TunedProfileUtils(mgr)
+
+        assert 'a' not in tp.mgr.cache.last_tuned_profile_update
+        assert 'b' not in tp.mgr.cache.last_tuned_profile_update
+
+        # with an online host, should proceed as normal. Providing
+        # no actual profiles here though so the only actual action taken
+        # is updating the entry in the last_tuned_profile_update dict
+        tp._write_tuned_profiles('a', {})
+        assert 'a' in tp.mgr.cache.last_tuned_profile_update
+
+        # trying to write to an unreachable host should be a no-op
+        # and return immediately. No entry for 'b' should be added
+        # to the last_tuned_profile_update dict
+        tp._write_tuned_profiles('b', {})
+        assert 'b' not in tp.mgr.cache.last_tuned_profile_update
 
     def test_store(self):
         mgr = FakeMgr(['a', 'b', 'c'],

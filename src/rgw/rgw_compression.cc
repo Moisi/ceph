@@ -234,3 +234,16 @@ void RGWCompressionInfo::dump(Formatter *f) const
   ::encode_json("blocks", blocks, f);
 }
 
+list<RGWCompressionInfo> RGWCompressionInfo::generate_test_instances()
+{
+  list<RGWCompressionInfo> o;
+  RGWCompressionInfo i;
+  i.compression_type = "type";
+  i.orig_size = 1024;
+  i.blocks.push_back(compression_block());
+  i.blocks.back().old_ofs = 0;
+  i.blocks.back().new_ofs = 0;
+  i.blocks.back().len = 1024;
+  o.push_back(std::move(i));
+  return o;
+}

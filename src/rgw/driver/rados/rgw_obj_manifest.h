@@ -20,6 +20,7 @@
 
 #pragma once
 
+#include <optional>
 #include "rgw_zone_types.h"
 #include "rgw_bucket_types.h"
 #include "rgw_obj_types.h"
@@ -57,8 +58,16 @@ public:
     }
   }
 
+  std::optional<rgw_obj> get_head_obj() const {
+    if (is_raw) {
+      return std::nullopt;
+    } else {
+      return obj;
+    }
+  }
+
   rgw_raw_obj get_raw_obj(const RGWZoneGroup& zonegroup, const RGWZoneParams& zone_params) const;
-  rgw_raw_obj get_raw_obj(rgw::sal::RadosStore* store) const;
+  rgw_raw_obj get_raw_obj(RGWRados* store) const;
 
   rgw_obj_select& operator=(const rgw_obj& rhs) {
     obj = rhs;
@@ -102,7 +111,7 @@ struct RGWObjManifestPart {
   }
 
   void dump(Formatter *f) const;
-  static void generate_test_instances(std::list<RGWObjManifestPart*>& o);
+  static std::list<RGWObjManifestPart> generate_test_instances();
 };
 WRITE_CLASS_ENCODER(RGWObjManifestPart)
 
@@ -154,6 +163,7 @@ struct RGWObjManifestRule {
     DECODE_FINISH(bl);
   }
   void dump(Formatter *f) const;
+  static std::list<RGWObjManifestRule> generate_test_instances();
 };
 WRITE_CLASS_ENCODER(RGWObjManifestRule)
 
@@ -180,6 +190,7 @@ struct RGWObjTier {
       DECODE_FINISH(bl);
     }
     void dump(Formatter *f) const;
+    static std::list<RGWObjTier> generate_test_instances();
 };
 WRITE_CLASS_ENCODER(RGWObjTier)
 
@@ -286,7 +297,7 @@ public:
   }
 
   void decode(bufferlist::const_iterator& bl) {
-    DECODE_START_LEGACY_COMPAT_LEN_32(7, 2, 2, bl);
+    DECODE_START_LEGACY_COMPAT_LEN_32(8, 2, 2, bl);
     decode(obj_size, bl);
     decode(objs, bl);
     if (struct_v >= 3) {
@@ -363,7 +374,7 @@ public:
   }
 
   void dump(Formatter *f) const;
-  static void generate_test_instances(std::list<RGWObjManifest*>& o);
+  static std::list<RGWObjManifest> generate_test_instances();
 
   int append(const DoutPrefixProvider *dpp, RGWObjManifest& m, const RGWZoneGroup& zonegroup,
              const RGWZoneParams& zone_params);
@@ -460,16 +471,27 @@ public:
       return tier_type;
   }
 
+  bool is_tier_type_s3() {
+      return (tier_type == RGWTierType::CLOUD_S3 ||
+              tier_type == RGWTierType::CLOUD_S3_GLACIER);
+  }
+
+  bool is_tier_type_s3_glacier() {
+      return (tier_type == RGWTierType::CLOUD_S3_GLACIER);
+  }
+
   inline void set_tier_type(std::string value) {
-      /* Only "cloud-s3" tier-type is supported for now */
-      if (value == "cloud-s3") {
+      /* Only RGWTierType::CLOUD_S3 & RGWTierType::CLOUD_S3_GLACIER
+       * tier-type are supported for now */
+      if (RGWTierType::is_tier_type_supported(value)) {
         tier_type = value;
       }
   }
 
   inline void set_tier_config(RGWObjTier t) {
-      /* Set only if tier_type set to "cloud-s3" */
-      if (tier_type != "cloud-s3")
+      /* Set only if tier_type set to RGWTierType::CLOUD_S3 or
+       * RGWTierType::CLOUD_S3_GLACIER */
+      if (!is_tier_type_s3())
         return;
 
       tier_config.name = t.name;
@@ -478,7 +500,7 @@ public:
   }
 
   inline const void get_tier_config(RGWObjTier* t) {
-      if (tier_type != "cloud-s3")
+      if (!is_tier_type_s3())
         return;
 
       t->name = tier_config.name;
@@ -545,6 +567,14 @@ public:
       return ofs;
     }
 
+    const std::string& get_cur_override_prefix() const {
+      return cur_override_prefix;
+    }
+
+    int get_cur_part_id() const {
+      return cur_part_id;
+    }
+
     /* stripe number */
     int get_cur_stripe() const {
       return cur_stripe;
@@ -576,6 +606,8 @@ public:
   obj_iterator obj_find(const DoutPrefixProvider *dpp, uint64_t ofs) const {
     return obj_iterator{dpp, this, std::min(ofs, obj_size)};
   }
+  // return an iterator to the beginning of the given part number
+  obj_iterator obj_find_part(const DoutPrefixProvider *dpp, int part_num) const;
 
   /*
    * simple object generator. Using a simple single rule manifest.
@@ -607,7 +639,7 @@ public:
     int create_next(uint64_t ofs);
 
     rgw_raw_obj get_cur_obj(RGWZoneGroup& zonegroup, RGWZoneParams& zone_params) { return cur_obj.get_raw_obj(zonegroup, zone_params); }
-    rgw_raw_obj get_cur_obj(rgw::sal::RadosStore* store) const { return cur_obj.get_raw_obj(store); }
+    rgw_raw_obj get_cur_obj(RGWRados* store) const { return cur_obj.get_raw_obj(store); }
 
     /* total max size of current stripe (including head obj) */
     uint64_t cur_stripe_max_size() const {

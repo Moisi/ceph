@@ -1,7 +1,7 @@
 import { HttpClientTestingModule, HttpTestingController } from '@angular/common/http/testing';
 import { ComponentFixture, TestBed } from '@angular/core/testing';
 import { ReactiveFormsModule } from '@angular/forms';
-import { ActivatedRoute } from '@angular/router';
+import { ActivatedRoute, Router } from '@angular/router';
 import { RouterTestingModule } from '@angular/router/testing';
 
 import { NgbTypeaheadModule } from '@ng-bootstrap/ng-bootstrap';
@@ -11,7 +11,6 @@ import { Observable, of } from 'rxjs';
 import { NfsFormClientComponent } from '~/app/ceph/nfs/nfs-form-client/nfs-form-client.component';
 import { NfsFormComponent } from '~/app/ceph/nfs/nfs-form/nfs-form.component';
 import { Directory } from '~/app/shared/api/nfs.service';
-import { LoadingPanelComponent } from '~/app/shared/components/loading-panel/loading-panel.component';
 import { SharedModule } from '~/app/shared/shared.module';
 import { ActivatedRouteStub } from '~/testing/activated-route-stub';
 import { configureTestBed, RgwHelper } from '~/testing/unit-test-helper';
@@ -21,33 +20,30 @@ describe('NfsFormComponent', () => {
   let fixture: ComponentFixture<NfsFormComponent>;
   let httpTesting: HttpTestingController;
   let activatedRoute: ActivatedRouteStub;
+  let router: Router;
 
-  configureTestBed(
-    {
-      declarations: [NfsFormComponent, NfsFormClientComponent],
-      imports: [
-        HttpClientTestingModule,
-        ReactiveFormsModule,
-        RouterTestingModule,
-        SharedModule,
-        ToastrModule.forRoot(),
-        NgbTypeaheadModule
-      ],
-      providers: [
-        {
-          provide: ActivatedRoute,
-          useValue: new ActivatedRouteStub({ cluster_id: 'mynfs', export_id: '1' })
-        }
-      ]
-    },
-    [LoadingPanelComponent]
-  );
+  configureTestBed({
+    declarations: [NfsFormComponent, NfsFormClientComponent],
+    imports: [
+      HttpClientTestingModule,
+      ReactiveFormsModule,
+      RouterTestingModule,
+      SharedModule,
+      ToastrModule.forRoot(),
+      NgbTypeaheadModule
+    ],
+    providers: [
+      {
+        provide: ActivatedRoute,
+        useValue: new ActivatedRouteStub({ cluster_id: 'mynfs', export_id: '1' })
+      }
+    ]
+  });
 
   const matchSquash = (backendSquashValue: string, uiSquashValue: string) => {
     component.ngOnInit();
-    httpTesting.expectOne('ui-api/nfs-ganesha/fsals').flush(['CEPH', 'RGW']);
-    httpTesting.expectOne('ui-api/nfs-ganesha/cephfs/filesystems').flush([{ id: 1, name: 'a' }]);
     httpTesting.expectOne('api/nfs-ganesha/cluster').flush(['mynfs']);
+    httpTesting.expectOne('ui-api/nfs-ganesha/cephfs/filesystems').flush([{ id: 1, name: 'a' }]);
     httpTesting.expectOne('api/nfs-ganesha/export/mynfs/1').flush({
       fsal: {
         name: 'RGW'
@@ -69,12 +65,16 @@ describe('NfsFormComponent', () => {
     component = fixture.componentInstance;
     httpTesting = TestBed.inject(HttpTestingController);
     activatedRoute = <ActivatedRouteStub>TestBed.inject(ActivatedRoute);
+    router = TestBed.inject(Router);
+
+    Object.defineProperty(router, 'url', {
+      get: jasmine.createSpy('url').and.returnValue('/cephfs/nfs')
+    });
     RgwHelper.selectDaemon();
     fixture.detectChanges();
 
-    httpTesting.expectOne('ui-api/nfs-ganesha/fsals').flush(['CEPH', 'RGW']);
-    httpTesting.expectOne('ui-api/nfs-ganesha/cephfs/filesystems').flush([{ id: 1, name: 'a' }]);
     httpTesting.expectOne('api/nfs-ganesha/cluster').flush(['mynfs']);
+    httpTesting.expectOne('ui-api/nfs-ganesha/cephfs/filesystems').flush([{ id: 1, name: 'a' }]);
     httpTesting.verify();
   });
 
@@ -82,27 +82,22 @@ describe('NfsFormComponent', () => {
     expect(component).toBeTruthy();
   });
 
-  it('should process all data', () => {
-    expect(component.allFsals).toEqual([
-      { descr: 'CephFS', value: 'CEPH', disabled: false },
-      { descr: 'Object Gateway', value: 'RGW', disabled: false }
-    ]);
-    expect(component.allFsNames).toEqual([{ id: 1, name: 'a' }]);
-    expect(component.allClusters).toEqual([{ cluster_id: 'mynfs' }]);
-  });
-
   it('should create the form', () => {
     expect(component.nfsForm.value).toEqual({
       access_type: 'RW',
       clients: [],
       cluster_id: 'mynfs',
-      fsal: { fs_name: 'a', name: 'CEPH' },
-      path: '/',
+      fsal: { fs_name: '', name: 'CEPH', user_id: '' },
+      path: '',
       protocolNfsv4: true,
+      protocolNfsv3: true,
       pseudo: '',
+      rgw_export_type: null,
       sec_label_xattr: 'security.selinux',
       security_label: false,
       squash: 'no_root_squash',
+      subvolume: '',
+      subvolume_group: '_nogroup',
       transportTCP: true,
       transportUDP: true
     });
@@ -121,8 +116,9 @@ describe('NfsFormComponent', () => {
     expect(component.nfsForm.get('cluster_id').disabled).toBeTruthy();
   });
 
-  it('should mark NFSv4 protocol as enabled always', () => {
+  it('should mark NFSv4 & NFSv3 protocols as enabled always', () => {
     expect(component.nfsForm.get('protocolNfsv4')).toBeTruthy();
+    expect(component.nfsForm.get('protocolNfsv3')).toBeTruthy();
   });
 
   it('should match backend squash values with ui values', () => {
@@ -142,6 +138,7 @@ describe('NfsFormComponent', () => {
         fsal: { name: 'CEPH', fs_name: 1 },
         path: '/foo',
         protocolNfsv4: true,
+        protocolNfsv3: true,
         pseudo: '/baz',
         squash: 'no_root_squash',
         transportTCP: true,
@@ -155,6 +152,31 @@ describe('NfsFormComponent', () => {
       component.cluster_id = 'cluster1';
       component.export_id = '1';
       component.nfsForm.patchValue({ export_id: 1 });
+      component.submitAction();
+
+      const req = httpTesting.expectOne('api/nfs-ganesha/export/cluster1/1');
+      expect(req.request.method).toBe('PUT');
+      expect(req.request.body).toEqual({
+        access_type: 'RW',
+        clients: [],
+        cluster_id: 'cluster1',
+        export_id: 1,
+        fsal: { fs_name: 1, name: 'CEPH', sec_label_xattr: null },
+        path: '/foo',
+        protocols: [3, 4],
+        pseudo: '/baz',
+        security_label: false,
+        squash: 'no_root_squash',
+        transports: ['TCP', 'UDP']
+      });
+    });
+
+    it('should call update with selected nfs protocol', () => {
+      activatedRoute.setParams({ cluster_id: 'cluster1', export_id: '1' });
+      component.isEdit = true;
+      component.cluster_id = 'cluster1';
+      component.export_id = '1';
+      component.nfsForm.patchValue({ export_id: 1, protocolNfsv3: false });
       component.submitAction();
 
       const req = httpTesting.expectOne('api/nfs-ganesha/export/cluster1/1');
@@ -190,7 +212,7 @@ describe('NfsFormComponent', () => {
           sec_label_xattr: null
         },
         path: '/foo',
-        protocols: [4],
+        protocols: [3, 4],
         pseudo: '/baz',
         security_label: false,
         squash: 'no_root_squash',

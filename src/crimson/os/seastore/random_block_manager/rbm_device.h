@@ -66,11 +66,6 @@ using discard_ertr = crimson::errorator<
   crimson::ct_error::input_output_error>;
 
 constexpr uint32_t RBM_SUPERBLOCK_SIZE = 4096;
-enum {
-  // TODO: This allows the device to manage crc on a block by itself
-  RBM_NVME_END_TO_END_PROTECTION = 1,
-  RBM_BITMAP_BLOCK_CRC = 2,
-};
 
 class RBMDevice : public Device {
 public:
@@ -83,7 +78,8 @@ public:
     return read(rbm_addr, out);
   }
 protected:
-  rbm_metadata_header_t super;
+  rbm_superblock_t super;
+  rbm_shard_info_t shard_info;
 public:
   RBMDevice() {}
   virtual ~RBMDevice() = default;
@@ -132,7 +128,7 @@ public:
    */
   virtual write_ertr::future<> write(
     uint64_t offset,
-    bufferptr &bptr,
+    bufferptr bptr,
     uint16_t stream = 0) = 0;
 
   virtual discard_ertr::future<> discard(
@@ -148,35 +144,56 @@ public:
     ceph::bufferlist bl,
     uint16_t stream = 0) = 0;
 
-  bool is_data_protection_enabled() const { return false; }
+  bool is_end_to_end_data_protection() const final {
+    return super.is_end_to_end_data_protection();
+  }
 
-  mkfs_ret mkfs(device_config_t) final;
+  virtual nvme_command_ertr::future<> initialize_nvme_features() { 
+    return nvme_command_ertr::now(); 
+  }
 
-  write_ertr::future<> write_rbm_header();
+  mkfs_ret do_mkfs(device_config_t);
 
-  read_ertr::future<rbm_metadata_header_t> read_rbm_header(rbm_abs_addr addr);
+  // shard 0 mkfs
+  mkfs_ret do_primary_mkfs(device_config_t, int shard_num, size_t journal_size);
+
+  mount_ret do_mount();
+
+  mount_ret do_shard_mount();
+
+  write_ertr::future<> write_rbm_superblock();
+
+  read_ertr::future<rbm_superblock_t> read_rbm_superblock(rbm_abs_addr addr);
 
   using stat_device_ret =
     read_ertr::future<seastar::stat_data>;
   virtual stat_device_ret stat_device() = 0;
 
+  virtual std::string get_device_path() const = 0;
+
   uint64_t get_journal_size() const {
     return super.journal_size;
   }
 
-  static rbm_abs_addr get_journal_start() {
+  static rbm_abs_addr get_shard_reserved_size() {
     return RBM_SUPERBLOCK_SIZE;
   }
 
-  // interfaces for test
-  void set_device_id(device_id_t id) {
-    super.config.spec.id = id;
+  rbm_abs_addr get_shard_journal_start() {
+    return shard_info.start_offset + get_shard_reserved_size();
   }
-  void set_journal_size(uint64_t size) {
-    super.journal_size = size;
+
+  uint64_t get_shard_start() const {
+    return shard_info.start_offset;
+  }
+
+  uint64_t get_shard_end() const {
+    return shard_info.start_offset + shard_info.size;
   }
 };
 using RBMDeviceRef = std::unique_ptr<RBMDevice>;
+
+constexpr uint64_t DEFAULT_TEST_CBJOURNAL_SIZE = 1 << 26;
 
 class EphemeralRBMDevice : public RBMDevice {
 public:
@@ -197,17 +214,8 @@ public:
   std::size_t get_available_size() const final { return size; }
   extent_len_t get_block_size() const final { return block_size; }
 
-  mount_ret mount() final {
-    return open("", seastar::open_flags::rw
-    ).safe_then([]() {
-      return mount_ertr::now();
-    }).handle_error(
-      mount_ertr::pass_further{},
-      crimson::ct_error::assert_all{
-	"Invalid error mount"
-      }
-    );
-  }
+  mount_ret mount() final;
+  mkfs_ret mkfs(device_config_t config) final;
 
   open_ertr::future<> open(
     const std::string &in_path,
@@ -215,7 +223,7 @@ public:
 
   write_ertr::future<> write(
     uint64_t offset,
-    bufferptr &bptr,
+    bufferptr bptr,
     uint16_t stream = 0) override;
 
   using RBMDevice::read;
@@ -239,9 +247,16 @@ public:
       stat
     );
   }
+
+  std::string get_device_path() const final {
+    return "";
+  }
+
   char *buf;
 };
 using EphemeralRBMDeviceRef = std::unique_ptr<EphemeralRBMDevice>;
-EphemeralRBMDeviceRef create_test_ephemeral(uint64_t journal_size, uint64_t data_size);
+EphemeralRBMDeviceRef create_test_ephemeral(
+  uint64_t journal_size = DEFAULT_TEST_CBJOURNAL_SIZE,
+  uint64_t data_size = DEFAULT_TEST_CBJOURNAL_SIZE);
 
 }

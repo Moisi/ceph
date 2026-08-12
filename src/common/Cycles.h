@@ -32,6 +32,8 @@
 #ifndef CEPH_CYCLES_H
 #define CEPH_CYCLES_H
 
+#include <cstdint>
+
 /**
  * This class provides static methods that read the fine-grain CPU
  * cycle counter and translate between cycle-level times and absolute
@@ -81,6 +83,10 @@ class Cycles {
 #elif defined(__s390__)
     uint64_t tsc;
     asm volatile("stck %0" : "=Q" (tsc) : : "cc");
+    return tsc;
+#elif defined(__riscv) && __riscv_xlen == 64
+    uint64_t tsc;
+    asm volatile ("rdtime %0" : "=r" (tsc));
     return tsc;
 #else
 #warning No high-precision counter available for your OS/arch

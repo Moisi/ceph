@@ -6,4 +6,6 @@ export interface RbdImageFeature {
   interlockedWith?: string;
   key?: string;
   initDisabled?: boolean;
+  helperHtml?: string;
+  helperText?: string;
 }

@@ -21,8 +21,7 @@
 
 namespace crimson::os::seastore::onode {
 
-using crimson::os::seastore::LogicalCachedExtent;
-class NodeExtent : public LogicalCachedExtent {
+class NodeExtent : public LogicalChildNode {
  public:
   virtual ~NodeExtent() = default;
   const node_header_t& get_header() const {
@@ -32,7 +31,7 @@ class NodeExtent : public LogicalCachedExtent {
     return get_bptr().c_str();
   }
   NodeExtentMutable get_mutable() {
-    assert(is_pending());
+    assert(is_mutable());
     return do_get_mutable();
   }
 
@@ -41,7 +40,7 @@ class NodeExtent : public LogicalCachedExtent {
 
  protected:
   template <typename... T>
-  NodeExtent(T&&... t) : LogicalCachedExtent(std::forward<T>(t)...) {}
+  NodeExtent(T&&... t) : LogicalChildNode(std::forward<T>(t)...) {}
 
   NodeExtentMutable do_get_mutable() {
     return NodeExtentMutable(get_bptr().c_str(), get_length());
@@ -62,7 +61,6 @@ class NodeExtent : public LogicalCachedExtent {
 
 using crimson::os::seastore::TransactionManager;
 class NodeExtentManager {
-  using base_iertr = TransactionManager::base_iertr;
  public:
   virtual ~NodeExtentManager() = default;
 

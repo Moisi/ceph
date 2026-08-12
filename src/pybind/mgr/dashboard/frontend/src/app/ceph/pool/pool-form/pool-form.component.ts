@@ -1,5 +1,5 @@
 import { Component, OnInit, Type, ViewChild } from '@angular/core';
-import { FormControl, Validators } from '@angular/forms';
+import { UntypedFormControl, Validators } from '@angular/forms';
 import { ActivatedRoute, Router } from '@angular/router';
 
 import { NgbNav, NgbTooltip } from '@ng-bootstrap/ng-bootstrap';
@@ -11,7 +11,7 @@ import { CrushRuleService } from '~/app/shared/api/crush-rule.service';
 import { ErasureCodeProfileService } from '~/app/shared/api/erasure-code-profile.service';
 import { PoolService } from '~/app/shared/api/pool.service';
 import { CrushNodeSelectionClass } from '~/app/shared/classes/crush.node.selection.class';
-import { CriticalConfirmationModalComponent } from '~/app/shared/components/critical-confirmation-modal/critical-confirmation-modal.component';
+import { DeleteConfirmationModalComponent } from '~/app/shared/components/delete-confirmation-modal/delete-confirmation-modal.component';
 import { SelectOption } from '~/app/shared/components/select/select-option.model';
 import { ActionLabelsI18n, URLVerbs } from '~/app/shared/constants/app.constants';
 import { Icons } from '~/app/shared/enum/icons.enum';
@@ -37,6 +37,8 @@ import { CrushRuleFormModalComponent } from '../crush-rule-form-modal/crush-rule
 import { ErasureCodeProfileFormModalComponent } from '../erasure-code-profile-form/erasure-code-profile-form-modal.component';
 import { Pool } from '../pool';
 import { PoolFormData } from './pool-form-data';
+import { PoolEditModeResponseModel } from '../../block/mirroring/pool-edit-mode-modal/pool-edit-mode-response.model';
+import { RbdMirroringService } from '~/app/shared/api/rbd-mirroring.service';
 
 interface FormFieldDescription {
   externalFieldName: string;
@@ -66,6 +68,8 @@ export class PoolFormComponent extends CdForm implements OnInit {
   editing = false;
   isReplicated = false;
   isErasure = false;
+  blobUnits = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+  maxBytesUnits = ['KiB', 'MiB', 'GiB', 'TiB'];
   data = new PoolFormData();
   externalPgChange = false;
   current: Record<string, any> = {
@@ -83,6 +87,9 @@ export class PoolFormComponent extends CdForm implements OnInit {
   crushUsage: string[] = undefined; // Will only be set if a rule is used by some pool
   ecpUsage: string[] = undefined; // Will only be set if a rule is used by some pool
   crushRuleMaxSize = 10;
+  DEFAULT_RATIO = 0.875;
+  isApplicationsSelected = true;
+  msrCrush: boolean = false;
 
   private modalSubscription: Subscription;
 
@@ -97,7 +104,8 @@ export class PoolFormComponent extends CdForm implements OnInit {
     private taskWrapper: TaskWrapperService,
     private ecpService: ErasureCodeProfileService,
     private crushRuleService: CrushRuleService,
-    public actionLabels: ActionLabelsI18n
+    public actionLabels: ActionLabelsI18n,
+    private rbdMirroringService: RbdMirroringService
   ) {
     super();
     this.editing = this.router.url.startsWith(`/pool/${URLVerbs.EDIT}`);
@@ -120,22 +128,28 @@ export class PoolFormComponent extends CdForm implements OnInit {
 
   private createForm() {
     const compressionForm = new CdFormGroup({
-      mode: new FormControl('none'),
-      algorithm: new FormControl(''),
-      minBlobSize: new FormControl('', {
+      mode: new UntypedFormControl('none'),
+      algorithm: new UntypedFormControl(''),
+      minBlobSize: new UntypedFormControl('', {
         updateOn: 'blur'
       }),
-      maxBlobSize: new FormControl('', {
+      minBlobSizeUnit: new UntypedFormControl(this.blobUnits[0], {
         updateOn: 'blur'
       }),
-      ratio: new FormControl('', {
+      maxBlobSize: new UntypedFormControl('', {
+        updateOn: 'blur'
+      }),
+      maxBlobSizeUnit: new UntypedFormControl(this.blobUnits[2], {
+        updateOn: 'blur'
+      }),
+      ratio: new UntypedFormControl(this.DEFAULT_RATIO, {
         updateOn: 'blur'
       })
     });
 
     this.form = new CdFormGroup(
       {
-        name: new FormControl('', {
+        name: new UntypedFormControl('', {
           validators: [
             Validators.pattern(/^[.A-Za-z0-9_/-]+$/),
             Validators.required,
@@ -149,10 +163,10 @@ export class PoolFormComponent extends CdForm implements OnInit {
             })
           ]
         }),
-        poolType: new FormControl('', {
+        poolType: new UntypedFormControl('', {
           validators: [Validators.required]
         }),
-        crushRule: new FormControl(null, {
+        crushRule: new UntypedFormControl(null, {
           validators: [
             CdValidators.custom(
               'tooFewOsds',
@@ -161,22 +175,24 @@ export class PoolFormComponent extends CdForm implements OnInit {
             CdValidators.custom(
               'required',
               (rule: CrushRule) =>
-                this.isReplicated && this.info.crush_rules_replicated.length > 0 && !rule
+                this.isReplicated && this.info?.crush_rules_replicated?.length > 0 && !rule
             )
           ]
         }),
-        size: new FormControl('', {
+        size: new UntypedFormControl('', {
           updateOn: 'blur'
         }),
-        erasureProfile: new FormControl(null),
-        pgNum: new FormControl('', {
+        erasureProfile: new UntypedFormControl(null),
+        pgNum: new UntypedFormControl('', {
           validators: [Validators.required]
         }),
-        pgAutoscaleMode: new FormControl(null),
-        ecOverwrites: new FormControl(false),
+        pgAutoscaleMode: new UntypedFormControl(null),
+        ecOverwrites: new UntypedFormControl(false),
         compression: compressionForm,
-        max_bytes: new FormControl(''),
-        max_objects: new FormControl(0)
+        max_bytes: new UntypedFormControl(''),
+        maxBytesUnit: new UntypedFormControl(this.maxBytesUnits[2]),
+        max_objects: new UntypedFormControl(0),
+        rbdMirroring: new UntypedFormControl(false)
       },
       [CdValidators.custom('form', (): null => null)]
     );
@@ -194,6 +210,7 @@ export class PoolFormComponent extends CdForm implements OnInit {
       this.listenToChanges();
       this.setComplexValidators();
     });
+    this.erasureProfileChange();
   }
 
   private initInfo(info: PoolFormInfo) {
@@ -256,6 +273,13 @@ export class PoolFormComponent extends CdForm implements OnInit {
       initialData: pool.configuration,
       sourceType: RbdConfigurationSourceField.pool
     });
+    const maxBytesConverted = this.dimlessBinaryPipe.transform(pool.quota_max_bytes).split(' ');
+    const minBlobSizeConverted = this.dimlessBinaryPipe
+      .transform(pool.options.compression_min_blob_size)
+      .split(' ');
+    const maxBlobSizeConverted = this.dimlessBinaryPipe
+      .transform(pool.options.compression_max_blob_size)
+      .split(' ');
     this.poolTypeChange(pool.type);
     const rules = this.info.crush_rules_replicated.concat(this.info.crush_rules_erasure);
     const dataMap = {
@@ -269,10 +293,13 @@ export class PoolFormComponent extends CdForm implements OnInit {
       ecOverwrites: pool.flags_names.includes('ec_overwrites'),
       mode: pool.options.compression_mode,
       algorithm: pool.options.compression_algorithm,
-      minBlobSize: this.dimlessBinaryPipe.transform(pool.options.compression_min_blob_size),
-      maxBlobSize: this.dimlessBinaryPipe.transform(pool.options.compression_max_blob_size),
+      minBlobSize: minBlobSizeConverted[0],
+      minBlobSizeUnit: minBlobSizeConverted[1],
+      maxBlobSize: maxBlobSizeConverted[0],
+      maxBlobSizeUnit: maxBlobSizeConverted[1],
       ratio: pool.options.compression_required_ratio,
-      max_bytes: this.dimlessBinaryPipe.transform(pool.quota_max_bytes),
+      max_bytes: maxBytesConverted[0],
+      maxBytesUnit: maxBytesConverted[1],
       max_objects: pool.quota_max_objects
     };
     Object.keys(dataMap).forEach((controlName: string) => {
@@ -284,11 +311,16 @@ export class PoolFormComponent extends CdForm implements OnInit {
     this.data.pgs = this.form.getValue('pgNum');
     this.setAvailableApps(this.data.applications.default.concat(pool.application_metadata));
     this.data.applications.selected = pool.application_metadata;
+    this.rbdMirroringService
+      .getPool(pool.pool_name)
+      .subscribe((resp: PoolEditModeResponseModel) => {
+        this.form.get('rbdMirroring').setValue(resp.mirror_mode === 'pool');
+      });
   }
 
   private setAvailableApps(apps: string[] = this.data.applications.default) {
     this.data.applications.available = _.uniq(apps.sort()).map(
-      (x: string) => new SelectOption(false, x, '')
+      (x: string) => new SelectOption(false, x, this.data.APP_LABELS[x] || x)
     );
   }
 
@@ -365,7 +397,13 @@ export class PoolFormComponent extends CdForm implements OnInit {
     this.form.get('minBlobSize').valueChanges.subscribe(() => {
       this.form.get('maxBlobSize').updateValueAndValidity({ emitEvent: false });
     });
+    this.form.get('minBlobSizeUnit').valueChanges.subscribe(() => {
+      this.form.get('maxBlobSize').updateValueAndValidity({ emitEvent: false });
+    });
     this.form.get('maxBlobSize').valueChanges.subscribe(() => {
+      this.form.get('minBlobSize').updateValueAndValidity({ emitEvent: false });
+    });
+    this.form.get('maxBlobSizeUnit').valueChanges.subscribe(() => {
       this.form.get('minBlobSize').updateValueAndValidity({ emitEvent: false });
     });
   }
@@ -528,13 +566,23 @@ export class PoolFormComponent extends CdForm implements OnInit {
     CdValidators.validateIf(this.form.get('minBlobSize'), () => this.hasCompressionEnabled(), [
       Validators.min(0),
       CdValidators.custom('maximum', (size: string) =>
-        this.oddBlobSize(size, this.form.getValue('maxBlobSize'))
+        this.oddBlobSize(
+          size,
+          this.form.getValue('minBlobSizeUnit'),
+          this.form.getValue('maxBlobSize'),
+          this.form.getValue('maxBlobSizeUnit')
+        )
       )
     ]);
     CdValidators.validateIf(this.form.get('maxBlobSize'), () => this.hasCompressionEnabled(), [
       Validators.min(0),
       CdValidators.custom('minimum', (size: string) =>
-        this.oddBlobSize(this.form.getValue('minBlobSize'), size)
+        this.oddBlobSize(
+          this.form.getValue('minBlobSize'),
+          this.form.getValue('minBlobSizeUnit'),
+          size,
+          this.form.getValue('maxBlobSizeUnit')
+        )
       )
     ]);
     CdValidators.validateIf(this.form.get('ratio'), () => this.hasCompressionEnabled(), [
@@ -543,9 +591,9 @@ export class PoolFormComponent extends CdForm implements OnInit {
     ]);
   }
 
-  private oddBlobSize(minimum: string, maximum: string) {
-    const min = this.formatter.toBytes(minimum);
-    const max = this.formatter.toBytes(maximum);
+  private oddBlobSize(minimum: string, minUnit: string, maximum: string, maxUnit: string) {
+    const min = this.formatter.toBytes(minimum + minUnit);
+    const max = this.formatter.toBytes(maximum + maxUnit);
     return Boolean(min && max && min >= max);
   }
 
@@ -674,7 +722,7 @@ export class PoolFormComponent extends CdForm implements OnInit {
       return;
     }
     const name = value[nameAttribute];
-    this.modalService.show(CriticalConfirmationModalComponent, {
+    this.modalService.show(DeleteConfirmationModalComponent, {
       itemDescription,
       itemNames: [name],
       submitActionObservable: () => {
@@ -766,7 +814,10 @@ export class PoolFormComponent extends CdForm implements OnInit {
       {
         externalFieldName: 'quota_max_bytes',
         formControlName: 'max_bytes',
-        replaceFn: this.formatter.toBytes,
+        replaceFn: (value: string) => {
+          const unit = this.form.getValue('maxBytesUnit');
+          return this.formatter.toBytes(value + unit);
+        },
         editable: true,
         resetValue: this.editing ? 0 : undefined
       },
@@ -775,7 +826,14 @@ export class PoolFormComponent extends CdForm implements OnInit {
         formControlName: 'max_objects',
         editable: true,
         resetValue: this.editing ? 0 : undefined
-      }
+      },
+      this.data.applications.selected.includes('rbd')
+        ? { externalFieldName: 'rbd_mirroring', formControlName: 'rbdMirroring' }
+        : {
+            externalFieldName: 'rbd_mirroring',
+            formControlName: 'rbdMirroring',
+            resetValue: undefined
+          }
     ]);
 
     if (this.info.is_all_bluestore) {
@@ -801,14 +859,20 @@ export class PoolFormComponent extends CdForm implements OnInit {
           {
             externalFieldName: 'compression_min_blob_size',
             formControlName: 'minBlobSize',
-            replaceFn: this.formatter.toBytes,
+            replaceFn: (value: string) => {
+              const unit = this.form.getValue('minBlobSizeUnit');
+              return this.formatter.toBytes(value + unit);
+            },
             editable: true,
             resetValue: 0
           },
           {
             externalFieldName: 'compression_max_blob_size',
             formControlName: 'maxBlobSize',
-            replaceFn: this.formatter.toBytes,
+            replaceFn: (value: string) => {
+              const unit = this.form.getValue('maxBlobSizeUnit');
+              return this.formatter.toBytes(value + unit);
+            },
             editable: true,
             resetValue: 0
           },
@@ -840,12 +904,23 @@ export class PoolFormComponent extends CdForm implements OnInit {
     const apps = this.data.applications.selected;
     if (apps.length > 0 || this.editing) {
       pool['application_metadata'] = apps;
+      if (apps.includes('rbd')) {
+        pool['rbd_mirroring'] = this.form.getValue('rbdMirroring');
+      }
+      this.isApplicationsSelected = true;
+    } else {
+      this.isApplicationsSelected = false;
     }
 
     // Only collect configuration data for replicated pools, as QoS cannot be configured on EC
     // pools. EC data pools inherit their settings from the corresponding replicated metadata pool.
     if (this.isReplicated && !_.isEmpty(this.currentConfigurationValues)) {
       pool['configuration'] = this.currentConfigurationValues;
+    }
+
+    if (!this.isApplicationsSelected) {
+      this.form.setErrors({ cdSubmitButton: true });
+      return;
     }
 
     this.triggerApiTask(pool);
@@ -892,10 +967,11 @@ export class PoolFormComponent extends CdForm implements OnInit {
   }
 
   private triggerApiTask(pool: Record<string, any>) {
+    const poolName = pool.hasOwnProperty('srcpool') ? pool.srcpool : pool.pool;
     this.taskWrapper
       .wrapTaskAroundCall({
         task: new FinishedTask('pool/' + (this.editing ? URLVerbs.EDIT : URLVerbs.CREATE), {
-          pool_name: pool.hasOwnProperty('srcpool') ? pool.srcpool : pool.pool
+          pool_name: poolName
         }),
         call: this.poolService[this.editing ? URLVerbs.UPDATE : URLVerbs.CREATE](pool)
       })
@@ -912,5 +988,13 @@ export class PoolFormComponent extends CdForm implements OnInit {
 
   appSelection() {
     this.form.get('name').updateValueAndValidity({ emitEvent: false, onlySelf: true });
+  }
+
+  erasureProfileChange() {
+    const profile = this.form.get('erasureProfile').value;
+    if (profile) {
+      this.msrCrush =
+        profile['crush-num-failure-domains'] > 0 || profile['crush-osds-per-failure-domain'] > 0;
+    }
   }
 }

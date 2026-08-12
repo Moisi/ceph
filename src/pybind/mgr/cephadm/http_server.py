@@ -4,7 +4,7 @@ import logging
 from typing import TYPE_CHECKING
 
 from cephadm.agent import AgentEndpoint
-from cephadm.service_discovery import ServiceDiscovery
+from cephadm.services.service_discovery import ServiceDiscovery
 from mgr_util import test_port_allocation, PortAlreadyInUse
 from orchestrator import OrchestratorError
 
@@ -12,7 +12,7 @@ if TYPE_CHECKING:
     from cephadm.module import CephadmOrchestrator
 
 
-def cherrypy_filter(record: logging.LogRecord) -> int:
+def cherrypy_filter(record: logging.LogRecord) -> bool:
     blocked = [
         'TLSV1_ALERT_DECRYPT_ERROR'
     ]
@@ -31,6 +31,8 @@ class CephadmHttpServer(threading.Thread):
         self.service_discovery = ServiceDiscovery(mgr)
         self.cherrypy_shutdown_event = threading.Event()
         self._service_discovery_port = self.mgr.service_discovery_port
+        security_enabled, _, _ = self.mgr._get_security_config()
+        self.security_enabled = security_enabled
         super().__init__(target=self.run)
 
     def configure_cherrypy(self) -> None:
@@ -42,10 +44,16 @@ class CephadmHttpServer(threading.Thread):
     def configure(self) -> None:
         self.configure_cherrypy()
         self.agent.configure()
-        self.service_discovery.configure(self.mgr.service_discovery_port, self.mgr.get_mgr_ip())
+        self.service_discovery.configure(self.mgr.service_discovery_port,
+                                         self.mgr.get_mgr_ip(),
+                                         self.security_enabled)
 
     def config_update(self) -> None:
         self.service_discovery_port = self.mgr.service_discovery_port
+        security_enabled, _, _ = self.mgr._get_security_config()
+        if self.security_enabled != security_enabled:
+            self.security_enabled = security_enabled
+            self.restart()
 
     @property
     def service_discovery_port(self) -> int:

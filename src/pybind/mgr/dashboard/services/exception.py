@@ -34,7 +34,7 @@ def serialize_dashboard_exception(e, include_http_status=False, task=None):
     component = getattr(e, 'component', None)
     out['component'] = component if component else None
     if include_http_status:
-        out['status'] = getattr(e, 'status', 500)
+        out['status'] = getattr(e, 'status', 500)  # type: ignore
     if task:
         out['task'] = dict(name=task.name, metadata=task.metadata)  # type: ignore
     return out
@@ -49,9 +49,14 @@ def dashboard_exception_handler(handler, *args, **kwargs):
     except (cherrypy.HTTPRedirect, cherrypy.NotFound, cherrypy.HTTPError):
         raise
     except (ViewCacheNoDataException, DashboardException) as error:
-        logger.exception('Dashboard Exception')
+        http_status = getattr(error, 'status', 400)
+        cherrypy.response.status = http_status
         cherrypy.response.headers['Content-Type'] = 'application/json'
-        cherrypy.response.status = getattr(error, 'status', 400)
+
+        if http_status >= 500:
+            logger.exception('Dashboard Exception')
+        else:
+            logger.info('Dashboard Exception: %s', error)
         return json.dumps(serialize_dashboard_exception(error)).encode('utf-8')
     except Exception as error:
         logger.exception('Internal Server Error')

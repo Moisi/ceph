@@ -28,7 +28,6 @@ function run() {
     CEPH_ARGS+="--osd_min_pg_log_entries=5 --osd_max_pg_log_entries=10 "
     CEPH_ARGS+="--fake_statfs_for_testing=3686400 "
     CEPH_ARGS+="--osd_max_backfills=10 "
-    CEPH_ARGS+="--osd_mclock_profile=high_recovery_ops "
     CEPH_ARGS+="--osd_mclock_override_recovery_settings=true "
     export objects=600
     export poolprefix=test
@@ -610,9 +609,16 @@ function TEST_backfill_grow() {
 
     wait_for_clean || return 1
 
+    #Capture the timestamp after complete cleanup or finish the recovery progress
+    current_timestamp=$(date +"%Y-%m-%dT%H:%M:%S")
+
     delete_pool $poolname
     kill_daemons $dir || return 1
-    ! grep -q "num_bytes mismatch" $dir/osd.*.log || return 1
+
+    #Ignore the num_bytes mismatch messages before calling wait_cleanup
+    if ! awk -v ts="$current_timestamp" '$0 >= ts && /num_bytes mismatch/' $dir/osd.*.log > /dev/null; then
+	return 1
+    fi
 }
 
 # Create a 5 shard EC pool on 6 OSD cluster

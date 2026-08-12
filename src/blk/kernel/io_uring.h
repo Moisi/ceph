@@ -8,6 +8,10 @@
 #include "include/types.h"
 #include "aio/aio.h"
 
+#include <list>
+#include <memory>
+#include <vector>
+
 struct ioring_data;
 
 struct ioring_queue_t final : public io_queue_t {
@@ -27,7 +31,7 @@ struct ioring_queue_t final : public io_queue_t {
   int init(std::vector<int> &fds) final;
   void shutdown() final;
 
-  int submit_batch(aio_iter begin, aio_iter end, uint16_t aios_size,
-                   void *priv, int *retries) final;
+  int submit_batch(aio_iter begin, aio_iter end,
+                   void *priv, int *retries, int submit_retries, int initial_delay_us) final;
   int get_next_completed(int timeout_ms, aio_t **paio, int max) final;
 };

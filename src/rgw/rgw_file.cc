@@ -23,7 +23,7 @@
 #include "rgw_user.h"
 #include "rgw_bucket.h"
 #include "rgw_zone.h"
-#include "rgw_file.h"
+#include "rgw_file_int.h"
 #include "rgw_lib_frontend.h"
 #include "rgw_perf_counters.h"
 #include "common/errno.h"
@@ -182,7 +182,7 @@ namespace rgw {
     LookupFHResult fhr{nullptr, 0};
 
     /* XXX the need for two round-trip operations to identify file or
-     * directory leaf objects is unecessary--the current proposed
+     * directory leaf objects is unnecessary--the current proposed
      * mechanism to avoid this is to store leaf object names with an
      * object locator w/o trailing slash */
 
@@ -345,7 +345,7 @@ namespace rgw {
     int rc = g_rgwlib->get_fe()->execute_req(&req);
     if ((rc == 0) &&
         ((rc = req.get_ret()) == 0)) {
-      lock_guard(rgw_fh->mtx);
+      lock_guard guard(rgw_fh->mtx);
       rgw_fh->set_atime(real_clock::to_timespec(real_clock::now()));
       *bytes_read = req.nread;
     }
@@ -383,6 +383,7 @@ namespace rgw {
 	/* implies !rgw_fh, so also !LOCKED */
 	return -ENOENT;
       }
+      assert(rgw_fh);
 
       if (bs.num_entries > 1) {
 	unref(bkt_fh); /* return stat_bucket ref */
@@ -414,7 +415,7 @@ namespace rgw {
        * leaf object
        */
       if (! rgw_fh) {
-	/* XXX for now, peform a hard lookup to deduce the type of
+	/* XXX for now, perform a hard lookup to deduce the type of
 	 * object to be deleted ("foo" vs. "foo/")--also, ensures
 	 * atomicity at this endpoint */
 	struct rgw_file_handle *fh;
@@ -449,6 +450,7 @@ namespace rgw {
 
     /* ENOENT when raced with other s3 gateway */
     if (! rc || rc == -ENOENT) {
+      // coverity[var_deref_op:SUPPRESS]
       rgw_fh->flags |= RGWFileHandle::FLAG_DELETED;
       fh_cache.remove(rgw_fh->fh.fh_hk.object, rgw_fh,
 		      RGWFileHandle::FHCache::FLAG_LOCK);
@@ -899,6 +901,10 @@ namespace rgw {
     }
     break;
     default:
+      if (unlikely(rgw_fh->is_bucket())) {
+	/* treat buckets like immutable, namespace roots */
+	return 0; /* it's not an error, we just won't do it */
+      }
       break;
     };
 
@@ -1342,7 +1348,7 @@ namespace rgw {
 	      goto rele;
 	    }
 	    /* maybe clear state */
-	    d = get<directory>(&rgw_fh->variant_type);
+	    d = std::get_if<directory>(&rgw_fh->variant_type);
 	    if (d) {
 	      struct timespec ev_ts = ev.ts;
 	      lock_guard guard(rgw_fh->mtx);
@@ -1504,7 +1510,7 @@ namespace rgw {
     if (factory == nullptr) {
       return false;
     }
-    /* make sure the reclaiming object is the same partiton with newobject factory,
+    /* make sure the reclaiming object is the same partition with newobject factory,
      * then we can recycle the object, and replace with newobject */
     if (!fs->fh_cache.is_same_partition(factory->fhk.fh_hk.object, fh.fh_hk.object)) {
       return false;
@@ -1537,8 +1543,7 @@ namespace rgw {
   std::ostream& operator<<(std::ostream &os,
 			   RGWFileHandle::readdir_offset const &offset)
   {
-    using boost::get;
-    if (unlikely(!! get<uint64_t*>(&offset))) {
+    if (unlikely(!!std::get_if<uint64_t*>(&offset))) {
       uint64_t* ioff = get<uint64_t*>(offset);
       os << *ioff;
     }
@@ -1562,7 +1567,7 @@ namespace rgw {
       << object_name()
       << dendl;
 
-    directory* d = get<directory>(&variant_type);
+    directory* d = std::get_if<directory>(&variant_type);
     if (d) {
       (void) clock_gettime(CLOCK_MONOTONIC_COARSE, &now); /* !LOCKED */
       lock_guard guard(mtx);
@@ -1572,7 +1577,7 @@ namespace rgw {
     bool initial_off;
     char* mk{nullptr};
 
-    if (likely(!! get<const char*>(&offset))) {
+    if (likely(!!std::get_if<const char*>(&offset))) {
       mk = const_cast<char*>(get<const char*>(offset));
       initial_off = !mk;
     } else {
@@ -1629,7 +1634,7 @@ namespace rgw {
 
     int rc = 0;
 
-    file* f = get<file>(&variant_type);
+    file* f = std::get_if<file>(&variant_type);
     if (! f)
       return -EISDIR;
 
@@ -1748,7 +1753,7 @@ namespace rgw {
       guard.lock();
     }
 
-    file* f = get<file>(&variant_type);
+    file* f = std::get_if<file>(&variant_type);
     if (f && (f->write_req)) {
       lsubdout(fs->get_context(), rgw, 10)
 	<< __func__
@@ -1784,7 +1789,7 @@ namespace rgw {
 
   void RGWFileHandle::clear_state()
   {
-    directory* d = get<directory>(&variant_type);
+    directory* d = std::get_if<directory>(&variant_type);
     if (d) {
       state.nlink = 2;
       d->last_marker = rgw_obj_key{};
@@ -1819,6 +1824,33 @@ namespace rgw {
     }
   }
 
+  bool RGWListBucketsRequest::eof() {
+    if (unlikely(cct->_conf->subsys.should_gather(ceph_subsys_rgw, 15))) {
+      bool is_offset =
+	unlikely(!std::get_if<const char*>(&offset)) ||
+	!! get<const char*>(offset);
+      lsubdout(cct, rgw, 15) << "READDIR offset: " <<
+	((is_offset) ? offset : "(nil)")
+			     << " is_truncated: " << is_truncated
+			     << dendl;
+    }
+    return !is_truncated && !rcb_eof;
+  }
+
+  bool RGWReaddirRequest::eof() {
+    if (unlikely(cct->_conf->subsys.should_gather(ceph_subsys_rgw, 15))) {
+      bool is_offset =
+	unlikely(!std::get_if<const char*>(&offset)) ||
+	!! get<const char*>(offset);
+      lsubdout(cct, rgw, 15) << "READDIR offset: " <<
+	((is_offset) ? offset : "(nil)")
+			     << " next marker: " << next_marker
+			     << " is_truncated: " << is_truncated
+			     << dendl;
+    }
+    return !is_truncated && !rcb_eof;
+  }
+
   int RGWWriteRequest::exec_start() {
     req_state* state = get_state();
 
@@ -1832,7 +1864,8 @@ namespace rgw {
     ceph_assert(! dlo_manifest);
     ceph_assert(! slo_info);
 
-    perfcounter->inc(l_rgw_put);
+    counters = rgw::op_counters::get(state);
+    rgw::op_counters::inc(counters, l_rgw_op_put_obj, 1);
     op_ret = -EINVAL;
 
     if (state->object->empty()) {
@@ -1864,8 +1897,8 @@ namespace rgw {
         version_id = state->object->get_instance();
       }
     }
-    processor = get_driver()->get_atomic_writer(this, state->yield, state->object->clone(),
-					 state->bucket_owner.get_id(),
+    processor = get_driver()->get_atomic_writer(this, state->yield, state->object.get(),
+					 state->bucket_owner,
 					 &state->dest_placement, 0, state->req_id);
 
     op_ret = processor->prepare(state->yield);
@@ -1931,6 +1964,7 @@ namespace rgw {
     char calc_md5[CEPH_CRYPTO_MD5_DIGESTSIZE * 2 + 1];
     unsigned char m[CEPH_CRYPTO_MD5_DIGESTSIZE];
     req_state* state = get_state();
+    const req_context rctx{this, state->yield, nullptr};
 
     size_t osize = rgw_fh->get_size();
     struct timespec octime = rgw_fh->get_ctime();
@@ -1938,7 +1972,7 @@ namespace rgw {
     real_time appx_t = real_clock::now();
 
     state->obj_size = bytes_written;
-    perfcounter->inc(l_rgw_put_b, state->obj_size);
+    rgw::op_counters::inc(counters, l_rgw_op_put_obj_b, state->obj_size);
 
     // flush data in filters
     op_ret = filter->process({}, state->obj_size);
@@ -1959,12 +1993,14 @@ namespace rgw {
       RGWCompressionInfo cs_info;
       cs_info.compression_type = plugin->get_type_name();
       cs_info.orig_size = state->obj_size;
+      cs_info.compressor_message = compressor->get_compressor_message();
       cs_info.blocks = std::move(compressor->get_compression_blocks());
       encode(cs_info, tmp);
       attrs[RGW_ATTR_COMPRESSION] = tmp;
       ldpp_dout(this, 20) << "storing " << RGW_ATTR_COMPRESSION
 			<< " with type=" << cs_info.compression_type
 			<< ", orig_size=" << cs_info.orig_size
+			<< ", compressor_message=" << cs_info.compressor_message
 			<< ", blocks=" << cs_info.blocks.size() << dendl;
     }
 
@@ -2010,9 +2046,9 @@ namespace rgw {
     }
 
     op_ret = processor->complete(state->obj_size, etag, &mtime, real_time(), attrs,
-                                 (delete_at ? *delete_at : real_time()),
-                                if_match, if_nomatch, nullptr, nullptr, nullptr,
-                                state->yield);
+                                 rgw::cksum::no_cksum, (delete_at ? *delete_at : real_time()),
+				 if_match, if_nomatch, nullptr, nullptr, nullptr,
+				 rctx, rgw::sal::FLAG_LOG_OP);
     if (op_ret != 0) {
       /* revert attr updates */
       rgw_fh->set_mtime(omtime);
@@ -2021,7 +2057,7 @@ namespace rgw {
     }
 
   done:
-    perfcounter->tinc(l_rgw_put_lat, state->time_elapsed());
+    rgw::op_counters::tinc(counters, l_rgw_op_put_obj_lat, state->time_elapsed());
     return op_ret;
   } /* exec_finish */
 

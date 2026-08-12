@@ -10,6 +10,7 @@
 #include "common/admin_socket.h"
 #include "common/debug.h"
 #include "common/errno.h"
+#include "include/intarith.h" // for p2roundup()
 #include "journal/Types.h"
 #include "librbd/ImageCtx.h"
 #include "perfglue/heap_profiler.h"
@@ -502,6 +503,7 @@ Mirror::Mirror(CephContext *cct, const std::vector<const char*> &args) :
   m_cache_manager_handler(new CacheManagerHandler(cct)),
   m_pool_meta_cache(new PoolMetaCache(cct)),
   m_asok_hook(new MirrorAdminSocketHook(cct, this)) {
+  dout(10) << "args=" << args << dendl;
 }
 
 Mirror::~Mirror()
@@ -703,15 +705,23 @@ void Mirror::update_pool_replayers(const PoolPeers &pool_peers,
   for (auto it = m_pool_replayers.begin(); it != m_pool_replayers.end();) {
     auto &peer = it->first.second;
     auto pool_peer_it = pool_peers.find(it->first.first);
-    if (pool_peer_it == pool_peers.end() ||
-        pool_peer_it->second.find(peer) == pool_peer_it->second.end()) {
-      dout(20) << "removing pool replayer for " << peer << dendl;
-      // TODO: make async
-      it->second->shut_down();
-      it = m_pool_replayers.erase(it);
-    } else {
-      ++it;
+    if (pool_peer_it != pool_peers.end()) {
+      // look up this pool replayer's peer by UUID
+      auto peer_it = pool_peer_it->second.find(peer);
+      if (peer_it != pool_peer_it->second.end()) {
+        // keep this pool replayer only if its peer is a full match
+        // otherwise, the pool replayer should be recreated since the
+        // peer was updated
+        if (*peer_it == peer) {
+          ++it;
+          continue;
+        }
+      }
     }
+    dout(20) << "removing pool replayer for " << peer << dendl;
+    // TODO: make async
+    it->second->shut_down();
+    it = m_pool_replayers.erase(it);
   }
 
   for (auto &kv : pool_peers) {

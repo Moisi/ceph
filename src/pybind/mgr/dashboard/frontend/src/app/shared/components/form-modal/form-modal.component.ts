@@ -1,7 +1,7 @@
-import { Component, OnInit } from '@angular/core';
-import { FormControl, ValidatorFn, Validators } from '@angular/forms';
+import { Component, Inject, OnInit, Optional } from '@angular/core';
+import { AsyncValidatorFn, UntypedFormControl, ValidatorFn, Validators } from '@angular/forms';
 
-import { NgbActiveModal } from '@ng-bootstrap/ng-bootstrap';
+import { BaseModal } from 'carbon-components-angular';
 import _ from 'lodash';
 
 import { CdFormBuilder } from '~/app/shared/forms/cd-form-builder';
@@ -15,59 +15,79 @@ import { FormatterService } from '~/app/shared/services/formatter.service';
   templateUrl: './form-modal.component.html',
   styleUrls: ['./form-modal.component.scss']
 })
-export class FormModalComponent implements OnInit {
-  // Input
-  titleText: string;
-  message: string;
-  fields: CdFormModalFieldConfig[];
-  submitButtonText: string;
-  onSubmit: Function;
-
+export class FormModalComponent extends BaseModal implements OnInit {
   // Internal
   formGroup: CdFormGroup;
 
   constructor(
-    public activeModal: NgbActiveModal,
     private formBuilder: CdFormBuilder,
     private formatter: FormatterService,
-    private dimlessBinaryPipe: DimlessBinaryPipe
-  ) {}
+    private dimlessBinaryPipe: DimlessBinaryPipe,
+
+    // Inputs
+    @Optional() @Inject('titleText') public titleText: string,
+    @Optional() @Inject('fields') public fields: CdFormModalFieldConfig[],
+    @Optional() @Inject('submitButtonText') public submitButtonText: string,
+    @Optional() @Inject('onSubmit') public onSubmit: Function,
+    @Optional() @Inject('message') public message = '',
+    @Optional() @Inject('updateAsyncValidators') public updateAsyncValidators: Function
+  ) {
+    super();
+  }
 
   ngOnInit() {
     this.createForm();
   }
 
   createForm() {
-    const controlsConfig: Record<string, FormControl> = {};
+    const controlsConfig: Record<string, UntypedFormControl> = {};
     this.fields.forEach((field) => {
       controlsConfig[field.name] = this.createFormControl(field);
     });
     this.formGroup = this.formBuilder.group(controlsConfig);
   }
 
-  private createFormControl(field: CdFormModalFieldConfig): FormControl {
+  private createFormControl(field: CdFormModalFieldConfig): UntypedFormControl {
     let validators: ValidatorFn[] = [];
+    let asyncValidators: AsyncValidatorFn[] = [];
     if (_.isBoolean(field.required) && field.required) {
       validators.push(Validators.required);
     }
     if (field.validators) {
       validators = validators.concat(field.validators);
     }
-    return new FormControl(
+    if (field.asyncValidators) {
+      asyncValidators = asyncValidators.concat(field.asyncValidators);
+    }
+
+    const control = new UntypedFormControl(
       _.defaultTo(
         field.type === 'binary' ? this.dimlessBinaryPipe.transform(field.value) : field.value,
         null
       ),
-      { validators }
+      { validators, asyncValidators }
     );
+
+    if (field.type === 'select-badges' && field.value) control.setValue(field.value);
+
+    if (field.valueChangeListener) {
+      control.valueChanges.subscribe((value) => {
+        const validatorToUpdate = this.updateAsyncValidators(value);
+        this.updateValidation(field.dependsOn, validatorToUpdate);
+      });
+    }
+    return control;
   }
 
   getError(field: CdFormModalFieldConfig): string {
     const formErrors = this.formGroup.get(field.name).errors;
-    const errors = Object.keys(formErrors).map((key) => {
+    if (!formErrors) {
+      return '';
+    }
+    const errors = Object.keys(formErrors)?.map((key) => {
       return this.getErrorMessage(key, formErrors[key], field.errors);
     });
-    return errors.join('<br>');
+    return errors?.join('<br>');
   }
 
   private getErrorMessage(
@@ -89,6 +109,9 @@ export class FormModalComponent implements OnInit {
     if (error === 'required') {
       return $localize`This field is required.`;
     }
+    if (error === 'pattern') {
+      return $localize`Size must be a number or in a valid format. eg: 5 GiB`;
+    }
     return $localize`An error occurred.`;
   }
 
@@ -102,9 +125,15 @@ export class FormModalComponent implements OnInit {
         values[key] = this.formatter.toBytes(value);
       }
     });
-    this.activeModal.close();
+    this.closeModal();
     if (_.isFunction(this.onSubmit)) {
       this.onSubmit(values);
     }
+  }
+
+  updateValidation(name?: string, validator?: AsyncValidatorFn[]) {
+    const field = this.formGroup.get(name);
+    field.setAsyncValidators(validator);
+    field.updateValueAndValidity();
   }
 }

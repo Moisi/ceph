@@ -16,19 +16,22 @@
 #define CEPH_OBJECT_H
 
 #include <cstdint>
-#include <cstdio>
-#include <iomanip>
 #include <iosfwd>
+#include <list>
 #include <string>
 #include <string>
 #include <string_view>
 
+#include <fmt/compile.h>
+#include <fmt/format.h>
+
 #include "include/rados.h"
-#include "include/unordered_map.h"
 
 #include "hash.h"
 #include "encoding.h"
 #include "ceph_hash.h"
+
+namespace ceph { class Formatter; }
 
 struct object_t {
   std::string name;
@@ -50,20 +53,16 @@ struct object_t {
     name.clear();
   }
 
-  void encode(ceph::buffer::list &bl) const {
-    using ceph::encode;
-    encode(name, bl);
-  }
-  void decode(ceph::buffer::list::const_iterator &bl) {
-    using ceph::decode;
-    decode(name, bl);
-  }
+  void encode(ceph::buffer::list &bl) const;
+  void decode(ceph::buffer::list::const_iterator &bl);
+
+  void dump(ceph::Formatter *f) const;
+
+  static std::list<object_t> generate_test_instances();
 };
 WRITE_CLASS_ENCODER(object_t)
 
-inline std::ostream& operator<<(std::ostream& out, const object_t& o) {
-  return out << o.name;
-}
+std::ostream& operator<<(std::ostream& out, const object_t& o);
 
 namespace std {
 template<> struct hash<object_t> {
@@ -84,11 +83,7 @@ struct file_object_t {
     buf[0] = 0;
   }
   
-  const char *c_str() const {
-    if (!buf[0])
-      snprintf(buf, sizeof(buf), "%llx.%08llx", (long long unsigned)ino, (long long unsigned)bno);
-    return buf;
-  }
+  const char *c_str() const;
 
   operator object_t() {
     return object_t(c_str());
@@ -102,10 +97,10 @@ struct file_object_t {
 struct snapid_t {
   uint64_t val;
   // cppcheck-suppress noExplicitConstructor
-  snapid_t(uint64_t v=0) : val(v) {}
+  constexpr snapid_t(uint64_t v=0) : val(v) {}
   snapid_t operator+=(snapid_t o) { val += o.val; return *this; }
   snapid_t operator++() { ++val; return *this; }
-  operator uint64_t() const { return val; }
+  constexpr operator uint64_t() const { return val; }
 };
 
 inline void encode(snapid_t i, ceph::buffer::list &bl) {
@@ -134,15 +129,27 @@ struct denc_traits<snapid_t> {
   }
 };
 
-inline std::ostream& operator<<(std::ostream& out, const snapid_t& s) {
-  if (s == CEPH_NOSNAP)
-    return out << "head";
-  else if (s == CEPH_SNAPDIR)
-    return out << "snapdir";
-  else
-    return out << std::hex << s.val << std::dec;
-}
+std::ostream& operator<<(std::ostream& out, const snapid_t& s);
 
+namespace fmt {
+template <>
+struct formatter<snapid_t> {
+
+  constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
+
+  template <typename FormatContext>
+  auto format(const snapid_t& snp, FormatContext& ctx) const
+  {
+    if (snp == CEPH_NOSNAP) {
+      return fmt::format_to(ctx.out(), "head");
+    }
+    if (snp == CEPH_SNAPDIR) {
+      return fmt::format_to(ctx.out(), "snapdir");
+    }
+    return fmt::format_to(ctx.out(), FMT_COMPILE("{:x}"), snp.val);
+  }
+};
+} // namespace fmt
 
 struct sobject_t {
   object_t oid;
@@ -170,12 +177,13 @@ struct sobject_t {
     decode(oid, bl);
     decode(snap, bl);
   }
+  void dump(ceph::Formatter *f) const;
+  static std::list<sobject_t> generate_test_instances();
 };
 WRITE_CLASS_ENCODER(sobject_t)
 
-inline std::ostream& operator<<(std::ostream& out, const sobject_t &o) {
-  return out << o.oid << "/" << o.snap;
-}
+std::ostream& operator<<(std::ostream& out, const sobject_t &o);
+
 namespace std {
 template<> struct hash<sobject_t> {
   size_t operator()(const sobject_t &r) const {

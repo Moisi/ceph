@@ -5,6 +5,7 @@
 
 #include "common/Formatter.h"
 
+#include "crimson/common/coroutine.h"
 #include "crimson/osd/osd.h"
 #include "crimson/osd/osd_connection_priv.h"
 #include "crimson/osd/osd_operation_external_tracking.h"
@@ -16,12 +17,14 @@ namespace {
   }
 }
 
+SET_SUBSYS(osd);
+
 namespace crimson::osd {
 
 RepRequest::RepRequest(crimson::net::ConnectionRef&& conn,
 		       Ref<MOSDRepOp> &&req)
-  : conn{std::move(conn)},
-    req{req}
+  : RemoteOperation{std::move(conn)},
+    req{std::move(req)}
 {}
 
 void RepRequest::print(std::ostream& os) const
@@ -46,23 +49,71 @@ void RepRequest::dump_detail(Formatter *f) const
 
 ConnectionPipeline &RepRequest::get_connection_pipeline()
 {
-  return get_osd_priv(conn.get()).replicated_request_conn_pipeline;
+  return get_osd_priv(&get_connection()
+  ).replicated_request_conn_pipeline;
 }
 
-RepRequest::PGPipeline &RepRequest::pp(PG &pg)
+PerShardPipeline &RepRequest::get_pershard_pipeline(
+    ShardServices &shard_services)
 {
-  return pg.replicated_request_pg_pipeline;
+  return shard_services.get_replicated_request_pipeline();
+}
+
+PGRepopPipeline &RepRequest::repop_pipeline(PG &pg)
+{
+  return pg.repop_pipeline;
+}
+
+RepRequest::interruptible_future<> RepRequest::with_pg_interruptible(
+  Ref<PG> pg)
+{
+  LOG_PREFIX(RepRequest::with_pg_interruptible);
+  DEBUGI("{}", *this);
+  req->finish_decode();
+  co_await this->template enter_stage<interruptor>(repop_pipeline(*pg).process);
+  co_await interruptor::make_interruptible(this->template with_blocking_event<
+    PG_OSDMapGate::OSDMapBlocker::BlockingEvent
+    >([this, pg](auto &&trigger) {
+      return pg->osdmap_gate.wait_for_map(
+	std::move(trigger), req->min_epoch);
+    }));
+
+  if (pg->can_discard_replica_op(*req)) {
+    co_return;
+  }
+
+  auto [commit_fut, reply] = co_await pg->handle_rep_op(req);
+
+  // Transitions from OrderedExclusive->OrderedConcurrent cannot block
+  this->enter_stage_sync(repop_pipeline(*pg).wait_commit);
+
+  co_await std::move(commit_fut);
+
+  co_await this->template enter_stage<interruptor>(
+    repop_pipeline(*pg).send_reply);
+
+  co_await interruptor::make_interruptible(
+    pg->shard_services.send_to_osd(
+      req->from.osd, std::move(reply), pg->get_osdmap_epoch())
+  );
 }
 
 seastar::future<> RepRequest::with_pg(
   ShardServices &shard_services, Ref<PG> pg)
 {
-  logger().debug("{}: RepRequest::with_pg", *this);
-
+  LOG_PREFIX(RepRequest::with_pg);
+  DEBUGI("{}", *this);
   IRef ref = this;
   return interruptor::with_interruption([this, pg] {
-    return pg->handle_rep_op(req);
-  }, [ref](std::exception_ptr) { return seastar::now(); }, pg);
+    return with_pg_interruptible(pg);
+  }, [](std::exception_ptr) {
+    return seastar::now();
+  }, pg, pg->get_osdmap_epoch()
+  ).finally([this, pg, ref=std::move(ref)]() mutable {
+    logger().debug("{}: exit", *this);
+    return handle.complete(
+    ).finally([ref=std::move(ref), pg=std::move(pg)] {});
+  });
 }
 
 }

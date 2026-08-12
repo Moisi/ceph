@@ -26,6 +26,8 @@ class Scope(object):
     USER = "user"
     DASHBOARD_SETTINGS = "dashboard-settings"
     NFS_GANESHA = "nfs-ganesha"
+    NVME_OF = "nvme-of"
+    SMB = "smb"
 
     @classmethod
     def all_scopes(cls):

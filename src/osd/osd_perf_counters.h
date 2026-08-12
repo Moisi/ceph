@@ -5,8 +5,9 @@
 
 #include "include/common_fwd.h"
 #include "common/perf_counters.h"
+#include "common/perf_counters_key.h"
 
-enum {
+enum osd_counter_idx_t {
   l_osd_first = 10000,
   l_osd_op_wip,
   l_osd_op,
@@ -36,8 +37,16 @@ enum {
   l_osd_op_rw_process_lat,
   l_osd_op_rw_prepare_lat,
 
+  l_osd_op_delayed_unreadable,
+  l_osd_op_delayed_degraded,
+
   l_osd_op_before_queue_op_lat,
   l_osd_op_before_dequeue_op_lat,
+
+  l_osd_replica_read,
+  l_osd_replica_read_redirect_missing,
+  l_osd_replica_read_redirect_conflict,
+  l_osd_replica_read_served,
 
   l_osd_sop,
   l_osd_sop_inb,
@@ -58,6 +67,16 @@ enum {
   l_osd_rop,
   l_osd_rbytes,
 
+  l_osd_recovery_push_queue_lat,
+  l_osd_recovery_push_reply_queue_lat,
+  l_osd_recovery_pull_queue_lat,
+  l_osd_recovery_backfill_queue_lat,
+  l_osd_recovery_backfill_remove_queue_lat,
+  l_osd_recovery_scan_queue_lat,
+
+  l_osd_recovery_queue_lat,
+  l_osd_recovery_context_queue_lat,
+
   l_osd_loadavg,
   l_osd_cached_crc,
   l_osd_cached_crc_adjusted,
@@ -72,6 +91,8 @@ enum {
   l_osd_map,
   l_osd_mape,
   l_osd_mape_dup,
+  l_osd_full_map_received,
+  l_osd_inc_map_received,
 
   l_osd_waiting_for_map,
 
@@ -118,6 +139,81 @@ enum {
   l_osd_pg_fastinfo,
   l_osd_pg_biginfo,
 
+  // scrubber related. Here, as the rest of the scrub counters
+  // are labeled, and histograms do not fully support labels.
+  l_osd_scrub_reservation_dur_hist,
+
+  l_osd_watch_timeouts,
+
+  // scrub I/O (no EC vs. replicated differentiation)
+  l_osd_scrub_omapgetheader_cnt,  ///< omap get header calls count
+  l_osd_scrub_omapgetheader_bytes,  ///< bytes read by omap get header
+  l_osd_scrub_omapget_cnt,      ///< omap get calls count
+  l_osd_scrub_omapget_bytes,    ///< total bytes read by omap get
+
+  // ----   scrub I/O - replicated pools
+  l_osd_scrub_rppool_getattr_cnt, ///< get_attr calls count
+  l_osd_scrub_rppool_stats_cnt, ///< stats calls count
+  l_osd_scrub_rppool_read_cnt, ///< read calls count
+  l_osd_scrub_rppool_read_bytes, ///< total bytes read
+
+  // ----   scrub I/O - EC
+  l_osd_scrub_ec_getattr_cnt, ///< get_attr calls count
+  l_osd_scrub_ec_stats_cnt, ///< stats calls count
+  l_osd_scrub_ec_read_cnt, ///< read calls count
+  l_osd_scrub_ec_read_bytes, ///< total bytes read
+
+  // ----   scrub - replicated pools
+  l_osd_scrub_rppool_started, ///< scrubs that got started
+  l_osd_scrub_rppool_active_started, ///< scrubs that got past replicas reservation
+  l_osd_scrub_rppool_successful, ///< successful scrubs count
+  l_osd_scrub_rppool_successful_elapsed, ///< time to complete a successful scrub
+  l_osd_scrub_rppool_failed, ///< failed scrubs count
+  l_osd_scrub_rppool_failed_elapsed, ///< time from start to failure
+
+  // ----   scrub reservation process - replicated pools
+
+  /// successful replicas reservation count
+  l_osd_scrub_rppool_reserv_success,
+  /// time to complete a successful replicas reservation
+  l_osd_scrub_rppool_reserv_successful_elapsed,
+  /// failed attempt to reserve replicas due to an abort
+  l_osd_scrub_rppool_reserv_aborted,
+  /// reservation failed due to a 'rejected' response
+  l_osd_scrub_rppool_reserv_rejected,
+  /// reservation skipped for high-priority scrubs
+  l_osd_scrub_rppool_reserv_skipped,
+  /// time for a replicas reservation process to fail
+  l_osd_scrub_rppool_reserv_failed_elapsed,
+  /// number of replicas
+  l_osd_scrub_rppool_reserv_secondaries_num,
+
+
+  // ----   scrub - EC
+  l_osd_scrub_ec_started, ///< scrubs that got started
+  l_osd_scrub_ec_active_started, /// scrubs that got past secondaries reservation
+  l_osd_scrub_ec_successful, ///< successful scrubs count
+  l_osd_scrub_ec_successful_elapsed, ///< time to complete a successful scrub
+  l_osd_scrub_ec_failed, ///< failed scrubs count
+  l_osd_scrub_ec_failed_elapsed, ///< time from start to failure
+
+  // ----   scrub reservation process - EC
+
+  /// successful replicas reservation count
+  l_osd_scrub_ec_reserv_success,
+  /// time to complete a successful replicas reservation
+  l_osd_scrub_ec_reserv_successful_elapsed,
+  /// failed attempt to reserve replicas due to an abort
+  l_osd_scrub_ec_reserv_aborted,
+  /// reservation failed due to a 'rejected' response
+  l_osd_scrub_ec_reserv_rejected,
+  /// reservation skipped for high-priority scrubs
+  l_osd_scrub_ec_reserv_skipped,
+  /// time for a replicas reservation process to fail
+  l_osd_scrub_ec_reserv_failed_elapsed,
+  /// number of replicas
+  l_osd_scrub_ec_reserv_secondaries_num,
+
   l_osd_last,
 };
 
@@ -161,3 +257,25 @@ enum {
 };
 
 PerfCounters *build_recoverystate_perf(CephContext *cct);
+
+// Scrubber perf counters. There are four sets (shallow vs. deep,
+// EC vs. replicated) of these counters:
+enum {
+  scrbcnt_first = 20500,
+
+  // -- interruptions of various types
+  /// # preemptions
+  scrbcnt_preempted,
+  /// # chunks selection performed
+  scrbcnt_chunks_selected,
+  /// # busy chunks
+  scrbcnt_chunks_busy,
+  /// # waiting on object events
+  scrbcnt_blocked,
+  /// # write blocked by the scrub
+  scrbcnt_write_blocked,
+
+  scrbcnt_last,
+};
+
+PerfCounters *build_scrub_labeled_perf(CephContext *cct, std::string label);

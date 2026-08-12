@@ -38,16 +38,18 @@ class TokenEngine : public rgw::auth::Engine {
   bool is_applicable(const std::string& token) const noexcept;
 
   boost::optional<token_envelope_t>
-  get_from_keystone(const DoutPrefixProvider* dpp, const std::string& token, bool allow_expired) const;
+  get_from_keystone(const DoutPrefixProvider* dpp,
+                    const std::string& token,
+                    bool allow_expired,
+                    optional_yield y) const;
 
   acl_strategy_t get_acl_strategy(const token_envelope_t& token) const;
-  auth_info_t get_creds_info(const token_envelope_t& token,
-                             const std::vector<std::string>& admin_roles
-                            ) const noexcept;
+  auth_info_t get_creds_info(const token_envelope_t& token) const noexcept;
   result_t authenticate(const DoutPrefixProvider* dpp,
                         const std::string& token,
                         const std::string& service_token,
-                        const req_state* s) const;
+                        const req_state* s,
+                        optional_yield y) const;
 
 public:
   TokenEngine(CephContext* const cct,
@@ -70,7 +72,8 @@ public:
 
   result_t authenticate(const DoutPrefixProvider* dpp, const req_state* const s,
 			optional_yield y) const override {
-    return authenticate(dpp, auth_token_extractor->get_token(s), service_token_extractor->get_token(s), s);
+    return authenticate(dpp, auth_token_extractor->get_token(s),
+                        service_token_extractor->get_token(s), s, y);
   }
 }; /* class TokenEngine */
 
@@ -99,7 +102,7 @@ class SecretCache {
     : cct(g_ceph_context),
       lock(),
       max(cct->_conf->rgw_keystone_token_cache_size),
-      s3_token_expiry_length(300, 0) {
+      s3_token_expiry_length(cct->_conf->rgw_keystone_token_cache_ttl, 0) {
   }
 
   ~SecretCache() {}
@@ -147,13 +150,22 @@ class EC2Engine : public rgw::auth::s3::AWSEngine {
   get_from_keystone(const DoutPrefixProvider* dpp,
                     const std::string_view& access_key_id,
                     const std::string& string_to_sign,
-                    const std::string_view& signature) const;
-  std::pair<boost::optional<token_envelope_t>, int>
+                    const std::string_view& signature,
+                    optional_yield y) const;
+
+  struct access_token_result {
+    boost::optional<token_envelope_t> token;
+    boost::optional<std::string> secret_key;
+    int failure_reason = 0;
+  };
+  access_token_result
   get_access_token(const DoutPrefixProvider* dpp,
                    const std::string_view& access_key_id,
                    const std::string& string_to_sign,
                    const std::string_view& signature,
-		   const signature_factory_t& signature_factory) const;
+		   const signature_factory_t& signature_factory,
+                   bool ignore_signature,
+                   optional_yield y) const;
   result_t authenticate(const DoutPrefixProvider* dpp,
                         const std::string_view& access_key_id,
                         const std::string_view& signature,
@@ -163,9 +175,11 @@ class EC2Engine : public rgw::auth::s3::AWSEngine {
                         const completer_factory_t& completer_factory,
                         const req_state* s,
 			optional_yield y) const override;
-  std::pair<boost::optional<std::string>, int> get_secret_from_keystone(const DoutPrefixProvider* dpp,
-                                                                        const std::string& user_id,
-                                                                        const std::string_view& access_key_id) const;
+  auto get_secret_from_keystone(const DoutPrefixProvider* dpp,
+                                const std::string& user_id,
+                                const std::string_view& access_key_id,
+                                optional_yield y) const
+      -> std::pair<boost::optional<std::string>, int>;
 public:
   EC2Engine(CephContext* const cct,
             const rgw::auth::s3::AWSEngine::VersionAbstractor* const ver_abstractor,

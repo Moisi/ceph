@@ -10,6 +10,7 @@
 
 #include "osd/osd_types.h"
 #include "common/WorkQueue.h"
+#include "common/Clock.h" // for ceph_clock_now()
 #include "common/Cond.h"
 
 class OSDMap;
@@ -144,6 +145,7 @@ protected:
     }
 
     void _process(Item *i, ThreadPool::TPHandle &h) override;
+    void _process_finish(Item *i) override { delete i;}
 
     void _clear() override {
       ceph_assert(_empty());
@@ -247,16 +249,6 @@ private:
 	row[4 + size + i] = up[i];
       }
     }
-
-    uint64_t get_num_acting_pgs() const {
-      uint64_t num_acting_pgs = 0;
-      const size_t row_size = this->row_size();
-      for (size_t ps = 0; ps < pg_num; ++ps) {
-        const int32_t *row = &table[row_size * ps];
-        num_acting_pgs += row[2];
-      }
-      return num_acting_pgs;
-    }
   };
 
   mempool::osdmap_mapping::map<int64_t,PoolMapping> pools;
@@ -338,12 +330,6 @@ public:
   const mempool::osdmap_mapping::vector<pg_t>& get_osd_acting_pgs(unsigned osd) { 
     ceph_assert(osd < acting_rmap.size());
     return acting_rmap[osd];
-  }
-
-  uint64_t get_num_acting_pgs(int64_t pool) const {
-    auto p = pools.find(pool);
-    ceph_assert(p != pools.end());
-    return p->second.get_num_acting_pgs();
   }
 
   void update(const OSDMap& map, pg_t pgid);

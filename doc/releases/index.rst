@@ -21,8 +21,8 @@ security fixes.
    :maxdepth: 1
    :hidden:
 
-   Quincy (v17.2.*) <quincy>
-   Pacific (v16.2.*) <pacific>
+   Squid (v19.2.*) <squid>
+   Reef (v18.2.*) <reef>
 
 .. ceph_releases:: releases.yml current
 
@@ -39,6 +39,8 @@ receive bug fixes or backports).
    :maxdepth: 1
    :hidden:
 
+   Quincy (v17.2.*) <quincy>
+   Pacific (v16.2.*) <pacific>
    Octopus (v15.2.*) <octopus>
    Nautilus (v14.2.*) <nautilus>
    Mimic (v13.2.*) <mimic>
@@ -58,8 +60,23 @@ receive bug fixes or backports).
 Release timeline
 ----------------
 
-.. ceph_timeline_gantt:: releases.yml quincy pacific
-.. ceph_timeline:: releases.yml quincy pacific
+.. ceph_timeline_gantt:: releases.yml squid reef quincy
+.. ceph_timeline:: releases.yml squid reef quincy
+
+.. _Squid: squid
+.. _19.2.0: squid#v19-2-0-squid
+.. _19.2.1: squid#v19-2-1-squid
+.. _19.2.2: squid#v19-2-2-squid
+.. _19.2.3: squid#v19-2-3-squid
+
+.. _Reef: reef
+.. _18.2.0: reef#v18-2-0-reef
+.. _18.2.1: reef#v18-2-1-reef
+.. _18.2.2: reef#v18-2-2-reef
+.. _18.2.4: reef#v18-2-4-reef
+.. _18.2.5: reef#v18-2-5-reef
+.. _18.2.6: reef#v18-2-6-reef
+.. _18.2.7: reef#v18-2-7-reef
 
 .. _Quincy: quincy
 .. _17.2.0: quincy#v17-2-0-quincy
@@ -68,8 +85,17 @@ Release timeline
 .. _17.2.3: quincy#v17-2-3-quincy
 .. _17.2.4: quincy#v17-2-4-quincy
 .. _17.2.5: quincy#v17-2-5-quincy
+.. _17.2.6: quincy#v17-2-6-quincy
+.. _17.2.7: quincy#v17-2-7-quincy
+.. _17.2.8: quincy#v17-2-8-quincy
+.. _17.2.9: quincy#v17-2-9-quincy
 
 .. _Pacific: pacific
+.. _16.2.15: pacific#v16-2-15-pacific
+.. _16.2.14: pacific#v16-2-14-pacific
+.. _16.2.13: pacific#v16-2-13-pacific
+.. _16.2.12: pacific#v16-2-12-pacific
+.. _16.2.11: pacific#v16-2-11-pacific
 .. _16.2.10: pacific#v16-2-10-pacific
 .. _16.2.9: pacific#v16-2-9-pacific
 .. _16.2.8: pacific#v16-2-8-pacific
@@ -271,4 +297,4 @@ Release timeline
 .. _0.67.1: dumpling#v0-67-1-dumpling
 .. _0.67: dumpling#v0-67-dumpling
 .. _Dumpling:  dumpling
-   
+

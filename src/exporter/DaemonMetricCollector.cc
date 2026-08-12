@@ -1,5 +1,6 @@
 #include "DaemonMetricCollector.h"
 
+#include <boost/asio/io_context.hpp>
 #include <boost/json/src.hpp>
 #include <chrono>
 #include <filesystem>
@@ -7,6 +8,7 @@
 #include <map>
 #include <memory>
 #include <regex>
+#include <sstream>
 #include <string>
 #include <utility>
 
@@ -27,25 +29,42 @@ using json_object = boost::json::object;
 using json_value = boost::json::value;
 using json_array = boost::json::array;
 
-void DaemonMetricCollector::request_loop(boost::asio::steady_timer &timer) {
-  timer.async_wait([&](const boost::system::error_code &e) {
-    std::cerr << e << std::endl;
+void DaemonMetricCollector::request_loop() {
+  timer.async_wait([this](const boost::system::error_code &e) {
+    if (shutdown_flag) {
+      dout(1) << "Metric collector request loop cancelled" << dendl;
+      return;
+    }
+
+    if (e) return; // Exit on error or cancellation
+
+    dout(10) << "Getting metrics loop..." << dendl;
     update_sockets();
-    dump_asok_metrics();
+
+    bool sort_metrics = g_conf().get_val<bool>("exporter_sort_metrics");
+    auto prio_limit = g_conf().get_val<int64_t>("exporter_prio_limit");
+    std::string dump_response;
+    std::string schema_response;
+    dump_asok_metrics(sort_metrics, prio_limit, true, dump_response, schema_response, true);
     auto stats_period = g_conf().get_val<int64_t>("exporter_stats_period");
     // time to wait before sending requests again
-    timer.expires_from_now(std::chrono::seconds(stats_period));
-    request_loop(timer);
+    timer.expires_after(std::chrono::seconds(stats_period));
+    request_loop();
   });
 }
 
 void DaemonMetricCollector::main() {
-  // time to wait before sending requests again
-
-  boost::asio::io_service io;
-  boost::asio::steady_timer timer{io, std::chrono::seconds(0)};
-  request_loop(timer);
+  shutdown_flag = false;
+  timer.expires_after(std::chrono::seconds(0));
+  request_loop();
   io.run();
+}
+
+void DaemonMetricCollector::shutdown(){
+  shutdown_flag = true;
+  timer.cancel();  // Explicitly cancel the timer
+  dout(1) << "Collector shutdown initiated, timer canceled" << dendl;
+  io.stop();
 }
 
 std::string DaemonMetricCollector::get_metrics() {
@@ -80,82 +99,218 @@ std::string boost_string_to_std(boost::json::string js) {
 
 std::string quote(std::string value) { return "\"" + value + "\""; }
 
-bool is_hyphen(char ch) { return ch == '-'; }
+void DaemonMetricCollector::parse_asok_metrics(
+    std::string &counter_dump_response, std::string &counter_schema_response,
+    int64_t prio_limit, const std::string &daemon_name) {
+  try {
+    json_object counter_dump =
+        boost::json::parse(counter_dump_response).as_object();
+    json_object counter_schema =
+        boost::json::parse(counter_schema_response).as_object();
 
-void DaemonMetricCollector::dump_asok_metrics() {
+    for (auto &perf_group_item : counter_schema) {
+      std::string perf_group = {perf_group_item.key().begin(),
+                                perf_group_item.key().end()};
+      json_array perf_group_schema_array = perf_group_item.value().as_array();
+      json_array perf_group_dump_array = counter_dump[perf_group].as_array();
+      for (auto schema_itr = perf_group_schema_array.begin(),
+                dump_itr = perf_group_dump_array.begin();
+           schema_itr != perf_group_schema_array.end() &&
+           dump_itr != perf_group_dump_array.end();
+           ++schema_itr, ++dump_itr) {
+        try {
+          auto counters = schema_itr->at("counters").as_object();
+          auto counters_labels = schema_itr->at("labels").as_object();
+          auto counters_values = dump_itr->at("counters").as_object();
+          labels_t labels;
+
+          for (auto &label : counters_labels) {
+            std::string label_key = {label.key().begin(), label.key().end()};
+            labels[label_key] = quote(label.value().as_string().c_str());
+          }
+          for (auto &counter : counters) {
+            try {
+              json_object counter_group = counter.value().as_object();
+              if (counter_group["priority"].as_int64() < prio_limit) {
+                continue;
+              }
+              std::string counter_name_init = {counter.key().begin(),
+                                               counter.key().end()};
+              std::string counter_name = perf_group + "_" + counter_name_init;
+              promethize(counter_name);
+
+              auto extra_labels = get_extra_labels(daemon_name);
+              if (extra_labels.empty()) {
+                dout(1) << "Unable to parse instance_id from daemon_name: "
+                        << daemon_name << dendl;
+                continue;
+              }
+              labels.insert(extra_labels.begin(), extra_labels.end());
+
+              // For now this is only required for rgw multi-site metrics
+              auto multisite_labels_and_name = add_fixed_name_metrics(counter_name);
+              if (!multisite_labels_and_name.first.empty()) {
+                labels.insert(multisite_labels_and_name.first.begin(),
+                              multisite_labels_and_name.first.end());
+                counter_name = multisite_labels_and_name.second;
+              }
+              auto perf_values = counters_values.at(counter_name_init);
+              dump_asok_metric(counter_group, perf_values, counter_name, labels);
+            } catch (const std::exception &e) {
+              dout(1) << "Exception in counter processing for " << daemon_name << ": " << e.what() << dendl;
+              continue;
+            }
+          }
+        } catch (const std::exception &e) {
+          dout(1) << "Exception in schema/dump iteration for " << daemon_name << ": " << e.what() << dendl;
+          continue;
+        }
+      }
+    }
+  } catch (const std::exception &e) {
+    dout(1) << "Exception in parse_asok_metrics for " << daemon_name << ": " << e.what() << dendl;
+    return;
+  }
+}
+
+/*
+perf_values can be either a int/double or a json_object. Since
+   json_value is a wrapper of both we use that class.
+ */
+void DaemonMetricCollector::dump_asok_metric(json_object perf_info,
+                                             json_value perf_values,
+                                             std::string name,
+                                             labels_t labels) {
+  try {
+    if (!perf_info.if_contains("type") ||
+        !perf_info.if_contains("metric_type") ||
+        !perf_info.if_contains("description")) {
+      dout(1) << "Missing required key in perf_info for metric: " << name << dendl;
+      return;
+    }
+    int64_t type = perf_info["type"].as_int64();
+
+    if (!perf_info["metric_type"].is_string()) {
+      dout(1) << "Missing or invalid 'metric_type' in perf_info for metric: " << name << dendl;
+      return;
+    }
+    std::string metric_type =
+        boost_string_to_std(perf_info["metric_type"].as_string());
+
+    if (!perf_info["description"].is_string()) {
+      dout(1) << "Missing or invalid 'description' in perf_info for metric: " << name << dendl;
+      return;
+    }
+    std::string description =
+        boost_string_to_std(perf_info["description"].as_string());
+
+    if (type & PERFCOUNTER_LONGRUNAVG) {
+      if (!perf_values.is_object()) {
+        dout(1) << "perf_values is not an object for metric: " << name << dendl;
+        return;
+      }
+      auto perf_obj = perf_values.as_object();
+      if (!perf_obj.if_contains("avgcount")) {
+        dout(1) << "Missing 'avgcount' in perf_values for metric: " << name << dendl;
+        return;
+      }
+      if (!perf_obj.if_contains("sum")) {
+        dout(1) << "Missing 'sum' in perf_values for metric: " << name << dendl;
+        return;
+      }
+      int64_t count = perf_obj["avgcount"].as_int64();
+      add_metric(builder, count, name + "_count", description + " Count", "counter",
+                 labels);
+      json_value sum_value = perf_obj["sum"];
+      add_double_or_int_metric(builder, sum_value, name + "_sum", description + " Total",
+                               metric_type, labels);
+    } else {
+      add_double_or_int_metric(builder, perf_values, name, description,
+                               metric_type, labels);
+    }
+  } catch (const std::exception& e) {
+    dout(1) << "Exception in dump_asok_metric for metric: " << name << ": " << e.what() << dendl;
+    return;
+  }
+}
+
+void DaemonMetricCollector::dump_asok_metrics(bool sort_metrics, int64_t counter_prio,
+                                              bool sockClientsPing, std::string &dump_response,
+                                              std::string &schema_response,
+                                              bool config_show_response) {
   BlockTimer timer(__FILE__, __FUNCTION__);
 
   std::vector<std::pair<std::string, int>> daemon_pids;
 
   int failures = 0;
-  bool sort = g_conf().get_val<bool>("exporter_sort_metrics");
-  if (sort) {
+  if (sort_metrics) {
     builder =
         std::unique_ptr<OrderedMetricsBuilder>(new OrderedMetricsBuilder());
   } else {
     builder =
         std::unique_ptr<UnorderedMetricsBuilder>(new UnorderedMetricsBuilder());
   }
+  auto prio_limit = counter_prio;
   for (auto &[daemon_name, sock_client] : clients) {
-    bool ok;
-    sock_client.ping(&ok);
-    if (!ok) {
-      failures++;
-      continue;
-    }
-    std::string perf_dump_response =
-        asok_request(sock_client, "perf dump", daemon_name);
-    if (perf_dump_response.size() == 0) {
-      failures++;
-      continue;
-    }
-    std::string perf_schema_response =
-        asok_request(sock_client, "perf schema", daemon_name);
-    if (perf_schema_response.size() == 0) {
-      failures++;
-      continue;
-    }
-    std::string config_show =
-        asok_request(sock_client, "config show", daemon_name);
-    if (config_show.size() == 0) {
-      failures++;
-      continue;
-    }
-    json_object pid_file_json = boost::json::parse(config_show).as_object();
-    std::string pid_path =
-        boost_string_to_std(pid_file_json["pid_file"].as_string());
-    std::string pid_str = read_file_to_string(pid_path);
-    if (!pid_path.size()) {
-      dout(1) << "pid path is empty; process metrics won't be fetched for: "
-              << daemon_name << dendl;
-    }
-    if (!pid_str.empty()) {
-      daemon_pids.push_back({daemon_name, std::stoi(pid_str)});
-    }
-    json_object dump = boost::json::parse(perf_dump_response).as_object();
-    json_object schema = boost::json::parse(perf_schema_response).as_object();
-    for (auto &perf : schema) {
-      std::string perf_group = {perf.key().begin(), perf.key().end()};
-      json_object perf_group_object = perf.value().as_object();
-      for (auto &perf_counter : perf_group_object) {
-        std::string perf_name = {perf_counter.key().begin(),
-                                 perf_counter.key().end()};
-        json_object perf_info = perf_counter.value().as_object();
-        auto prio_limit = g_conf().get_val<int64_t>("exporter_prio_limit");
-        if (perf_info["priority"].as_int64() < prio_limit) {
-          continue;
-        }
-        std::string name = "ceph_" + perf_group + "_" + perf_name;
-        std::replace_if(name.begin(), name.end(), is_hyphen, '_');
-
-        // FIXME: test this, based on mgr_module perfpath_to_path_labels
-        auto labels_and_name = get_labels_and_metric_name(daemon_name, name);
-        labels_t labels = labels_and_name.first;
-        name = labels_and_name.second;
-
-        json_value perf_values = dump[perf_group].as_object()[perf_name];
-        dump_asok_metric(perf_info, perf_values, name, labels);
+    if (sockClientsPing) {
+      bool ok;
+      sock_client.ping(&ok);
+      std::string ceph_daemon_socket_up_desc(
+      "Reports the health status of a Ceph daemon, as determined by whether it is able to respond via its admin socket (1 = healthy, 0 = unhealthy).");
+      labels_t ceph_daemon_socket_up_labels;
+      ceph_daemon_socket_up_labels["hostname"] = quote(ceph_get_hostname());
+      ceph_daemon_socket_up_labels["ceph_daemon"] = quote(daemon_name);
+      add_metric(builder, static_cast<int>(ok), "ceph_daemon_socket_up", ceph_daemon_socket_up_desc,
+             "gauge", ceph_daemon_socket_up_labels);
+      if (!ok) {
+        failures++;
+        continue;
       }
+    }
+    std::string counter_dump_response = dump_response.size() > 0 ? dump_response :
+      asok_request(sock_client, "counter dump", daemon_name);
+    if (counter_dump_response.size() == 0) {
+        failures++;
+        continue;
+    }
+    std::string counter_schema_response = schema_response.size() > 0 ? schema_response :
+        asok_request(sock_client, "counter schema", daemon_name);
+    if (counter_schema_response.size() == 0) {
+      failures++;
+      continue;
+    }
+
+    try {
+      parse_asok_metrics(counter_dump_response, counter_schema_response,
+                         prio_limit, daemon_name);
+
+      std::string config_show = !config_show_response ? "" :
+        asok_request(sock_client, "config show", daemon_name);
+      if (config_show.size() == 0) {
+        failures++;
+        continue;
+      }
+      json_object pid_file_json = boost::json::parse(config_show).as_object();
+      std::string pid_path =
+          boost_string_to_std(pid_file_json["pid_file"].as_string());
+      std::string pid_str = read_file_to_string(pid_path);
+      if (!pid_path.size()) {
+        dout(1) << "pid path is empty; process metrics won't be fetched for: "
+                << daemon_name << dendl;
+      }
+      if (!pid_str.empty()) {
+        daemon_pids.push_back({daemon_name, std::stoi(pid_str)});
+      }
+    } catch (const std::invalid_argument &e) {
+      failures++;
+      dout(1) << "failed to handle " << daemon_name << ": " << e.what()
+              << dendl;
+      continue;
+    } catch (const std::runtime_error &e) {
+      failures++;
+      dout(1) << "failed to parse json for " << daemon_name << ": " << e.what()
+              << dendl;
+      continue;
     }
   }
   dout(10) << "Perf counters retrieved for " << clients.size() - failures << "/"
@@ -262,67 +417,62 @@ std::string DaemonMetricCollector::asok_request(AdminSocketClient &asok,
   return response;
 }
 
+labels_t DaemonMetricCollector::get_extra_labels(std::string daemon_name) {
+  labels_t labels;
+  const std::string ceph_daemon_prefix = "ceph-";
+  const std::string ceph_client_prefix = "client.";
+  if (daemon_name.rfind(ceph_daemon_prefix, 0) == 0) {
+    daemon_name = daemon_name.substr(ceph_daemon_prefix.size());
+  }
+  if (daemon_name.rfind(ceph_client_prefix, 0) == 0) {
+    daemon_name = daemon_name.substr(ceph_client_prefix.size());
+  }
+  // In vstart cluster socket files for rgw are stored as radosgw.<instance_id>.asok
+  if (daemon_name.find("radosgw") != std::string::npos) {
+    std::size_t pos = daemon_name.find_last_of('.');
+    std::string tmp = daemon_name.substr(pos+1);
+    labels["instance_id"] = quote(tmp);
+  }
+  else if (daemon_name.find("rgw") != std::string::npos) {
+    // fetch intance_id for e.g. "hrgsea" from daemon_name=rgw.foo.ceph-node-00.hrgsea.2.94739968030880
+    std::vector<std::string> elems;
+    std::stringstream ss;
+    ss.str(daemon_name);
+    std::string item;
+    while (std::getline(ss, item, '.')) {
+        elems.push_back(item);
+    }
+    if (elems.size() >= 4) {
+      labels["instance_id"] = quote(elems[3]);
+    } else {
+      return labels_t();
+    }
+  } else {
+    labels.insert({"ceph_daemon", quote(daemon_name)});
+  }
+  return labels;
+}
+
+// Add fixed name metrics from existing ones that have details in their names
+// that should be in labels (not in name). For backward compatibility,
+// a new fixed name metric is created (instead of replacing)and details are put
+// in new labels. Intended for RGW sync perf. counters but extendable as required.
+// See: https://tracker.ceph.com/issues/45311
 std::pair<labels_t, std::string>
-DaemonMetricCollector::get_labels_and_metric_name(std::string daemon_name,
-                                                  std::string metric_name) {
+DaemonMetricCollector::add_fixed_name_metrics(std::string metric_name) {
   std::string new_metric_name;
   labels_t labels;
   new_metric_name = metric_name;
-  if (daemon_name.find("rgw") != std::string::npos) {
-    std::string tmp = daemon_name.substr(16, std::string::npos);
-    std::string::size_type pos = tmp.find('.');
-    labels["instance_id"] = quote("rgw." + tmp.substr(0, pos));
-  } else {
-    labels["ceph_daemon"] = quote(daemon_name);
-    if (daemon_name.find("rbd-mirror") != std::string::npos) {
-      std::regex re(
-          "^rbd_mirror_image_([^/]+)/(?:(?:([^/]+)/"
-          ")?)(.*)\\.(replay(?:_bytes|_latency)?)$");
-      std::smatch match;
-      if (std::regex_search(daemon_name, match, re) == true) {
-        new_metric_name = "ceph_rbd_mirror_image_" + match.str(4);
-        labels["pool"] = quote(match.str(1));
-        labels["namespace"] = quote(match.str(2));
-        labels["image"] = quote(match.str(3));
-      }
-    }
-  }
-  return {labels, new_metric_name};
-}
 
-/*
-perf_values can be either a int/double or a json_object. Since
-   json_value is a wrapper of both we use that class.
- */
-void DaemonMetricCollector::dump_asok_metric(json_object perf_info,
-                                             json_value perf_values,
-                                             std::string name,
-                                             labels_t labels) {
-  int64_t type = perf_info["type"].as_int64();
-  std::string metric_type =
-      boost_string_to_std(perf_info["metric_type"].as_string());
-  std::string description =
-      boost_string_to_std(perf_info["description"].as_string());
-
-  if (type & PERFCOUNTER_LONGRUNAVG) {
-    int64_t count = perf_values.as_object()["avgcount"].as_int64();
-    add_metric(builder, count, name + "_count", description, metric_type,
-               labels);
-    json_value sum_value = perf_values.as_object()["sum"];
-    add_double_or_int_metric(builder, sum_value, name + "_sum", description,
-                             metric_type, labels);
-  } else if (type & PERFCOUNTER_TIME) {
-    if (perf_values.is_int64()) {
-      double value = perf_values.as_int64() / 1000000000.0f;
-      add_metric(builder, value, name, description, metric_type, labels);
-    } else if (perf_values.is_double()) {
-      double value = perf_values.as_double() / 1000000000.0f;
-      add_metric(builder, value, name, description, metric_type, labels);
-    }
-  } else {
-    add_double_or_int_metric(builder, perf_values, name, description,
-                             metric_type, labels);
+  std::regex re("data_sync_from_([^_]*)");
+  std::smatch match;
+  if (std::regex_search(metric_name, match, re)) {
+      new_metric_name = std::regex_replace(metric_name, re, "data_sync_from_zone");
+      labels["source_zone"] = quote(match.str(1));
+      return {labels, new_metric_name};
   }
+
+  return {};
 }
 
 void DaemonMetricCollector::update_sockets() {
@@ -409,3 +559,4 @@ DaemonMetricCollector &collector_instance() {
   static DaemonMetricCollector instance;
   return instance;
 }
+

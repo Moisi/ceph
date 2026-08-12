@@ -71,6 +71,8 @@ class Collection(str, enum.Enum):
     basic_rook_v01 = 'basic_rook_v01'
     perf_memory_metrics = 'perf_memory_metrics'
     basic_pool_options_bluestore = 'basic_pool_options_bluestore'
+    basic_pool_flags = 'basic_pool_flags'
+    basic_stretch_cluster = 'basic_stretch_cluster'
 
 MODULE_COLLECTION : List[Dict] = [
     {
@@ -139,6 +141,18 @@ MODULE_COLLECTION : List[Dict] = [
         "channel": "basic",
         "nag": False
     },
+    {
+        "name": Collection.basic_pool_flags,
+        "description": "Per-pool flags",
+        "channel": "basic",
+        "nag": False
+    },
+    {
+        "name": Collection.basic_stretch_cluster,
+        "description": "Stretch mode information for stretch clusters",
+        "channel": "basic",
+        "nag": False
+    },
 ]
 
 ROOK_KEYS_BY_COLLECTION : List[Tuple[str, Collection]] = [
@@ -198,6 +212,9 @@ class Module(MgrModule):
         Option(name='leaderboard',
                type='bool',
                default=False),
+        Option(name='leaderboard_description',
+               type='str',
+               default=None),
         Option(name='description',
                type='str',
                default=None),
@@ -261,6 +278,7 @@ class Module(MgrModule):
             self.enabled = False
             self.last_opt_revision = 0
             self.leaderboard = ''
+            self.leaderboard_description = ''
             self.interval = 0
             self.proxy = ''
             self.channel_basic = True
@@ -790,32 +808,41 @@ class Module(MgrModule):
         return crashlist
 
     def gather_perf_counters(self, mode: str = 'separated') -> Dict[str, dict]:
-        # Extract perf counter data with get_all_perf_counters(), a method
-        # from mgr/mgr_module.py. This method returns a nested dictionary that
-        # looks a lot like perf schema, except with some additional fields.
-        #
-        # Example of output, a snapshot of a mon daemon:
-        #   "mon.b": {
-        #       "bluestore.kv_flush_lat": {
-        #           "count": 2431,
-        #           "description": "Average kv_thread flush latency",
-        #           "nick": "fl_l",
-        #           "priority": 8,
-        #           "type": 5,
-        #           "units": 1,
-        #           "value": 88814109
-        #       },
-        #   },
-        all_perf_counters = self.get_all_perf_counters()
+        """
+        Extract perf counter data with get_perf_counters(), a method from
+        mgr/mgr_module.py. This method returns a nested dictionary that looks a
+        lot like perf schema, except with some additional fields.
+
+        Example of output, a snapshot of a mon daemon:
+            "mon.b":{
+                "bluestore": [
+                    {
+                        "labels": {},
+                        "counters": {
+                            "kv_flush_lat": {
+                                "description": "bluestore.kv_flush_lat",
+                                "nick": "kfsl",
+                                "type": 5,
+                                "priority": 8,
+                                "units": 1,
+                                "value": 14814406948,
+                                "count": 141
+                            },
+                        }
+                    },
+                ]
+            }
+
+        """
+        perf_counters = self.get_perf_counters()
 
         # Initialize 'result' dict
-        result: Dict[str, dict] = defaultdict(lambda: defaultdict(
-            lambda: defaultdict(lambda: defaultdict(int))))
+        result: Dict[str, dict] = defaultdict(lambda: defaultdict(list))
 
         # 'separated' mode
         anonymized_daemon_dict = {}
 
-        for daemon, all_perf_counters_by_daemon in all_perf_counters.items():
+        for daemon, perf_counters_by_daemon in perf_counters.items():
             daemon_type = daemon[0:3] # i.e. 'mds', 'osd', 'rgw'
 
             if mode == 'separated':
@@ -832,11 +859,7 @@ class Module(MgrModule):
                 else:
                     result[daemon_type]['num_combined_daemons'] += 1
 
-            for collection in all_perf_counters_by_daemon:
-                # Split the collection to avoid redundancy in final report; i.e.:
-                #   bluestore.kv_flush_lat, bluestore.kv_final_lat -->
-                #   bluestore: kv_flush_lat, kv_final_lat
-                col_0, col_1 = collection.split('.')
+            for collection, sub_collection_list in perf_counters_by_daemon.items():
 
                 # Debug log for empty keys. This initially was a problem for prioritycache
                 # perf counters, where the col_0 was empty for certain mon counters:
@@ -846,42 +869,52 @@ class Module(MgrModule):
                 #        "cache_bytes": {...},                          "cache_bytes": {...},
                 #
                 # This log is here to detect any future instances of a similar issue.
-                if (daemon == "") or (col_0 == "") or (col_1 == ""):
+                if (daemon == "") or (collection == ""):
                     self.log.debug("Instance of an empty key: {}{}".format(daemon, collection))
+                    continue
 
-                if mode == 'separated':
-                    # Add value to result
-                    result[daemon][col_0][col_1]['value'] = \
-                            all_perf_counters_by_daemon[collection]['value']
+                result[daemon][collection] = []
 
-                    # Check that 'count' exists, as not all counters have a count field.
-                    if 'count' in all_perf_counters_by_daemon[collection]:
-                        result[daemon][col_0][col_1]['count'] = \
-                                all_perf_counters_by_daemon[collection]['count']
-                elif mode == 'aggregated':
-                    # Not every rgw daemon has the same schema. Specifically, each rgw daemon
-                    # has a uniquely-named collection that starts off identically (i.e.
-                    # "objecter-0x...") then diverges (i.e. "...55f4e778e140.op_rmw").
-                    # This bit of code combines these unique counters all under one rgw instance.
-                    # Without this check, the schema would remain separeted out in the final report.
-                    if col_0[0:11] == "objecter-0x":
-                        col_0 = "objecter-0x"
+                for sub_collection in sub_collection_list:
+                    sub_collection_result: Dict[str, dict] = defaultdict(lambda: defaultdict(dict))
+                    sub_collection_result['labels'] = sub_collection['labels']
+                    for sub_collection_counter_name, sub_collection_counter_info in sub_collection['counters'].items():
+                        if mode == 'separated':
+                            # Add value to result
+                            sub_collection_result['counters'][sub_collection_counter_name]['value'] = \
+                                sub_collection_counter_info['value']
 
-                    # Check that the value can be incremented. In some cases,
-                    # the files are of type 'pair' (real-integer-pair, integer-integer pair).
-                    # In those cases, the value is a dictionary, and not a number.
-                    #   i.e. throttle-msgr_dispatch_throttler-hbserver["wait"]
-                    if isinstance(all_perf_counters_by_daemon[collection]['value'], numbers.Number):
-                        result[daemon_type][col_0][col_1]['value'] += \
-                                all_perf_counters_by_daemon[collection]['value']
+                            # Check that 'count' exists, as not all counters have a count field.
+                            if 'count' in sub_collection_counter_info:
+                                sub_collection_result['counters'][sub_collection_counter_name]['count'] = \
+                                        sub_collection_counter_info['count']
+                        elif mode == 'aggregated':
+                            self.log.debug("telemetry in mode: agregated")
+                            # Not every rgw daemon has the same schema. Specifically, each rgw daemon
+                            # has a uniquely-named collection that starts off identically (i.e.
+                            # "objecter-0x...") then diverges (i.e. "...55f4e778e140.op_rmw").
+                            # This bit of code combines these unique counters all under one rgw instance.
+                            # Without this check, the schema would remain separeted out in the final report.
+                            if collection[0:11] == "objecter-0x":
+                                collection = "objecter-0x"
 
-                    # Check that 'count' exists, as not all counters have a count field.
-                    if 'count' in all_perf_counters_by_daemon[collection]:
-                        result[daemon_type][col_0][col_1]['count'] += \
-                                all_perf_counters_by_daemon[collection]['count']
-                else:
-                    self.log.error('Incorrect mode specified in gather_perf_counters: {}'.format(mode))
-                    return {}
+                            # Check that the value can be incremented. In some cases,
+                            # the files are of type 'pair' (real-integer-pair, integer-integer pair).
+                            # In those cases, the value is a dictionary, and not a number.
+                            #   i.e. throttle-msgr_dispatch_throttler-hbserver["wait"]
+                            if isinstance(sub_collection_counter_info['value'], numbers.Number):
+                                sub_collection_result['counters'][sub_collection_counter_name]['value'] += \
+                                        sub_collection_counter_info['value']
+
+                            # Check that 'count' exists, as not all counters have a count field.
+                            if 'count' in sub_collection_counter_info:
+                                sub_collection_result['counters'][sub_collection_counter_name]['count'] += \
+                                        sub_collection_counter_info['count']
+                        else:
+                            self.log.error('Incorrect mode specified in gather_perf_counters: {}'.format(mode))
+                            return {}
+
+                    result[daemon][collection].append(sub_collection_result)
 
         if mode == 'separated':
             # for debugging purposes only, this data is never reported
@@ -968,8 +1001,8 @@ class Module(MgrModule):
             res[anon_host][anon_devid] = m
         return res
 
-    def get_latest(self, daemon_type: str, daemon_name: str, stat: str) -> int:
-        data = self.get_counter(daemon_type, daemon_name, stat)[stat]
+    def get_unlabeled_counter_latest(self, daemon_type: str, daemon_name: str, stat: str) -> int:
+        data = self.get_unlabeled_counter(daemon_type, daemon_name, stat)[stat]
         if data:
             return data[-1][1]
         else:
@@ -980,6 +1013,7 @@ class Module(MgrModule):
             channels = self.get_active_channels()
         report = {
             'leaderboard': self.leaderboard,
+            'leaderboard_description': self.leaderboard_description,
             'report_version': 1,
             'report_timestamp': datetime.utcnow().isoformat(),
             'report_id': self.report_id,
@@ -1104,7 +1138,37 @@ class Module(MgrModule):
                         for option in bluestore_options:
                             if option in pool['options']:
                                 pool_data['options'][option] = pool['options'][option]
+
+                # basic_pool_flags collection
+                if self.is_enabled_collection(Collection.basic_pool_flags):
+                    if 'flags_names' in pool and pool['flags_names'] is not None:
+                        # flags are defined in pg_pool_t (src/osd/osd_types.h)
+                        flags_to_report = [
+                            'hashpspool',
+                            'full',
+                            'ec_overwrites',
+                            'incomplete_clones',
+                            'nodelete',
+                            'nopgchange',
+                            'nosizechange',
+                            'write_fadvise_dontneed',
+                            'noscrub',
+                            'nodeep-scrub',
+                            'full_quota',
+                            'nearfull',
+                            'backfillfull',
+                            'selfmanaged_snaps',
+                            'pool_snaps',
+                            'creating',
+                            'eio',
+                            'bulk',
+                            'crimson',
+                            ]
+
+                        pool_data['flags_names'] = [flag for flag in pool['flags_names'].split(',') if flag in flags_to_report]
+
                 cast(List[Dict[str, Any]], report['pools']).append(pool_data)
+
                 if 'rbd' in pool['application_metadata']:
                     rbd_num_pools += 1
                     ioctx = self.rados.open_ioctx(pool['pool_name'])
@@ -1154,22 +1218,22 @@ class Module(MgrModule):
                 rbytes = 0
                 rsnaps = 0
                 for gid, mds in fs['info'].items():
-                    num_sessions += self.get_latest('mds', mds['name'],
+                    num_sessions += self.get_unlabeled_counter_latest('mds', mds['name'],
                                                     'mds_sessions.session_count')
-                    cached_ino += self.get_latest('mds', mds['name'],
+                    cached_ino += self.get_unlabeled_counter_latest('mds', mds['name'],
                                                   'mds_mem.ino')
-                    cached_dn += self.get_latest('mds', mds['name'],
+                    cached_dn += self.get_unlabeled_counter_latest('mds', mds['name'],
                                                  'mds_mem.dn')
-                    cached_cap += self.get_latest('mds', mds['name'],
+                    cached_cap += self.get_unlabeled_counter_latest('mds', mds['name'],
                                                   'mds_mem.cap')
-                    subtrees += self.get_latest('mds', mds['name'],
+                    subtrees += self.get_unlabeled_counter_latest('mds', mds['name'],
                                                 'mds.subtrees')
                     if mds['rank'] == 0:
-                        rfiles = self.get_latest('mds', mds['name'],
+                        rfiles = self.get_unlabeled_counter_latest('mds', mds['name'],
                                                  'mds.root_rfiles')
-                        rbytes = self.get_latest('mds', mds['name'],
+                        rbytes = self.get_unlabeled_counter_latest('mds', mds['name'],
                                                  'mds.root_rbytes')
-                        rsnaps = self.get_latest('mds', mds['name'],
+                        rsnaps = self.get_unlabeled_counter_latest('mds', mds['name'],
                                                  'mds.root_rsnaps')
                 report['fs']['filesystems'].append({  # type: ignore
                     'max_mds': fs['max_mds'],
@@ -1275,6 +1339,17 @@ class Module(MgrModule):
 
             # Rook
             self.get_rook_data(report)
+
+            # Stretch Mode
+            if self.is_enabled_collection(Collection.basic_stretch_cluster):
+                stretch_mode = osd_map.get("stretch_mode", {})
+                report['stretch_cluster'] = {
+                    'stretch_mode_enabled': stretch_mode.get("stretch_mode_enabled", {}),
+                    'stretch_bucket_count': stretch_mode.get("stretch_bucket_count", {}),
+                    'degraded_stretch_mode': stretch_mode.get("degraded_stretch_mode", {}),
+                    'recovering_stretch_mode': stretch_mode.get("recovering_stretch_mode", {}),
+                    'stretch_mode_bucket': stretch_mode.get("stretch_mode_bucket", {}),
+                }
 
         if 'crash' in channels:
             report['crashes'] = self.gather_crashinfo()
@@ -1540,6 +1615,8 @@ class Module(MgrModule):
         # Formatting the perf histograms so they are human-readable. This will change the
         # ranges and values, which are currently in list form, into strings so that
         # they are displayed horizontally instead of vertically.
+        if 'report' in report:
+            report = report['report']
         try:
             # Formatting ranges and values in osd_perf_histograms
             mode = 'osd_perf_histograms'
@@ -1937,10 +2014,13 @@ Please consider enabling the telemetry module with 'ceph telemetry on'.'''
 
         if not self.channel_device:
             # device channel is off, no need to display its report
-            return 0, json.dumps(self.get_report_locked('default'), indent=4, sort_keys=True), ''
+            report = self.get_report_locked('default')
+        else:
+            # telemetry is on and device channel is enabled, show both
+            report = self.get_report_locked('all')
 
-        # telemetry is on and device channel is enabled, show both
-        return 0, json.dumps(self.get_report_locked('all'), indent=4, sort_keys=True), ''
+        self.format_perf_histogram(report)
+        return 0, json.dumps(report, indent=4, sort_keys=True), ''
 
     @CLIReadCommand('telemetry preview-all')
     def preview_all(self) -> Tuple[int, str, str]:
@@ -1994,7 +2074,8 @@ Please consider enabling the telemetry module with 'ceph telemetry on'.'''
         return {}
 
     def self_test(self) -> None:
-        report = self.compile_report()
+        self.opt_in_all_collections()
+        report = self.compile_report(channels=ALL_CHANNELS)
         if len(report) == 0:
             raise RuntimeError('Report is empty')
 

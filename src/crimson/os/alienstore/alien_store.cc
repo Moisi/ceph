@@ -57,10 +57,11 @@ public:
   }
 
   void finish(int) final {
-    return seastar::alien::submit_to(alien, cpuid, [this] {
-      alien_done.set_value();
+    std::ignore = seastar::alien::submit_to(alien, cpuid,
+        [&_alien_done=this->alien_done] {
+      _alien_done.set_value();
       return seastar::make_ready_future<>();
-    }).wait();
+    });
   }
 };
 }
@@ -74,7 +75,8 @@ AlienStore::AlienStore(const std::string& type,
                        const ConfigValues& values)
   : type(type),
     path{path},
-    values(values)
+    values(values),
+    op_gates()
 {
 }
 
@@ -100,26 +102,23 @@ seastar::future<> AlienStore::start()
   if (!store) {
     ceph_abort_msgf("unsupported objectstore type: %s", type.c_str());
   }
-  auto cpu_cores = seastar::resource::parse_cpuset(
-    get_conf<std::string>("crimson_alien_thread_cpu_cores"));
-  // cores except the first "N_CORES_FOR_SEASTAR" ones will
-  // be used for alien threads scheduling:
-  // 	[0, N_CORES_FOR_SEASTAR) are reserved for seastar reactors
-  // 	[N_CORES_FOR_SEASTAR, ..] are assigned to alien threads.
-  if (!cpu_cores.has_value()) {
-    seastar::resource::cpuset cpuset;
-    std::copy(boost::counting_iterator<unsigned>(N_CORES_FOR_SEASTAR),
-	      boost::counting_iterator<unsigned>(sysconf(_SC_NPROCESSORS_ONLN)),
-	      std::inserter(cpuset, cpuset.end()));
-    if (cpuset.empty()) {
-      logger().error("{}: unable to get nproc: {}", __func__, errno);
-    } else {
-      cpu_cores = cpuset;
-    }
+  /*
+   * crimson_bluestore_cpu_set must be set for optimal performance.
+   * Otherwise, no CPU pinning will take place.
+  */
+  std::optional<seastar::resource::cpuset> alien_thread_cpu_cores;
+
+  if (std::string conf_cpu_cores =
+        get_conf<std::string>("crimson_bluestore_cpu_set");
+      !conf_cpu_cores.empty()) {
+    logger().debug("{} using crimson_bluestore_cpu_set", __func__);
+    alien_thread_cpu_cores =
+      seastar::resource::parse_cpuset(conf_cpu_cores);
   }
+
   const auto num_threads =
-    get_conf<uint64_t>("crimson_alien_op_num_threads");
-  tp = std::make_unique<crimson::os::ThreadPool>(num_threads, 128, cpu_cores);
+    get_conf<uint64_t>("crimson_bluestore_num_threads");
+  tp = std::make_unique<crimson::os::ThreadPool>(num_threads, 128, alien_thread_cpu_cores);
   return tp->start();
 }
 
@@ -130,9 +129,6 @@ seastar::future<> AlienStore::stop()
     return seastar::now();
   }
   return tp->submit([this] {
-    for (auto [cid, ch]: coll_map) {
-      static_cast<AlienCollection*>(ch.get())->collection.reset();
-    }
     store.reset();
     cct.reset();
     g_ceph_context = nullptr;
@@ -140,6 +136,20 @@ seastar::future<> AlienStore::stop()
   }).then([this] {
     return tp->stop();
   });
+}
+
+AlienStore::base_errorator::future<bool>
+AlienStore::exists(
+  CollectionRef ch,
+  const ghobject_t& oid,
+  uint32_t op_flags)
+{
+    return op_gates.simple_dispatch("exists", [=, this] {
+        return tp->submit(ch->get_cid().hash_to_shard(tp->size()), [=, this] {
+            auto c = static_cast<AlienCollection*>(ch.get());
+            return store->exists(c->collection, oid);
+        });
+    });
 }
 
 AlienStore::mount_ertr::future<> AlienStore::mount()
@@ -165,13 +175,20 @@ seastar::future<> AlienStore::umount()
     // not really started yet
     return seastar::now();
   }
-  return op_gate.close().then([this] {
+  return op_gates.close_all().then([this] {
     return tp->submit([this] {
+      {
+	std::lock_guard l(coll_map_lock);
+	for (auto [cid, ch]: coll_map) {
+	  static_cast<AlienCollection*>(ch.get())->collection.reset();
+	}
+	coll_map.clear();
+      }
       return store->umount();
+    }).then([] (int r) {
+      assert(r == 0);
+      return seastar::now();
     });
-  }).then([] (int r) {
-    assert(r == 0);
-    return seastar::now();
   });
 }
 
@@ -196,13 +213,13 @@ seastar::future<std::tuple<std::vector<ghobject_t>, ghobject_t>>
 AlienStore::list_objects(CollectionRef ch,
                         const ghobject_t& start,
                         const ghobject_t& end,
-                        uint64_t limit) const
+                        uint64_t limit,
+			uint32_t op_flags) const
 {
   logger().debug("{}", __func__);
   assert(tp);
   return do_with_op_gate(std::vector<ghobject_t>(), ghobject_t(),
                          [=, this] (auto &objects, auto &next) {
-    objects.reserve(limit);
     return tp->submit(ch->get_cid().hash_to_shard(tp->size()),
       [=, this, &objects, &next] {
       auto c = static_cast<AlienCollection*>(ch.get());
@@ -223,23 +240,9 @@ seastar::future<CollectionRef> AlienStore::create_new_collection(const coll_t& c
   logger().debug("{}", __func__);
   assert(tp);
   return tp->submit([this, cid] {
-    return store->create_new_collection(cid);
-  }).then([this, cid] (ObjectStore::CollectionHandle c) {
-    CollectionRef ch;
-    auto cp = coll_map.find(c->cid);
-    if (cp == coll_map.end()) {
-      ch = new AlienCollection(c);
-      coll_map[c->cid] = ch;
-    } else {
-      ch = cp->second;
-      auto ach = static_cast<AlienCollection*>(ch.get());
-      if (ach->collection != c) {
-        ach->collection = c;
-      }
-    }
-    return seastar::make_ready_future<CollectionRef>(ch);
+    ObjectStore::CollectionHandle c = store->create_new_collection(cid);
+    return get_alien_coll_ref(std::move(c));
   });
-
 }
 
 seastar::future<CollectionRef> AlienStore::open_collection(const coll_t& cid)
@@ -247,24 +250,12 @@ seastar::future<CollectionRef> AlienStore::open_collection(const coll_t& cid)
   logger().debug("{}", __func__);
   assert(tp);
   return tp->submit([this, cid] {
-    return store->open_collection(cid);
-  }).then([this] (ObjectStore::CollectionHandle c) {
+    ObjectStore::CollectionHandle c = store->open_collection(cid);
     if (!c) {
-      return seastar::make_ready_future<CollectionRef>();
-    }
-    CollectionRef ch;
-    auto cp = coll_map.find(c->cid);
-    if (cp == coll_map.end()){
-      ch = new AlienCollection(c);
-      coll_map[c->cid] = ch;
+      return CollectionRef{};
     } else {
-      ch = cp->second;
-      auto ach = static_cast<AlienCollection*>(ch.get());
-      if (ach->collection != c){
-        ach->collection = c;
-      }
+      return get_alien_coll_ref(std::move(c));
     }
-    return seastar::make_ready_future<CollectionRef>(ch);
   });
 }
 
@@ -285,6 +276,21 @@ seastar::future<std::vector<coll_core_t>> AlienStore::list_collections()
         [](auto p) { return std::make_pair(p, NULL_CORE); });
       return seastar::make_ready_future<std::vector<coll_core_t>>(std::move(ret));
     });
+  });
+}
+
+seastar::future<> AlienStore::set_collection_opts(CollectionRef ch,
+                                      const pool_opts_t& opts)
+{
+  logger().debug("{}", __func__);
+  assert(tp);
+
+  return tp->submit(ch->get_cid().hash_to_shard(tp->size()), [=, this] {
+    auto c = static_cast<AlienCollection*>(ch.get());
+    return store->set_collection_opts(c->collection, opts);
+  }).then([] (int r) {
+    assert(r==0);
+    return seastar::now();
   });
 }
 
@@ -344,7 +350,8 @@ AlienStore::readv(CollectionRef ch,
 AlienStore::get_attr_errorator::future<ceph::bufferlist>
 AlienStore::get_attr(CollectionRef ch,
                      const ghobject_t& oid,
-                     std::string_view name) const
+                     std::string_view name,
+		     uint32_t op_flags) const
 {
   logger().debug("{}", __func__);
   assert(tp);
@@ -372,7 +379,8 @@ AlienStore::get_attr(CollectionRef ch,
 
 AlienStore::get_attrs_ertr::future<AlienStore::attrs_t>
 AlienStore::get_attrs(CollectionRef ch,
-                      const ghobject_t& oid)
+                      const ghobject_t& oid,
+		      uint32_t op_flags)
 {
   logger().debug("{}", __func__);
   assert(tp);
@@ -393,7 +401,8 @@ AlienStore::get_attrs(CollectionRef ch,
 
 auto AlienStore::omap_get_values(CollectionRef ch,
                                  const ghobject_t& oid,
-                                 const set<string>& keys)
+                                 const set<string>& keys,
+				 uint32_t op_flags)
   -> read_errorator::future<omap_values_t>
 {
   logger().debug("{}", __func__);
@@ -415,28 +424,30 @@ auto AlienStore::omap_get_values(CollectionRef ch,
   });
 }
 
-auto AlienStore::omap_get_values(CollectionRef ch,
-                                 const ghobject_t &oid,
-                                 const std::optional<string> &start)
-  -> read_errorator::future<std::tuple<bool, omap_values_t>>
+AlienStore::read_errorator::future<ObjectStore::omap_iter_ret_t>
+AlienStore::omap_iterate(CollectionRef ch,
+                         const ghobject_t &oid,
+                         ObjectStore::omap_iter_seek_t start_from,
+                         omap_iterate_cb_t callback,
+                         uint32_t op_flags)
 {
   logger().debug("{} with_start", __func__);
   assert(tp);
-  return do_with_op_gate(omap_values_t{}, [=, this] (auto &values) {
-    return tp->submit(ch->get_cid().hash_to_shard(tp->size()), [=, this, &values] {
+  return do_with_op_gate(oid, [ch, start_from, callback, this] (auto& oid) {
+    return tp->submit(ch->get_cid().hash_to_shard(tp->size()), [ch, oid, start_from, callback, this] {
       auto c = static_cast<AlienCollection*>(ch.get());
-      return store->omap_get_values(c->collection, oid, start,
-		                    reinterpret_cast<map<string, bufferlist>*>(&values));
-    }).then([&values] (int r)
-      -> read_errorator::future<std::tuple<bool, omap_values_t>> {
+      return store->omap_iterate(
+        c->collection, oid, start_from, callback);
+    }).then([] (int r)
+      -> read_errorator::future<ObjectStore::omap_iter_ret_t> {
       if (r == -ENOENT) {
         return crimson::ct_error::enoent::make();
-      } else if (r < 0){
-        logger().error("omap_get_values(start): {}", r);
-        return crimson::ct_error::input_output_error::make();
       } else {
-        return read_errorator::make_ready_future<std::tuple<bool, omap_values_t>>(
-          true, std::move(values));
+        if (r == 1) {
+          return read_errorator::make_ready_future<ObjectStore::omap_iter_ret_t>(ObjectStore::omap_iter_ret_t::STOP);
+        } else {
+          return read_errorator::make_ready_future<ObjectStore::omap_iter_ret_t>(ObjectStore::omap_iter_ret_t::NEXT);
+        }
       }
     });
   });
@@ -474,7 +485,7 @@ seastar::future<> AlienStore::inject_data_error(const ghobject_t& o)
 {
   logger().debug("{}", __func__);
   assert(tp);
-  return seastar::with_gate(op_gate, [=, this] {
+  return op_gates.simple_dispatch("inject_data_error", [=, this] {
     return tp->submit([o, this] {
       return store->inject_data_error(o);
     });
@@ -485,8 +496,8 @@ seastar::future<> AlienStore::inject_mdata_error(const ghobject_t& o)
 {
   logger().debug("{}", __func__);
   assert(tp);
-  return seastar::with_gate(op_gate, [=, this] {
-    return tp->submit([=, this] {
+  return op_gates.simple_dispatch("inject_mdata_error", [=, this] {
+    return tp->submit([o, this] {
       return store->inject_mdata_error(o);
     });
   });
@@ -497,7 +508,7 @@ seastar::future<> AlienStore::write_meta(const std::string& key,
 {
   logger().debug("{}", __func__);
   assert(tp);
-  return seastar::with_gate(op_gate, [=, this] {
+  return op_gates.simple_dispatch("write_meta", [=, this] {
     return tp->submit([=, this] {
       return store->write_meta(key, value);
     }).then([] (int r) {
@@ -512,8 +523,8 @@ AlienStore::read_meta(const std::string& key)
 {
   logger().debug("{}", __func__);
   assert(tp);
-  return seastar::with_gate(op_gate, [this, key] {
-    return tp->submit([this, key] {
+  return op_gates.simple_dispatch("read_meta", [this, key] {
+    return tp->submit([key, this] {
       std::string value;
       int r = store->read_meta(key, &value);
       if (r > 0) {
@@ -551,6 +562,21 @@ seastar::future<store_statfs_t> AlienStore::stat() const
   });
 }
 
+seastar::future<store_statfs_t> AlienStore::pool_statfs(int64_t pool_id) const
+{
+  logger().info("{}", __func__);
+  assert(tp);
+  return do_with_op_gate(store_statfs_t{}, [this, pool_id] (store_statfs_t &st) {
+    return tp->submit([this, pool_id, &st]{
+      bool per_pool_omap_stats = false;
+      return store->pool_statfs(pool_id, &st, &per_pool_omap_stats);
+    }).then([&st] (int r) {
+      assert(r==0);
+      return seastar::make_ready_future<store_statfs_t>(std::move(st));
+    });
+  });
+}
+
 unsigned AlienStore::get_max_attr_name_length() const
 {
   logger().info("{}", __func__);
@@ -559,7 +585,8 @@ unsigned AlienStore::get_max_attr_name_length() const
 
 seastar::future<struct stat> AlienStore::stat(
   CollectionRef ch,
-  const ghobject_t& oid)
+  const ghobject_t& oid,
+  uint32_t op_flags)
 {
   assert(tp);
   return do_with_op_gate((struct stat){}, [this, ch, oid](auto& st) {
@@ -571,8 +598,22 @@ seastar::future<struct stat> AlienStore::stat(
   });
 }
 
+seastar::future<std::string> AlienStore::get_default_device_class()
+{
+  logger().debug("{}", __func__);
+  assert(tp);
+  return op_gates.simple_dispatch("get_default_device_class", [=, this] {
+    return tp->submit([=, this] {
+      return store->get_default_device_class();
+    }).then([] (std::string device_class) {
+      return seastar::make_ready_future<std::string>(device_class);
+    });
+  });
+}
+
 auto AlienStore::omap_get_header(CollectionRef ch,
-                                 const ghobject_t& oid)
+                                 const ghobject_t& oid,
+				 uint32_t op_flags)
   -> get_attr_errorator::future<ceph::bufferlist>
 {
   assert(tp);
@@ -585,7 +626,7 @@ auto AlienStore::omap_get_header(CollectionRef ch,
         return crimson::ct_error::enoent::make();
       } else if (r < 0) {
         logger().error("omap_get_header: {}", r);
-        ceph_assert(0 == "impossible");
+        ceph_abort_msg("impossible");
       } else {
         return get_attr_errorator::make_ready_future<ceph::bufferlist>(
 	  std::move(bl));
@@ -598,7 +639,8 @@ AlienStore::read_errorator::future<std::map<uint64_t, uint64_t>> AlienStore::fie
   CollectionRef ch,
   const ghobject_t& oid,
   uint64_t off,
-  uint64_t len)
+  uint64_t len,
+  uint32_t op_flags)
 {
   assert(tp);
   return do_with_op_gate(std::map<uint64_t, uint64_t>(), [=, this](auto& destmap) {
@@ -615,6 +657,23 @@ AlienStore::read_errorator::future<std::map<uint64_t, uint64_t>> AlienStore::fie
       }
     });
   });
+}
+
+CollectionRef AlienStore::get_alien_coll_ref(ObjectStore::CollectionHandle c) {
+  std::lock_guard l(coll_map_lock);
+  CollectionRef ch;
+  auto cp = coll_map.find(c->cid);
+  if (cp == coll_map.end()) {
+    ch = new AlienCollection(c);
+    coll_map[c->cid] = ch;
+  } else {
+    ch = cp->second;
+    auto ach = static_cast<AlienCollection*>(ch.get());
+    if (ach->collection != c) {
+      ach->collection = c;
+    }
+  }
+  return ch;
 }
 
 }

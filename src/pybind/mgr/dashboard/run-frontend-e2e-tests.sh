@@ -33,13 +33,27 @@ start_ceph() {
     # Set SSL verify to False
     ceph_all dashboard set-rgw-api-ssl-verify False
 
-    CYPRESS_BASE_URL=$(ceph mgr services | jq -r .dashboard)
+    # Set test_orchestrator as orch backend
+    ceph mgr module enable test_orchestrator
+    ceph orch set backend test_orchestrator
+
+    CYPRESS_BASE_URL=""
+    retry=0
+    while [[ -z "${CYPRESS_BASE_URL}" || "${CYPRESS_BASE_URL}" == "null" ]]; do
+        CYPRESS_BASE_URL=$(ceph mgr services | jq -r .dashboard)
+        if [ $retry -eq 10 ]; then
+            echo "ERROR: Could not get the dashboard URL"
+            stop 1
+        fi
+        retry=$((retry + 1))
+        sleep 1
+    done
     CYPRESS_CEPH2_URL=$(ceph2 mgr services | jq -r .dashboard)
 
     # start rbd-mirror daemon in the cluster
     KEY=$(ceph auth get client.admin --format=json | jq -r .[0].key)
     MON_CLUSTER_1=$(grep "mon host" ${FULL_PATH_BUILD_DIR}/run/1/ceph.conf | awk '{print $4}')
-    ${FULL_PATH_BUILD_DIR}/bin/rbd-mirror --mon_host $MON_CLUSTER_1 --key $KEY -c ${FULL_PATH_BUILD_DIR}/run/1/ceph.conf &
+    ${FULL_PATH_BUILD_DIR}/bin/rbd-mirror --mon_host $MON_CLUSTER_1 --key $KEY -c ${FULL_PATH_BUILD_DIR}/run/1/ceph.conf
 
     set +x
 }
@@ -50,6 +64,11 @@ stop() {
         for cluster in ${CLUSTERS[@]}; do
             ../src/mstop.sh $cluster
         done
+        pids=$(pgrep rbd-mirror)
+        if [ -n "$pids" ]; then
+            echo Killing rbd-mirror processes: $pids
+            kill -9 $pids
+        fi
     fi
     exit $1
 }

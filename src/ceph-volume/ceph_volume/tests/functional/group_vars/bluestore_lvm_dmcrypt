@@ -2,10 +2,8 @@
 
 dmcrypt: True
 ceph_dev: True
-cluster: test
 public_network: "192.168.3.0/24"
 cluster_network: "192.168.4.0/24"
-monitor_interface: eth1
 journal_size: 100
 osd_objectstore: "bluestore"
 osd_scenario: lvm
@@ -31,3 +29,5 @@ ceph_conf_overrides:
   global:
     osd_pool_default_pg_num: 8
     osd_pool_default_size: 1
+  osd:
+    bluefs_buffered_io: false

@@ -1,11 +1,17 @@
 #ifndef CEPH_JSON_H
 #define CEPH_JSON_H
 
+#include <deque>
+#include <map>
+#include <set>
 #include <stdexcept>
+#include <string>
 #include <typeindex>
+#include "include/encoding.h"
 #include <include/types.h>
 #include <boost/container/flat_map.hpp>
 #include <boost/container/flat_set.hpp>
+#include <boost/optional.hpp>
 #include <include/ceph_fs.h>
 #include "common/ceph_time.h"
 
@@ -582,6 +588,17 @@ static void encode_json(const char *name, const std::vector<T>& l, ceph::Formatt
   f->close_section();
 }
 
+template<class T, std::size_t N>
+static void encode_json(const char *name, const std::array<T, N>& l,
+                        ceph::Formatter *f)
+{
+  f->open_array_section(name);
+  for (auto iter = l.cbegin(); iter != l.cend(); ++iter) {
+    encode_json("obj", *iter, f);
+  }
+  f->close_section();
+}
+
 template<class K, class V, class C = std::less<K>>
 static void encode_json(const char *name, const std::map<K, V, C>& m, ceph::Formatter *f)
 {
@@ -810,30 +827,64 @@ public:
     }
   }
 
-  void encode(ceph::buffer::list& bl) const {
-    ENCODE_START(2, 1, bl);
-    encode((uint8_t)type, bl);
-    encode(value.str, bl);
-    encode(arr, bl);
-    encode(obj, bl);
-    encode(value.quoted, bl);
-    ENCODE_FINISH(bl);
-  }
+  void encode(ceph::buffer::list& bl) const;
+  void decode(ceph::buffer::list::const_iterator& bl);
 
-  void decode(ceph::buffer::list::const_iterator& bl) {
-    DECODE_START(2, bl);
-    uint8_t t;
-    decode(t, bl);
-    type = (Type)t;
-    decode(value.str, bl);
-    decode(arr, bl);
-    decode(obj, bl);
-    if (struct_v >= 2) {
-      decode(value.quoted, bl);
-    } else {
-      value.quoted = true;
+  void dump(ceph::Formatter *f) const {
+    switch (type) {
+      case FMT_VALUE:
+        if (value.quoted) {
+          f->dump_string("value", value.str);
+        } else {
+          f->dump_format_unquoted("value", "%s", value.str.c_str());
+        }
+        break;
+      case FMT_ARRAY:
+        f->open_array_section("array");
+        for (auto& i : arr) {
+          i.dump(f);
+        }
+        f->close_section();
+        break;
+      case FMT_OBJ:
+        f->open_object_section("object");
+        for (auto& i : obj) {
+          f->dump_object(i.first.c_str(), i.second);
+        }
+        f->close_section();
+        break;
+      default:
+        break;
     }
-    DECODE_FINISH(bl);
+  }
+  static std::list<JSONFormattable> generate_test_instances() {
+    std::list<JSONFormattable> o;
+    o.emplace_back();
+    o.emplace_back();
+    o.back().set_type(FMT_VALUE);
+    o.back().value.str = "foo";
+    o.back().value.quoted = true;
+    o.emplace_back();
+    o.back().set_type(FMT_VALUE);
+    o.back().value.str = "foo";
+    o.back().value.quoted = false;
+    o.emplace_back();
+    o.back().set_type(FMT_ARRAY);
+    o.back().arr.push_back(JSONFormattable());
+    o.back().arr.back().set_type(FMT_VALUE);
+    o.back().arr.back().value.str = "foo";
+    o.back().arr.back().value.quoted = true;
+    o.back().arr.push_back(JSONFormattable());
+    o.back().arr.back().set_type(FMT_VALUE);
+    o.back().arr.back().value.str = "bar";
+    o.back().arr.back().value.quoted = true;
+    o.emplace_back();
+    o.back().set_type(FMT_OBJ);
+    o.back().obj["foo"] = JSONFormattable();
+    o.back().obj["foo"].set_type(FMT_VALUE);
+    o.back().obj["foo"].value.str = "bar";
+    o.back().obj["foo"].value.quoted = true;
+    return o;
   }
 
   const std::string& val() const {

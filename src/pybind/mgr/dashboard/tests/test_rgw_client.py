@@ -6,14 +6,17 @@ from unittest.mock import Mock, patch
 
 from .. import mgr
 from ..exceptions import DashboardException
-from ..services.rgw_client import NoCredentialsException, \
-    NoRgwDaemonsException, RgwClient, _parse_frontend_config
+from ..services.rgw_client import NoRgwDaemonsException, RgwClient, \
+    _determine_rgw_addr, _parse_frontend_config
+from ..services.service import NoCredentialsException
 from ..settings import Settings
 from ..tests import CLICommandTestMixin, RgwStub
 
 
 @patch('dashboard.services.rgw_client.RgwClient._get_user_id', Mock(
     return_value='dummy_admin'))
+@patch('dashboard.services.ceph_service.CephService.send_command', Mock(
+    return_value=''))
 class RgwClientTest(TestCase, CLICommandTestMixin):
     _dashboard_user_realm1_access_key = 'VUOFXZFK24H81ISTVBTR'
     _dashboard_user_realm1_secret_key = '0PGsCvXPGWS3AGgibUZEcd9efLrbbshlUkY3jruR'
@@ -271,6 +274,57 @@ class RgwClientTest(TestCase, CLICommandTestMixin):
                 retention_period_years=years
             ))
 
+    def test_set_rgw_hostname(self):
+        result = self.exec_cmd(
+            'set-rgw-hostname',
+            daemon_name='test_daemon',
+            hostname='example.hostname.com'
+        )
+        self.assertEqual(
+            result,
+            'RGW hostname for daemon test_daemon configured'
+        )
+        self.assertEqual(
+            Settings.RGW_HOSTNAME_PER_DAEMON,
+            {'test_daemon': 'example.hostname.com'}
+        )
+
+    @patch("dashboard.services.rgw_client.RgwDaemon")
+    def test_hostname_when_rgw_hostname_config_is_set(self, mock_daemons):
+        mock_instance = Mock()
+        mock_daemons.return_value = mock_instance
+
+        self.test_set_rgw_hostname()
+
+        daemon_info = {
+            'metadata': {
+                'id': 'test_daemon',
+                'hostname': 'my-hostname.com',
+                'frontend_config#0': 'beast port=8000'
+            },
+            'addr': '192.0.2.1'
+        }
+
+        result = _determine_rgw_addr(daemon_info)
+        self.assertEqual(result.host, "example.hostname.com")
+
+    @patch("dashboard.services.rgw_client.RgwDaemon")
+    def test_hostname_when_rgw_hostname_config_is_not_set(self, mock_daemons):
+        mock_instance = Mock()
+        mock_daemons.return_value = mock_instance
+
+        daemon_info = {
+            'metadata': {
+                'id': 'test_daemon',
+                'hostname': 'my.hostname.com',
+                'frontend_config#0': 'beast port=8000'
+            },
+            'addr': '192.168.178.3:49774/1534999298'
+        }
+
+        result = _determine_rgw_addr(daemon_info)
+        self.assertEqual(result.host, "192.168.178.3")
+
 
 class RgwClientHelperTest(TestCase):
     def test_parse_frontend_config_1(self):
@@ -353,3 +407,47 @@ class RgwClientHelperTest(TestCase):
             _parse_frontend_config('mongoose port=8080')
         self.assertEqual(str(ctx.exception),
                          'Failed to determine RGW port from "mongoose port=8080"')
+
+
+class TestDictToXML(TestCase):
+    def test_empty_dict(self):
+        result = RgwClient.dict_to_xml({})
+        self.assertEqual(result, '')
+
+    def test_empty_string(self):
+        result = RgwClient.dict_to_xml("")
+        self.assertEqual(result, '')
+
+    def test_invalid_json_string(self):
+        with self.assertRaises(DashboardException):
+            RgwClient.dict_to_xml("invalid json")
+
+    def test_simple_dict(self):
+        data = {"name": "Foo", "age": 30}
+        expected_xml = "<name>Foo</name>\n<age>30</age>\n"
+        result = RgwClient.dict_to_xml(data)
+        self.assertEqual(result, expected_xml)
+
+    def test_nested_dict(self):
+        data = {"person": {"name": "Foo", "age": 30}}
+        expected_xml = "<person>\n<name>Foo</name>\n<age>30</age>\n</person>\n"
+        result = RgwClient.dict_to_xml(data)
+        self.assertEqual(result, expected_xml)
+
+    def test_list_in_dict(self):
+        data = {"names": ["Foo", "Boo"]}
+        expected_xml = "<names>\nFoo</names>\n<names>\nBoo</names>\n"
+        result = RgwClient.dict_to_xml(data)
+        self.assertEqual(result, expected_xml)
+
+    def test_rules_list_in_dict(self):
+        data = {"Rules": [{"id": 1}, {"id": 2}]}
+        expected_xml = "<Rule>\n<id>1</id>\n</Rule>\n<Rule>\n<id>2</id>\n</Rule>\n"
+        result = RgwClient.dict_to_xml(data)
+        self.assertEqual(result, expected_xml)
+
+    def test_json_string(self):
+        data = '{"name": "Foo", "age": 30}'
+        expected_xml = "<name>Foo</name>\n<age>30</age>\n"
+        result = RgwClient.dict_to_xml(data)
+        self.assertEqual(result, expected_xml)

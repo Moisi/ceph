@@ -24,36 +24,38 @@ For more information, see `https://ceph.com/foundation
 Members
 =======
 
+Diamond
+-------
+
+* `45Drives <https://45drives.com/>`_
+* `Bloomberg <https://bloomberg.com>`_
+* `IBM <https://ibm.com>`_
+
+Platinum
+--------
+
+* `Clyso <https://www.clyso.com/en/>`_
+* `Samsung Electronics <https://samsung.com/>`_
+
 Premier
 -------
 
-* `Bloomberg <https://bloomberg.com>`_
-* `Clyso <https://www.clyso.com/en/>`_
-* `DigitalOcean <https://www.digitalocean.com/>`_
-* `IBM <https://ibm.com>`_
-* `Intel <http://www.intel.com/>`_
 * `OVH <https://www.ovh.com/>`_
-* `Samsung Electronics <https://samsung.com/>`_
-* `SoftIron <https://www.softiron.com/>`_
-* `Western Digital <https://www.wdc.com/>`_
-* `XSKY <https://www.xsky.com/en/>`_
-* `ZTE <https://www.zte.com.cn/global/>`_
 
-General
--------
+Gold
+----
 
-* `ARM <http://www.arm.com/>`_
+* `42on <https://www.42on.com/>`_
+
+Silver
+------
+
 * `Canonical <https://www.canonical.com/>`_
-* `Cloudbase Solutions <https://cloudbase.it/>`_
+* `CloudFerro <https://cloudferro.com/>`_
 * `croit <http://www.croit.io/>`_
-* `EasyStack <https://www.easystack.io/>`_
 * `ISS <http://iss-integration.com/>`_
-* `Koor <http://koor.tech/>`_
-* `Linode <https://linode.com/>`_
+* `Intel <http://www.intel.com/>`_
 * `OSNexus <https://osnexus.com/>`_
-* `Seagate <https://seagate.com/>`_
-* `SinoRail <http://www.sinorail.com/>`_
-* `Vexxhost <https://vexxhost.com>`_
 
 Associate
 ---------
@@ -96,25 +98,18 @@ information see :ref:`governance`.
 Members
 -------
 
-* Anjaneya "Reddy" Chagam (Intel)
-* Alex Marangone (DigitalOcean)
+* Brett Kelly (45Drives)
 * Carlos Maltzahn (UCSC) - Associate member representative
-* Dan van der Ster (CERN) - Ceph Council representative
-* Haomai Wang (XSKY)
-* James Page (Canonical)
+* Dan van der Ster (Clyso) - Ceph Council representative
 * Joachim Kraftmayer (Clyso)
 * Josh Durgin (IBM) - Ceph Council representative
-* Kenneth Van Alstyne (SoftIron)
-* Matias Bjorling (Western Digital)
 * Matthew Leonard (Bloomberg)
 * Mike Perez (IBM) - Ceph community manager
-* Myoungwon Oh (Samsung Electronics)
 * Neha Ojha (IBM) - Ceph Council Representative
 * Steven Umbehocker (OSNexus) - General member representative
 * Pawel Sadowski (OVH)
+* Sungmin Lee (Samsung Electronics)
 * Vincent Hsu (IBM)
-* Xie Xingguo (ZTE)
-* Zhang Shaowen (China Mobile)
 
 Joining
 =======

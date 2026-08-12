@@ -1,4 +1,3 @@
-
 """
 ceph-mgr orchestrator interface
 
@@ -30,8 +29,23 @@ except ImportError:
 import yaml
 
 from ceph.deployment import inventory
-from ceph.deployment.service_spec import ServiceSpec, NFSServiceSpec, RGWSpec, \
-    IscsiServiceSpec, IngressSpec, SNMPGatewaySpec, MDSSpec, TunedProfileSpec
+from ceph.deployment.service_spec import (
+    ArgumentList,
+    ArgumentSpec,
+    GeneralArgList,
+    IngressSpec,
+    IscsiServiceSpec,
+    MDSSpec,
+    NFSServiceSpec,
+    NvmeofServiceSpec,
+    RGWSpec,
+    SMBSpec,
+    SNMPGatewaySpec,
+    MgmtGatewaySpec,
+    OAuth2ProxySpec,
+    ServiceSpec,
+    TunedProfileSpec,
+)
 from ceph.deployment.drive_group import DriveGroupSpec
 from ceph.deployment.hostspec import HostSpec, SpecValidationError
 from ceph.utils import datetime_to_str, str_to_datetime
@@ -59,7 +73,7 @@ class OrchestratorError(Exception):
                  errno: int = -errno.EINVAL,
                  event_kind_subject: Optional[Tuple[str, str]] = None) -> None:
         super(Exception, self).__init__(msg)
-        self.errno = errno
+        self.errno = abs(errno)
         # See OrchestratorEvent.subject
         self.event_subject = event_kind_subject
 
@@ -96,12 +110,12 @@ def handle_exception(prefix: str, perm: str, func: FuncT) -> FuncT:
             return func(*args, **kwargs)
         except (OrchestratorError, SpecValidationError) as e:
             # Do not print Traceback for expected errors.
-            return HandleCommandResult(e.errno, stderr=str(e))
+            return HandleCommandResult(retval=e.errno, stderr=str(e))
         except ImportError as e:
-            return HandleCommandResult(-errno.ENOENT, stderr=str(e))
+            return HandleCommandResult(retval=-errno.ENOENT, stderr=str(e))
         except NotImplementedError:
             msg = 'This Orchestrator does not support `{}`'.format(prefix)
-            return HandleCommandResult(-errno.ENOENT, stderr=msg)
+            return HandleCommandResult(retval=-errno.ENOENT, stderr=msg)
 
     # misuse lambda to copy `wrapper`
     wrapper_copy = lambda *l_args, **l_kwargs: wrapper(*l_args, **l_kwargs)  # noqa: E731
@@ -230,6 +244,25 @@ def raise_if_exception(c: OrchResult[T]) -> T:
     return c.result
 
 
+def completion_to_result(c: OrchResult[T]) -> HandleCommandResult:
+    """
+    Converts an OrchResult to a HandleCommandResult,
+    preserving output and error codes.
+    """
+    if c.serialized_exception is None:
+        assert c.result is not None, "OrchResult should either have result or an exception"
+        return HandleCommandResult(stdout=c.result_str())
+
+    try:
+        e = pickle.loads(c.serialized_exception)
+    except (KeyError, AttributeError):
+        return HandleCommandResult(stderr=c.exception_str, retval=errno.EIO)
+    if isinstance(e, OrchestratorError):
+        return HandleCommandResult(stderr=str(e), retval=-e.errno)
+
+    raise e
+
+
 def _hide_in_features(f: FuncT) -> FuncT:
     f._hide_in_features = True  # type: ignore
     return f
@@ -347,7 +380,83 @@ class Orchestrator(object):
         """
         raise NotImplementedError()
 
-    def remove_host(self, host: str, force: bool, offline: bool) -> OrchResult[str]:
+    def hardware_light(self, light_type: str, action: str, hostname: str, device: Optional[str] = None) -> OrchResult[Dict[str, Any]]:
+        """
+        Light a chassis or device ident LED.
+
+        :param light_type: led type (chassis or device).
+        :param action: set or get status led.
+        :param hostname: the name of the host.
+        :param device: the device id (when light_type = 'device')
+        """
+        raise NotImplementedError()
+
+    def hardware_powercycle(self, hostname: str, yes_i_really_mean_it: bool = False) -> OrchResult[str]:
+        """
+        Reboot a host.
+
+        :param hostname: the name of the host being rebooted.
+        """
+        raise NotImplementedError()
+
+    def hardware_shutdown(self, hostname: str, force: Optional[bool] = False, yes_i_really_mean_it: bool = False) -> OrchResult[str]:
+        """
+        Shutdown a host.
+
+        :param hostname: the name of the host to shutdown.
+        """
+        raise NotImplementedError()
+
+    def hardware_status(self, hostname: Optional[str] = None, category: Optional[str] = 'summary') -> OrchResult[str]:
+        """
+        Display hardware status.
+
+        :param category: category
+        :param hostname: hostname
+        """
+        raise NotImplementedError()
+
+    def node_proxy_summary(self, hostname: Optional[str] = None) -> OrchResult[Dict[str, Any]]:
+        """
+        Return node-proxy summary
+
+        :param hostname: hostname
+        """
+        raise NotImplementedError()
+
+    def node_proxy_fullreport(self, hostname: Optional[str] = None) -> OrchResult[Dict[str, Any]]:
+        """
+        Return node-proxy full report
+
+        :param hostname: hostname
+        """
+        raise NotImplementedError()
+
+    def node_proxy_firmwares(self, hostname: Optional[str] = None) -> OrchResult[Dict[str, Any]]:
+        """
+        Return node-proxy firmwares report
+
+        :param hostname: hostname
+        """
+        raise NotImplementedError()
+
+    def node_proxy_criticals(self, hostname: Optional[str] = None) -> OrchResult[Dict[str, Any]]:
+        """
+        Return node-proxy criticals report
+
+        :param hostname: hostname
+        """
+        raise NotImplementedError()
+
+    def node_proxy_common(self, category: str, hostname: Optional[str] = None) -> OrchResult[Dict[str, Any]]:
+        """
+        Return node-proxy generic report
+
+        :param hostname: hostname
+        """
+        raise NotImplementedError()
+
+    def remove_host(self, host: str, force: bool, offline: bool, rm_crush_entry: bool) -> OrchResult[str]:
         """
         Remove a host from the orchestrator inventory.
 
@@ -355,9 +464,17 @@ class Orchestrator(object):
         """
         raise NotImplementedError()
 
-    def drain_host(self, hostname: str, force: bool = False) -> OrchResult[str]:
+    def drain_host(self, hostname: str, force: bool = False, keep_conf_keyring: bool = False, zap_osd_devices: bool = False) -> OrchResult[str]:
         """
         drain all daemons from a host
+
+        :param hostname: hostname
+        """
+        raise NotImplementedError()
+
+    def stop_drain_host(self, hostname: str) -> OrchResult[str]:
+        """
+        stop draining daemons of a host
 
         :param hostname: hostname
         """
@@ -398,7 +515,7 @@ class Orchestrator(object):
         """
         raise NotImplementedError()
 
-    def host_ok_to_stop(self, hostname: str) -> OrchResult:
+    def host_ok_to_stop(self, hostname: str) -> OrchResult[str]:
         """
         Check if the specified host can be safely stopped without reducing availability
 
@@ -406,13 +523,13 @@ class Orchestrator(object):
         """
         raise NotImplementedError()
 
-    def enter_host_maintenance(self, hostname: str, force: bool = False) -> OrchResult:
+    def enter_host_maintenance(self, hostname: str, force: bool = False, yes_i_really_mean_it: bool = False) -> OrchResult[str]:
         """
         Place a host in maintenance, stopping daemons and disabling it's systemd target
         """
         raise NotImplementedError()
 
-    def exit_host_maintenance(self, hostname: str) -> OrchResult:
+    def exit_host_maintenance(self, hostname: str, force: bool = False, offline: bool = False) -> OrchResult[str]:
         """
         Return a host from maintenance, restarting the clusters systemd target
         """
@@ -429,19 +546,20 @@ class Orchestrator(object):
         """
         raise NotImplementedError()
 
+    def replace_device(self,
+                       hostname: str,
+                       device: str,
+                       clear: bool = False,
+                       yes_i_really_mean_it: bool = False) -> OrchResult:
+        """Perform all required operations in order to replace a device.
+        """
+        raise NotImplementedError()
+
     def get_inventory(self, host_filter: Optional['InventoryFilter'] = None, refresh: bool = False) -> OrchResult[List['InventoryHost']]:
         """
         Returns something that was created by `ceph-volume inventory`.
 
         :return: list of InventoryHost
-        """
-        raise NotImplementedError()
-
-    def service_discovery_dump_cert(self) -> OrchResult:
-        """
-        Returns service discovery server root certificate
-
-        :return: service discovery root certificate
         """
         raise NotImplementedError()
 
@@ -468,8 +586,96 @@ class Orchestrator(object):
         """
         raise NotImplementedError()
 
+    def cert_store_cert_ls(self,
+                           filter_by: str = '',
+                           show_details: bool = False,
+                           include_cephadm_signed: bool = False) -> OrchResult[Dict[str, Any]]:
+        raise NotImplementedError()
+
+    def cert_store_bindings_ls(self) -> OrchResult[Dict[Any, Dict[str, List[str]]]]:
+        raise NotImplementedError()
+
+    def cert_store_reload(self) -> OrchResult[str]:
+        raise NotImplementedError()
+
+    def cert_store_cert_check(self) -> OrchResult[List[str]]:
+        raise NotImplementedError()
+
+    def cert_store_key_ls(self, include_cephadm_generated_keys: bool = False) -> OrchResult[Dict[str, Any]]:
+        raise NotImplementedError()
+
+    def cert_store_get_cert(
+        self,
+        cert_name: str,
+        service_name: Optional[str] = None,
+        hostname: Optional[str] = None,
+        no_exception_when_missing: bool = False
+    ) -> OrchResult[str]:
+        raise NotImplementedError()
+
+    def cert_store_get_key(
+        self,
+        key_name: str,
+        service_name: Optional[str] = None,
+        hostname: Optional[str] = None,
+        no_exception_when_missing: bool = False
+    ) -> OrchResult[str]:
+        raise NotImplementedError()
+
+    def cert_store_set_pair(
+        self,
+        cert: str,
+        key: str,
+        consumer: str,
+        cert_name: Optional[str] = None,
+        service_name: Optional[str] = None,
+        hostname: Optional[str] = None,
+        force: Optional[bool] = False
+    ) -> OrchResult[str]:
+        raise NotImplementedError()
+
+    def cert_store_set_cert(
+        self,
+        cert_name: str,
+        cert: str,
+        service_name: Optional[str] = None,
+        hostname: Optional[str] = None,
+        force: bool = False
+    ) -> OrchResult[str]:
+        raise NotImplementedError()
+
+    def cert_store_set_key(
+        self,
+        key: str,
+        key_name: str,
+        service_name: Optional[str] = None,
+        hostname: Optional[str] = None,
+    ) -> OrchResult[str]:
+        raise NotImplementedError()
+
+    def cert_store_rm_cert(
+        self,
+        cert_name: str,
+        service_name: Optional[str] = None,
+        hostname: Optional[str] = None,
+    ) -> OrchResult[str]:
+        raise NotImplementedError()
+
+    def cert_store_rm_key(
+        self,
+        key_name: str,
+        service_name: Optional[str] = None,
+        hostname: Optional[str] = None,
+    ) -> OrchResult[str]:
+        raise NotImplementedError()
+
     @handle_orch_error
-    def apply(self, specs: Sequence["GenericSpec"], no_overwrite: bool = False) -> List[str]:
+    def apply(
+        self,
+        specs: Sequence["GenericSpec"],
+        no_overwrite: bool = False,
+        continue_on_error: bool = False
+    ) -> List[str]:
         """
         Applies any spec
         """
@@ -478,6 +684,7 @@ class Orchestrator(object):
             'crash': self.apply_crash,
             'grafana': self.apply_grafana,
             'iscsi': self.apply_iscsi,
+            'nvmeof': self.apply_nvmeof,
             'mds': self.apply_mds,
             'mgr': self.apply_mgr,
             'mon': self.apply_mon,
@@ -488,11 +695,15 @@ class Orchestrator(object):
             'prometheus': self.apply_prometheus,
             'loki': self.apply_loki,
             'promtail': self.apply_promtail,
+            'alloy': self.apply_alloy,
             'rbd-mirror': self.apply_rbd_mirror,
             'rgw': self.apply_rgw,
             'ingress': self.apply_ingress,
             'snmp-gateway': self.apply_snmp_gateway,
             'host': self.add_host,
+            'smb': self.apply_smb,
+            'mgmt-gateway': self.apply_mgmt_gateway,
+            'oauth2-proxy': self.apply_oauth2_proxy,
         }
 
         def merge(l: OrchResult[List[str]], r: OrchResult[str]) -> OrchResult[List[str]]:  # noqa: E741
@@ -501,6 +712,14 @@ class Orchestrator(object):
             l_res.append(r_res)
             return OrchResult(l_res)
         return raise_if_exception(reduce(merge, [fns[spec.service_type](spec) for spec in specs], OrchResult([])))
+
+    def set_unmanaged(self, service_name: str, value: bool) -> OrchResult[str]:
+        """
+        Set unmanaged parameter to True/False for a given service
+
+        :return: None
+        """
+        raise NotImplementedError()
 
     def plan(self, spec: Sequence["GenericSpec"]) -> OrchResult[List]:
         """
@@ -537,7 +756,7 @@ class Orchestrator(object):
         # assert action in ["start", "stop", "reload, "restart", "redeploy"]
         raise NotImplementedError()
 
-    def daemon_action(self, action: str, daemon_name: str, image: Optional[str] = None) -> OrchResult[str]:
+    def daemon_action(self, action: str, daemon_name: str, image: Optional[str] = None, force: bool = False) -> OrchResult[str]:
         """
         Perform an action (start/stop/reload) on a daemon.
 
@@ -549,7 +768,7 @@ class Orchestrator(object):
         # assert action in ["start", "stop", "reload, "restart", "redeploy"]
         raise NotImplementedError()
 
-    def create_osds(self, drive_group: DriveGroupSpec) -> OrchResult[str]:
+    def create_osds(self, drive_group: DriveGroupSpec, skip_validation: bool = False) -> OrchResult[str]:
         """
         Create one or more OSDs within a single Drive Group.
 
@@ -580,13 +799,21 @@ class Orchestrator(object):
 
     def remove_osds(self, osd_ids: List[str],
                     replace: bool = False,
+                    replace_block: bool = False,
+                    replace_db: bool = False,
+                    replace_wal: bool = False,
                     force: bool = False,
-                    zap: bool = False) -> OrchResult[str]:
+                    zap: bool = False,
+                    no_destroy: bool = False) -> OrchResult[str]:
         """
         :param osd_ids: list of OSD IDs
         :param replace: marks the OSD as being destroyed. See :ref:`orchestrator-osd-replace`
+        :param replace_block: marks the corresponding block device as being replaced.
+        :param replace_db: marks the corresponding db device as being replaced.
+        :param replace_wal: marks the corresponding wal device as being replaced.
         :param force: Forces the OSD removal process without waiting for the data to be drained first.
         :param zap: Zap/Erase all devices associated with the OSDs (DESTROYS DATA)
+        :param no_destroy: Do not destroy associated VGs/LVs with the OSD.
 
 
         .. note:: this can only remove OSDs that were successfully
@@ -604,6 +831,10 @@ class Orchestrator(object):
         """
         Returns a status of the ongoing OSD removal operations.
         """
+        raise NotImplementedError()
+
+    def set_osd_spec(self, service_name: str, osd_ids: List[str]) -> OrchResult:
+        """ set service of osd """
         raise NotImplementedError()
 
     def blink_device_light(self, ident_fault: str, on: bool, locations: List['DeviceLightLoc']) -> OrchResult[List[str]]:
@@ -656,8 +887,48 @@ class Orchestrator(object):
         """Update iscsi cluster"""
         raise NotImplementedError()
 
+    def apply_nvmeof(self, spec: NvmeofServiceSpec) -> OrchResult[str]:
+        """Update nvmeof cluster"""
+        raise NotImplementedError()
+
     def apply_prometheus(self, spec: ServiceSpec) -> OrchResult[str]:
         """Update prometheus cluster"""
+        raise NotImplementedError()
+
+    def get_prometheus_access_info(self) -> OrchResult[Dict[str, str]]:
+        """get prometheus access information"""
+        raise NotImplementedError()
+
+    def get_security_config(self) -> OrchResult[Dict[str, bool]]:
+        """get security config"""
+        raise NotImplementedError()
+
+    def set_alertmanager_access_info(self, user: str, password: str) -> OrchResult[str]:
+        """set alertmanager access information"""
+        raise NotImplementedError()
+
+    def set_prometheus_access_info(self, user: str, password: str) -> OrchResult[str]:
+        """set prometheus access information"""
+        raise NotImplementedError()
+
+    def generate_certificates(self, module_name: str) -> OrchResult[Optional[Dict[str, str]]]:
+        """generate cert/key for the module with the name module_name"""
+        raise NotImplementedError()
+
+    def set_custom_prometheus_alerts(self, alerts_file: str) -> OrchResult[str]:
+        """set prometheus custom alerts files and schedule reconfig of prometheus"""
+        raise NotImplementedError()
+
+    def set_prometheus_target(self, url: str) -> OrchResult[str]:
+        """set prometheus target for multi-cluster"""
+        raise NotImplementedError()
+
+    def remove_prometheus_target(self, url: str) -> OrchResult[str]:
+        """remove prometheus target for multi-cluster"""
+        raise NotImplementedError()
+
+    def get_alertmanager_access_info(self) -> OrchResult[Dict[str, str]]:
+        """get alertmanager access information"""
         raise NotImplementedError()
 
     def apply_node_exporter(self, spec: ServiceSpec) -> OrchResult[str]:
@@ -676,6 +947,10 @@ class Orchestrator(object):
         """Update existing a Promtail daemon(s)"""
         raise NotImplementedError()
 
+    def apply_alloy(self, spec: ServiceSpec) -> OrchResult[str]:
+        """Update existing a alloy daemon(s)"""
+        raise NotImplementedError()
+
     def apply_crash(self, spec: ServiceSpec) -> OrchResult[str]:
         """Update existing a crash daemon(s)"""
         raise NotImplementedError()
@@ -690,6 +965,18 @@ class Orchestrator(object):
 
     def apply_snmp_gateway(self, spec: SNMPGatewaySpec) -> OrchResult[str]:
         """Update an existing snmp gateway service"""
+        raise NotImplementedError()
+
+    def apply_mgmt_gateway(self, spec: MgmtGatewaySpec) -> OrchResult[str]:
+        """Update an existing cluster gateway service"""
+        raise NotImplementedError()
+
+    def apply_oauth2_proxy(self, spec: OAuth2ProxySpec) -> OrchResult[str]:
+        """Update an existing oauth2-proxy"""
+        raise NotImplementedError()
+
+    def apply_smb(self, spec: SMBSpec) -> OrchResult[str]:
+        """Update a smb gateway service"""
         raise NotImplementedError()
 
     def apply_tuned_profiles(self, specs: List[TunedProfileSpec], no_overwrite: bool) -> OrchResult[str]:
@@ -708,9 +995,17 @@ class Orchestrator(object):
         """Change/Add a specific setting for a tuned profile"""
         raise NotImplementedError()
 
+    def tuned_profile_add_settings(self, profile_name: str, setting: dict) -> OrchResult[str]:
+        """Change/Add multiple settings for a tuned profile"""
+        raise NotImplementedError()
+
     def tuned_profile_rm_setting(self, profile_name: str, setting: str) -> OrchResult[str]:
         """Remove a specific setting for a tuned profile"""
         raise NotImplementedError()
+
+    def tuned_profile_rm_settings(self, profile_name: str, settings: List[str]) -> OrchResult[str]:
+        """Remove multiple settings from a tuned profile"""
+        raise NotImplementedError
 
     def upgrade_check(self, image: Optional[str], version: Optional[str]) -> OrchResult[str]:
         raise NotImplementedError()
@@ -738,6 +1033,9 @@ class Orchestrator(object):
 
         :return: UpgradeStatusSpec instance
         """
+        raise NotImplementedError()
+
+    def update_service(self, service_type: str, service_image: str, image: str) -> OrchResult:
         raise NotImplementedError()
 
     @_hide_in_features
@@ -770,6 +1068,9 @@ def daemon_type_to_service(dtype: str) -> str:
         'haproxy': 'ingress',
         'keepalived': 'ingress',
         'iscsi': 'iscsi',
+        'nvmeof': 'nvmeof',
+        'mgmt-gateway': 'mgmt-gateway',
+        'oauth2-proxy': 'oauth2-proxy',
         'rbd-mirror': 'rbd-mirror',
         'cephfs-mirror': 'cephfs-mirror',
         'nfs': 'nfs',
@@ -780,15 +1081,18 @@ def daemon_type_to_service(dtype: str) -> str:
         'ceph-exporter': 'ceph-exporter',
         'loki': 'loki',
         'promtail': 'promtail',
+        'alloy': 'alloy',
         'crash': 'crash',
         'crashcollector': 'crash',  # Specific Rook Daemon
         'container': 'container',
         'agent': 'agent',
+        'node-proxy': 'node-proxy',
         'snmp-gateway': 'snmp-gateway',
         'elasticsearch': 'elasticsearch',
         'jaeger-agent': 'jaeger-agent',
         'jaeger-collector': 'jaeger-collector',
-        'jaeger-query': 'jaeger-query'
+        'jaeger-query': 'jaeger-query',
+        'smb': 'smb',
     }
     return mapping[dtype]
 
@@ -802,6 +1106,9 @@ def service_to_daemon_types(stype: str) -> List[str]:
         'osd': ['osd'],
         'ingress': ['haproxy', 'keepalived'],
         'iscsi': ['iscsi'],
+        'nvmeof': ['nvmeof'],
+        'mgmt-gateway': ['mgmt-gateway'],
+        'oauth2-proxy': ['oauth2-proxy'],
         'rbd-mirror': ['rbd-mirror'],
         'cephfs-mirror': ['cephfs-mirror'],
         'nfs': ['nfs'],
@@ -810,17 +1117,20 @@ def service_to_daemon_types(stype: str) -> List[str]:
         'prometheus': ['prometheus'],
         'loki': ['loki'],
         'promtail': ['promtail'],
+        'alloy': ['alloy'],
         'node-exporter': ['node-exporter'],
         'ceph-exporter': ['ceph-exporter'],
         'crash': ['crash'],
         'container': ['container'],
         'agent': ['agent'],
+        'node-proxy': ['node-proxy'],
         'snmp-gateway': ['snmp-gateway'],
         'elasticsearch': ['elasticsearch'],
         'jaeger-agent': ['jaeger-agent'],
         'jaeger-collector': ['jaeger-collector'],
         'jaeger-query': ['jaeger-query'],
-        'jaeger-tracing': ['elasticsearch', 'jaeger-query', 'jaeger-collector', 'jaeger-agent']
+        'jaeger-tracing': ['elasticsearch', 'jaeger-query', 'jaeger-collector', 'jaeger-agent'],
+        'smb': ['smb'],
     }
     return mapping[stype]
 
@@ -839,6 +1149,50 @@ class UpgradeStatusSpec(object):
         self.progress: Optional[str] = None  # How many of the daemons have we upgraded
         self.message = ""  # Freeform description
         self.is_paused: bool = False  # Is the upgrade paused?
+
+    def to_json(self) -> dict:
+        return {
+            'in_progress': self.in_progress,
+            'target_image': self.target_image,
+            'which': self.which,
+            'services_complete': self.services_complete,
+            'progress': self.progress,
+            'message': self.message,
+            'is_paused': self.is_paused,
+        }
+
+    def to_dict(self) -> Dict:
+        out: Dict[str, Any] = {}
+        out['in_progress'] = self.in_progress
+        out['target_image'] = self.target_image
+        out['services_complete'] = self.services_complete
+        out['which'] = self.which
+        out['progress'] = self.progress
+        out['message'] = self.message
+        out['is_paused'] = self.is_paused
+        return out
+
+    @classmethod
+    def from_json(cls, data: dict) -> 'UpgradeStatusSpec':
+        if not isinstance(data, dict):
+            raise ValueError(f'Expected a dictionary, but got {type(data)}')
+        instance = cls()
+        instance.in_progress = data.get('in_progress', False)
+        instance.target_image = data.get('target_image', None)
+        instance.services_complete = data.get('services_complete', [])
+        instance.which = data.get('which', '<unknown>')
+        instance.progress = data.get('progress', None)
+        instance.message = data.get('message', "")
+        instance.is_paused = data.get('is_paused', False)
+
+        return instance
+
+    @staticmethod
+    def yaml_representer(dumper: 'yaml.Dumper', data: 'UpgradeStatusSpec') -> yaml.Node:
+        return dumper.represent_dict(cast(Mapping, data.to_json().items()))
+
+
+yaml.add_representer(UpgradeStatusSpec, UpgradeStatusSpec.yaml_representer)
 
 
 def handle_type_error(method: FuncT) -> FuncT:
@@ -912,10 +1266,12 @@ class DaemonDescription(object):
                  ports: Optional[List[int]] = None,
                  ip: Optional[str] = None,
                  deployed_by: Optional[List[str]] = None,
+                 systemd_unit: Optional[str] = None,
                  rank: Optional[int] = None,
                  rank_generation: Optional[int] = None,
-                 extra_container_args: Optional[List[str]] = None,
-                 extra_entrypoint_args: Optional[List[str]] = None,
+                 extra_container_args: Optional[GeneralArgList] = None,
+                 extra_entrypoint_args: Optional[GeneralArgList] = None,
+                 pending_daemon_config: bool = False
                  ) -> None:
 
         #: Host is at the same granularity as InventoryHost
@@ -978,10 +1334,28 @@ class DaemonDescription(object):
 
         self.deployed_by = deployed_by
 
+        self.systemd_unit = systemd_unit
+
         self.is_active = is_active
 
-        self.extra_container_args = extra_container_args
-        self.extra_entrypoint_args = extra_entrypoint_args
+        self.extra_container_args: Optional[ArgumentList] = None
+        self.extra_entrypoint_args: Optional[ArgumentList] = None
+        if extra_container_args:
+            self.extra_container_args = ArgumentSpec.from_general_args(
+                extra_container_args)
+        if extra_entrypoint_args:
+            self.extra_entrypoint_args = ArgumentSpec.from_general_args(
+                extra_entrypoint_args)
+        self.pending_daemon_config = pending_daemon_config
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if value is not None and name in ('extra_container_args', 'extra_entrypoint_args'):
+            for v in value:
+                tname = str(type(v))
+                if 'ArgumentSpec' not in tname:
+                    raise TypeError(f"{name} is not all ArgumentSpec values: {v!r}(is {type(v)} in {value!r}")
+
+        super().__setattr__(name, value)
 
     @property
     def status(self) -> Optional[DaemonDescriptionStatus]:
@@ -1006,6 +1380,24 @@ class DaemonDescription(object):
         if service_name:
             return (daemon_type_to_service(self.daemon_type) + '.' + self.daemon_id).startswith(service_name + '.')
         return False
+
+    def matches_digests(self, digests: Optional[List[str]]) -> bool:
+        # the DaemonDescription class maintains a list of container digests
+        # for the container image last reported as being used for the daemons.
+        # This function checks if any of those digests match any of the digests
+        # in the list of digests provided as an arg to this function
+        if not digests or not self.container_image_digests:
+            return False
+        return any(d in digests for d in self.container_image_digests)
+
+    def matches_image_name(self, image_name: Optional[str]) -> bool:
+        # the DaemonDescription class has an attribute that tracks the image
+        # name of the container image last reported as being used by the daemon.
+        # This function compares if the image name provided as an arg matches
+        # the image name in said attribute
+        if not image_name or not self.container_image_name:
+            return False
+        return image_name == self.container_image_name
 
     def service_id(self) -> str:
         assert self.daemon_id is not None
@@ -1076,6 +1468,9 @@ class DaemonDescription(object):
             return f'{daemon_type_to_service(self.daemon_type)}.{self.service_id()}'
         return daemon_type_to_service(self.daemon_type)
 
+    def update_pending_daemon_config(self, value: bool) -> None:
+        self.pending_daemon_config = value
+
     def __repr__(self) -> str:
         return "<DaemonDescription>({type}.{id})".format(type=self.daemon_type,
                                                          id=self.daemon_id)
@@ -1108,6 +1503,8 @@ class DaemonDescription(object):
         out['ip'] = self.ip
         out['rank'] = self.rank
         out['rank_generation'] = self.rank_generation
+        out['systemd_unit'] = self.systemd_unit
+        out['pending_daemon_config'] = self.pending_daemon_config
 
         for k in ['last_refresh', 'created', 'started', 'last_deployed',
                   'last_configured']:
@@ -1144,6 +1541,8 @@ class DaemonDescription(object):
         out['is_active'] = self.is_active
         out['ports'] = self.ports
         out['ip'] = self.ip
+        out['systemd_unit'] = self.systemd_unit
+        out['pending_daemon_config'] = self.pending_daemon_config
 
         for k in ['last_refresh', 'created', 'started', 'last_deployed',
                   'last_configured']:
@@ -1188,7 +1587,7 @@ class DaemonDescription(object):
         return DaemonDescription.from_json(self.to_json())
 
     @staticmethod
-    def yaml_representer(dumper: 'yaml.SafeDumper', data: 'DaemonDescription') -> Any:
+    def yaml_representer(dumper: 'yaml.Dumper', data: 'DaemonDescription') -> yaml.Node:
         return dumper.represent_dict(cast(Mapping, data.to_json().items()))
 
 
@@ -1321,7 +1720,7 @@ class ServiceDescription(object):
         return cls(spec=spec, events=events, **c_status)
 
     @staticmethod
-    def yaml_representer(dumper: 'yaml.SafeDumper', data: 'ServiceDescription') -> Any:
+    def yaml_representer(dumper: 'yaml.Dumper', data: 'ServiceDescription') -> yaml.Node:
         return dumper.represent_dict(cast(Mapping, data.to_json().items()))
 
 
@@ -1335,7 +1734,7 @@ class InventoryFilter(object):
 
     Typical use:
 
-      filter by host when presentig UI workflow for configuring
+      filter by host when presenting UI workflow for configuring
       a particular server.
       filter by label when not all of estate is Ceph servers,
       and we want to only learn about the Ceph servers.
@@ -1535,7 +1934,7 @@ class OrchestratorClientMixin(Orchestrator):
 
     >>> import mgr_module
     >>> #doctest: +SKIP
-    ... class MyImplentation(mgr_module.MgrModule, Orchestrator):
+    ... class MyImplementation(mgr_module.MgrModule, Orchestrator):
     ...     def __init__(self, ...):
     ...         self.orch_client = OrchestratorClientMixin()
     ...         self.orch_client.set_mgr(self.mgr))
@@ -1543,7 +1942,7 @@ class OrchestratorClientMixin(Orchestrator):
 
     def set_mgr(self, mgr: MgrModule) -> None:
         """
-        Useable in the Dashbord that uses a global ``mgr``
+        Useable in the Dashboard that uses a global ``mgr``
         """
 
         self.__mgr = mgr  # Make sure we're not overwriting any other `mgr` properties

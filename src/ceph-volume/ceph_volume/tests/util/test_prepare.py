@@ -5,6 +5,8 @@ from ceph_volume.util import prepare
 from ceph_volume.util.prepare import system
 from ceph_volume import conf
 from ceph_volume.tests.conftest import Factory
+from ceph_volume.objectstore.baseobjectstore import BaseObjectStore
+from unittest.mock import patch
 
 
 class TestOSDIDAvailable(object):
@@ -116,54 +118,51 @@ class TestFormatDevice(object):
         assert expected == fake_run.calls[0]['args'][0]
 
 
-mkfs_filestore_flags = [
-    'ceph-osd',
-    '--cluster',
-    '--osd-objectstore', 'filestore',
-    '--mkfs',
-    '-i',
-    '--monmap',
-    '--keyfile', '-', # goes through stdin
-    '--osd-data',
-    '--osd-journal',
-    '--osd-uuid',
-    '--setuser', 'ceph',
-    '--setgroup', 'ceph'
-]
+class TestOsdMkfs(object):
+    def setup_method(self):
+        conf.cluster = 'ceph'
 
-
-class TestOsdMkfsFilestore(object):
-
-    @pytest.mark.parametrize('flag', mkfs_filestore_flags)
-    def test_keyring_is_used(self, fake_call, monkeypatch, flag):
+    def test_keyring_is_added(self, fake_call, monkeypatch, factory):
+        args = factory(dmcrypt=False)
         monkeypatch.setattr(system, 'chown', lambda path: True)
-        prepare.osd_mkfs_filestore(1, 'asdf', keyring='secret')
-        assert flag in fake_call.calls[0]['args'][0]
+        o = BaseObjectStore(args)
+        o.osd_id = '1'
+        o.osd_fsid = 'asdf'
+        o.osd_mkfs()
+        assert '--keyfile' in fake_call.calls[2]['args'][0]
 
-
-class TestOsdMkfsBluestore(object):
-
-    def test_keyring_is_added(self, fake_call, monkeypatch):
+    def test_keyring_is_not_added(self, fake_call, monkeypatch, factory):
+        args = factory(dmcrypt=False)
         monkeypatch.setattr(system, 'chown', lambda path: True)
-        prepare.osd_mkfs_bluestore(1, 'asdf', keyring='secret')
-        assert '--keyfile' in fake_call.calls[0]['args'][0]
-
-    def test_keyring_is_not_added(self, fake_call, monkeypatch):
-        monkeypatch.setattr(system, 'chown', lambda path: True)
-        prepare.osd_mkfs_bluestore(1, 'asdf')
+        o = BaseObjectStore(args)
+        o.osd_id = '1'
+        o.osd_fsid = 'asdf'
+        o.osd_mkfs()
         assert '--keyfile' not in fake_call.calls[0]['args'][0]
 
-    def test_wal_is_added(self, fake_call, monkeypatch):
+    def test_wal_is_added(self, fake_call, monkeypatch, objectstore, factory):
+        args = factory(objecstore='bluestore',
+                       osd_id='1',
+                       osd_fid='asdf',
+                       wal_device_path='/dev/smm1',
+                       cephx_secret='foo',
+                       dmcrypt=False)
         monkeypatch.setattr(system, 'chown', lambda path: True)
-        prepare.osd_mkfs_bluestore(1, 'asdf', wal='/dev/smm1')
-        assert '--bluestore-block-wal-path' in fake_call.calls[0]['args'][0]
-        assert '/dev/smm1' in fake_call.calls[0]['args'][0]
+        o = BaseObjectStore(args)
+        o.wal_device_path = '/dev/smm1'
+        o.osd_mkfs()
+        assert '--bluestore-block-wal-path' in fake_call.calls[2]['args'][0]
+        assert '/dev/smm1' in fake_call.calls[2]['args'][0]
 
-    def test_db_is_added(self, fake_call, monkeypatch):
+    def test_db_is_added(self, fake_call, monkeypatch, factory):
+        args = factory(dmcrypt=False)
         monkeypatch.setattr(system, 'chown', lambda path: True)
-        prepare.osd_mkfs_bluestore(1, 'asdf', db='/dev/smm2')
-        assert '--bluestore-block-db-path' in fake_call.calls[0]['args'][0]
-        assert '/dev/smm2' in fake_call.calls[0]['args'][0]
+        o = BaseObjectStore(args)
+        o.args = args
+        o.db_device_path = '/dev/smm2'
+        o.osd_mkfs()
+        assert '--bluestore-block-db-path' in fake_call.calls[2]['args'][0]
+        assert '/dev/smm2' in fake_call.calls[2]['args'][0]
 
 
 class TestMountOSD(object):
@@ -288,52 +287,30 @@ class TestNormalizeFlags(object):
         result = sorted(prepare._normalize_mount_flags(flags, extras=['discard','rw']).split(','))
         assert ','.join(result) == 'auto,discard,exec,rw'
 
+@patch('ceph_volume.util.prepare.create_key', return_value='fake-secret')
+class TestMkfs(object):
 
-class TestMkfsFilestore(object):
-
-    def test_non_zero_exit_status(self, stub_call, monkeypatch):
+    def test_non_zero_exit_status(self, m_create_key, stub_call, monkeypatch, objectstore):
         conf.cluster = 'ceph'
         monkeypatch.setattr('ceph_volume.util.prepare.system.chown', lambda x: True)
         stub_call(([], [], 1))
+        o = objectstore(osd_id='1',
+                         osd_fsid='asdf-1234',
+                         cephx_secret='keyring')
         with pytest.raises(RuntimeError) as error:
-            prepare.osd_mkfs_filestore('1', 'asdf-1234', 'keyring')
+            o.osd_mkfs()
         assert "Command failed with exit code 1" in str(error.value)
 
-    def test_non_zero_exit_formats_command_correctly(self, stub_call, monkeypatch):
+    def test_non_zero_exit_formats_command_correctly(self, m_create_key, stub_call, monkeypatch, objectstore):
         conf.cluster = 'ceph'
         monkeypatch.setattr('ceph_volume.util.prepare.system.chown', lambda x: True)
         stub_call(([], [], 1))
+        o = objectstore(osd_id='1',
+                        objectstore='bluestore',
+                        osd_fsid='asdf-1234',
+                        cephx_secret='keyring')
         with pytest.raises(RuntimeError) as error:
-            prepare.osd_mkfs_filestore('1', 'asdf-1234', 'keyring')
-        expected = ' '.join([
-            'ceph-osd',
-            '--cluster',
-            'ceph',
-            '--osd-objectstore', 'filestore', '--mkfs',
-            '-i', '1', '--monmap', '/var/lib/ceph/osd/ceph-1/activate.monmap',
-            '--keyfile', '-', '--osd-data', '/var/lib/ceph/osd/ceph-1/',
-            '--osd-journal', '/var/lib/ceph/osd/ceph-1/journal',
-            '--osd-uuid', 'asdf-1234',
-            '--setuser', 'ceph', '--setgroup', 'ceph'])
-        assert expected in str(error.value)
-
-
-class TestMkfsBluestore(object):
-
-    def test_non_zero_exit_status(self, stub_call, monkeypatch):
-        conf.cluster = 'ceph'
-        monkeypatch.setattr('ceph_volume.util.prepare.system.chown', lambda x: True)
-        stub_call(([], [], 1))
-        with pytest.raises(RuntimeError) as error:
-            prepare.osd_mkfs_bluestore('1', 'asdf-1234', keyring='keyring')
-        assert "Command failed with exit code 1" in str(error.value)
-
-    def test_non_zero_exit_formats_command_correctly(self, stub_call, monkeypatch):
-        conf.cluster = 'ceph'
-        monkeypatch.setattr('ceph_volume.util.prepare.system.chown', lambda x: True)
-        stub_call(([], [], 1))
-        with pytest.raises(RuntimeError) as error:
-            prepare.osd_mkfs_bluestore('1', 'asdf-1234', keyring='keyring')
+            o.osd_mkfs()
         expected = ' '.join([
             'ceph-osd',
             '--cluster',
@@ -344,57 +321,3 @@ class TestMkfsBluestore(object):
             '--osd-uuid', 'asdf-1234',
             '--setuser', 'ceph', '--setgroup', 'ceph'])
         assert expected in str(error.value)
-
-
-class TestGetJournalSize(object):
-
-    def test_undefined_size_fallbacks_formatted(self, conf_ceph_stub):
-        conf_ceph_stub(dedent("""
-        [global]
-        fsid = a25d19a6-7d57-4eda-b006-78e35d2c4d9f
-        """))
-        result = prepare.get_journal_size()
-        assert result == '5G'
-
-    def test_undefined_size_fallbacks_unformatted(self, conf_ceph_stub):
-        conf_ceph_stub(dedent("""
-        [global]
-        fsid = a25d19a6-7d57-4eda-b006-78e35d2c4d9f
-        """))
-        result = prepare.get_journal_size(lv_format=False)
-        assert result.gb.as_int() == 5
-
-    def test_defined_size_unformatted(self, conf_ceph_stub):
-        conf_ceph_stub(dedent("""
-        [global]
-        fsid = a25d19a6-7d57-4eda-b006-78e35d2c4d9f
-
-        [osd]
-        osd journal size = 10240
-        """))
-        result = prepare.get_journal_size(lv_format=False)
-        assert result.gb.as_int() == 10
-
-    def test_defined_size_formatted(self, conf_ceph_stub):
-        conf_ceph_stub(dedent("""
-        [global]
-        fsid = a25d19a6-7d57-4eda-b006-78e35d2c4d9f
-
-        [osd]
-        osd journal size = 10240
-        """))
-        result = prepare.get_journal_size()
-        assert result == '10G'
-
-    def test_refuse_tiny_journals(self, conf_ceph_stub):
-        conf_ceph_stub(dedent("""
-        [global]
-        fsid = a25d19a6-7d57-4eda-b006-78e35d2c4d9f
-
-        [osd]
-        osd journal size = 1024
-        """))
-        with pytest.raises(RuntimeError) as error:
-            prepare.get_journal_size()
-        assert 'journal sizes must be larger' in str(error.value)
-        assert 'detected: 1024.00 MB' in str(error.value)

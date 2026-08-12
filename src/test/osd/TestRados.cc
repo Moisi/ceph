@@ -29,18 +29,22 @@ public:
 			bool ec_pool,
 			bool balance_reads,
 			bool localize_reads,
+			uint8_t offlen_randomization_ratio,
 			bool set_redirect,
 			bool set_chunk,
-			bool enable_dedup) :
+			bool enable_dedup,
+			RadosTestContext *context) :
     m_nextop(NULL), m_op(0), m_ops(ops), m_seconds(max_seconds),
     m_objects(objects), m_stats(stats),
     m_total_weight(0),
     m_ec_pool(ec_pool),
     m_balance_reads(balance_reads),
     m_localize_reads(localize_reads),
+    m_offlen_randomization_ratio(offlen_randomization_ratio),
     m_set_redirect(set_redirect),
     m_set_chunk(set_chunk),
-    m_enable_dedup(enable_dedup)
+    m_enable_dedup(enable_dedup),
+    context(context)
   {
     m_start = time(0);
     for (map<TestOpType, unsigned int>::const_iterator it = op_weights.begin();
@@ -72,7 +76,7 @@ public:
 	// make it a long name
 	oid << " " << string(300, 'o');
 	}*/
-      cout << m_op << ": write initial oid " << oid.str() << std::endl;
+      context.cout_prefix() << m_op << ": write initial oid " << oid.str() << std::endl;
       context.oid_not_flushing.insert(oid.str());
       if (m_ec_pool) {
 	return new WriteOp(m_op, &context, oid.str(), true, true);
@@ -143,7 +147,7 @@ public:
       /*if (m_op % 2) {
 	oid << " " << string(300, 'o');
 	}*/
-      cout << m_op << ": write initial oid " << oid.str() << std::endl;
+      context.cout_prefix() << m_op << ": write initial oid " << oid.str() << std::endl;
       context.oid_not_flushing.insert(oid.str());
       if (m_ec_pool) {
 	op = new WriteOp(m_op, &context, oid.str(), true, true);
@@ -164,7 +168,7 @@ public:
           /* previous write is not finished */
           op = NULL;
           m_op--;
-          cout << m_op << " wait for completion of write op! " << std::endl;
+          context.cout_prefix() << m_op << " wait for completion of write op! " << std::endl;
           return true;
         }
 
@@ -176,7 +180,7 @@ public:
 	if ((_oid2) % 2) {
 	  oid2 << " " << string(300, 'm');
 	}
-	cout << m_op << ": " << "copy oid " << oid.str() << " target oid " 
+	context.cout_prefix() << m_op << ": " << "copy oid " << oid.str() << " target oid "
 	      << oid2.str() << std::endl;
 	op = new CopyOp(m_op, &context, oid.str(), oid2.str(), context.low_tier_pool_name);
 	return true;
@@ -196,10 +200,10 @@ public:
 	  /* previous copy is not finished */
 	  op = NULL;
 	  m_op--;
-	  cout << m_op << " retry set_redirect !" << std::endl;
+	  context.cout_prefix() << m_op << " retry set_redirect !" << std::endl;
 	  return true;
 	}
-	cout << m_op << ": " << "set_redirect oid " << oid.str() << " target oid " 
+	context.cout_prefix() << m_op << ": " << "set_redirect oid " << oid.str() << " target oid "
 	      << oid2.str() << std::endl;
 	op = new SetRedirectOp(m_op, &context, oid.str(), oid2.str(), context.pool_name);
 	return true;
@@ -214,7 +218,7 @@ public:
 	  /* previous set-chunk is not finished */
 	  op = NULL;
 	  m_op--;
-	  cout << m_op << " retry set_chunk !" << std::endl;
+	  context.cout_prefix() << m_op << " retry set_chunk !" << std::endl;
 	  return true;
 	}
 	stringstream oid2;
@@ -223,7 +227,7 @@ public:
 	  oid2 << " " << string(300, 'm');
 	}
 
-	cout << m_op << ": " << "set_chunk oid " << oid.str() 
+	context.cout_prefix() << m_op << ": " << "set_chunk oid " << oid.str()
 	     <<  " target oid " << oid2.str()  << std::endl;
 	op = new SetChunkOp(m_op, &context, oid.str(), oid2.str(), m_stats);
 	return true;
@@ -231,12 +235,12 @@ public:
     } else if (m_op == make_manifest_end + 1) {
       int set_size = context.oid_not_in_use.size();
       int set_manifest_size = context.oid_redirect_not_in_use.size();
-      cout << m_op << " oid_not_in_use " << set_size << " oid_redirect_not_in_use " << set_manifest_size <<  std::endl;
+      context.cout_prefix() << m_op << " oid_not_in_use " << set_size << " oid_redirect_not_in_use " << set_manifest_size <<  std::endl;
       /* wait for redirect or set_chunk initialization */
       if (set_size != m_objects || set_manifest_size != 0) {
 	op = NULL;
 	m_op--;
-	cout << m_op << " wait for manifest initialization " << std::endl;
+	context.cout_prefix() << m_op << " wait for manifest initialization " << std::endl;
 	return true;
       }
       for (int t_op = m_objects+1; t_op <= m_objects*2; t_op++) {
@@ -245,7 +249,7 @@ public:
 	if (t_op % 2) {
 	  oid << " " << string(300, 'm');
 	}
-	cout << " redirect_not_in_use: " << oid.str() << std::endl;
+	context.cout_prefix() << " redirect_not_in_use: " << oid.str() << std::endl;
 	context.oid_redirect_not_in_use.insert(oid.str());
       }
     } 
@@ -264,36 +268,36 @@ private:
     case TEST_OP_READ:
       oid = *(rand_choose(context.oid_not_in_use));
       return new ReadOp(m_op, &context, oid, m_balance_reads, m_localize_reads,
-			m_stats);
+		        m_offlen_randomization_ratio, m_stats);
 
     case TEST_OP_WRITE:
       oid = *(rand_choose(context.oid_not_in_use));
-      cout << m_op << ": " << "write oid " << oid << " current snap is "
+      context.cout_prefix() << m_op << ": " << "write oid " << oid << " current snap is "
 	   << context.current_snap << std::endl;
       return new WriteOp(m_op, &context, oid, false, false, m_stats);
 
     case TEST_OP_WRITE_EXCL:
       oid = *(rand_choose(context.oid_not_in_use));
-      cout << m_op << ": " << "write (excl) oid "
+      context.cout_prefix() << m_op << ": " << "write (excl) oid "
 	   << oid << " current snap is "
 	   << context.current_snap << std::endl;
       return new WriteOp(m_op, &context, oid, false, true, m_stats);
 
     case TEST_OP_WRITESAME:
       oid = *(rand_choose(context.oid_not_in_use));
-      cout << m_op << ": " << "writesame oid "
+      context.cout_prefix() << m_op << ": " << "writesame oid "
 	   << oid << " current snap is "
 	   << context.current_snap << std::endl;
       return new WriteSameOp(m_op, &context, oid, m_stats);
 
     case TEST_OP_DELETE:
       oid = *(rand_choose(context.oid_not_in_use));
-      cout << m_op << ": " << "delete oid " << oid << " current snap is "
+      context.cout_prefix() << m_op << ": " << "delete oid " << oid << " current snap is "
 	   << context.current_snap << std::endl;
       return new DeleteOp(m_op, &context, oid, m_stats);
 
     case TEST_OP_SNAP_CREATE:
-      cout << m_op << ": " << "snap_create" << std::endl;
+      context.cout_prefix() << m_op << ": " << "snap_create" << std::endl;
       return new SnapCreateOp(m_op, &context, m_stats);
 
     case TEST_OP_SNAP_REMOVE:
@@ -304,33 +308,33 @@ private:
 	int snap = rand_choose(context.snaps)->first;
 	if (context.snaps_in_use.lookup(snap))
 	  continue;  // in use; try again!
-	cout << m_op << ": " << "snap_remove snap " << snap << std::endl;
+	context.cout_prefix() << m_op << ": " << "snap_remove snap " << snap << std::endl;
 	return new SnapRemoveOp(m_op, &context, snap, m_stats);
       }
 
     case TEST_OP_ROLLBACK:
       {
 	string oid = *(rand_choose(context.oid_not_in_use));
-	cout << m_op << ": " << "rollback oid " << oid << " current snap is "
+	context.cout_prefix() << m_op << ": " << "rollback oid " << oid << " current snap is "
 	     << context.current_snap << std::endl;
 	return new RollbackOp(m_op, &context, oid);
       }
 
     case TEST_OP_SETATTR:
       oid = *(rand_choose(context.oid_not_in_use));
-      cout << m_op << ": " << "setattr oid " << oid
+      context.cout_prefix() << m_op << ": " << "setattr oid " << oid
 	   << " current snap is " << context.current_snap << std::endl;
       return new SetAttrsOp(m_op, &context, oid, m_stats);
 
     case TEST_OP_RMATTR:
       oid = *(rand_choose(context.oid_not_in_use));
-      cout << m_op << ": " << "rmattr oid " << oid
+      context.cout_prefix() << m_op << ": " << "rmattr oid " << oid
 	   << " current snap is " << context.current_snap << std::endl;
       return new RemoveAttrsOp(m_op, &context, oid, m_stats);
 
     case TEST_OP_WATCH:
       oid = *(rand_choose(context.oid_not_in_use));
-      cout << m_op << ": " << "watch oid " << oid
+      context.cout_prefix() << m_op << ": " << "watch oid " << oid
 	   << " current snap is " << context.current_snap << std::endl;
       return new WatchOp(m_op, &context, oid, m_stats);
 
@@ -339,21 +343,21 @@ private:
       do {
 	oid2 = *(rand_choose(context.oid_not_in_use));
       } while (oid == oid2);
-      cout << m_op << ": " << "copy_from oid " << oid << " from oid " << oid2
+      context.cout_prefix() << m_op << ": " << "copy_from oid " << oid << " from oid " << oid2
 	   << " current snap is " << context.current_snap << std::endl;
       return new CopyFromOp(m_op, &context, oid, oid2, m_stats);
 
     case TEST_OP_HIT_SET_LIST:
       {
 	uint32_t hash = rjhash32(rand());
-	cout << m_op << ": " << "hit_set_list " << hash << std::endl;
+	context.cout_prefix() << m_op << ": " << "hit_set_list " << hash << std::endl;
 	return new HitSetListOp(m_op, &context, hash, m_stats);
       }
 
     case TEST_OP_UNDIRTY:
       {
 	oid = *(rand_choose(context.oid_not_in_use));
-	cout << m_op << ": " << "undirty oid " << oid << std::endl;
+	context.cout_prefix() << m_op << ": " << "undirty oid " << oid << std::endl;
 	return new UndirtyOp(m_op, &context, oid, m_stats);
       }
 
@@ -383,54 +387,54 @@ private:
 
     case TEST_OP_APPEND:
       oid = *(rand_choose(context.oid_not_in_use));
-      cout << "append oid " << oid << " current snap is "
+      context.cout_prefix() << "append oid " << oid << " current snap is "
 	   << context.current_snap << std::endl;
       return new WriteOp(m_op, &context, oid, true, false, m_stats);
 
     case TEST_OP_APPEND_EXCL:
       oid = *(rand_choose(context.oid_not_in_use));
-      cout << "append oid (excl) " << oid << " current snap is "
+      context.cout_prefix() << "append oid (excl) " << oid << " current snap is "
 	   << context.current_snap << std::endl;
       return new WriteOp(m_op, &context, oid, true, true, m_stats);
 
     case TEST_OP_CHUNK_READ:
       oid = *(rand_choose(context.oid_not_in_use));
-      cout << m_op << ": " << "chunk read oid " << oid << " target oid " << oid2 << std::endl;
+      context.cout_prefix() << m_op << ": " << "chunk read oid " << oid << " target oid " << oid2 << std::endl;
       return new ChunkReadOp(m_op, &context, oid, context.pool_name, false, m_stats);
 
     case TEST_OP_TIER_PROMOTE:
       oid = *(rand_choose(context.oid_not_in_use));
-      cout << m_op << ": " << "tier_promote oid " << oid << std::endl;
+      context.cout_prefix() << m_op << ": " << "tier_promote oid " << oid << std::endl;
       return new TierPromoteOp(m_op, &context, oid, m_stats);
 
     case TEST_OP_TIER_FLUSH:
       oid = *(rand_choose(context.oid_not_in_use));
-      cout << m_op << ": " << "tier_flush oid " << oid << std::endl;
+      context.cout_prefix() << m_op << ": " << "tier_flush oid " << oid << std::endl;
       return new TierFlushOp(m_op, &context, oid, m_stats);
 
     case TEST_OP_SET_REDIRECT:
       oid = *(rand_choose(context.oid_not_in_use));
       oid2 = *(rand_choose(context.oid_redirect_not_in_use));
-      cout << m_op << ": " << "set_redirect oid " << oid << " target oid " << oid2 << std::endl;
+      context.cout_prefix() << m_op << ": " << "set_redirect oid " << oid << " target oid " << oid2 << std::endl;
       return new SetRedirectOp(m_op, &context, oid, oid2, context.pool_name, m_stats);
 
     case TEST_OP_UNSET_REDIRECT:
       oid = *(rand_choose(context.oid_not_in_use));
-      cout << m_op << ": " << "unset_redirect oid " << oid << std::endl;
+      context.cout_prefix() << m_op << ": " << "unset_redirect oid " << oid << std::endl;
       return new UnsetRedirectOp(m_op, &context, oid, m_stats);
 
     case TEST_OP_SET_CHUNK:
       {
 	ceph_assert(m_enable_dedup);
 	oid = *(rand_choose(context.oid_not_in_use));
-	cout << m_op << ": " << "set_chunk oid " << oid 
+	context.cout_prefix() << m_op << ": " << "set_chunk oid " << oid
 	     <<  " target oid " << std::endl;
 	return new SetChunkOp(m_op, &context, oid, "", m_stats);
       }
 
     case TEST_OP_TIER_EVICT:
       oid = *(rand_choose(context.oid_not_in_use));
-      cout << m_op << ": " << "tier_evict oid " << oid << std::endl;
+      context.cout_prefix() << m_op << ": " << "tier_evict oid " << oid << std::endl;
       return new TierEvictOp(m_op, &context, oid, m_stats);
 
     default:
@@ -452,9 +456,11 @@ private:
   bool m_ec_pool;
   bool m_balance_reads;
   bool m_localize_reads;
+  uint8_t m_offlen_randomization_ratio;
   bool m_set_redirect;
   bool m_set_chunk;
   bool m_enable_dedup;
+  RadosTestContext *context;
 };
 
 int main(int argc, char **argv)
@@ -518,11 +524,14 @@ int main(int argc, char **argv)
   bool no_sparse = false;
   bool balance_reads = false;
   bool localize_reads = false;
+  uint8_t offlen_randomization_ratio = 50;
   bool set_redirect = false;
   bool set_chunk = false;
   bool enable_dedup = false;
+  bool timestamp = false;
   string chunk_algo = "";
   string chunk_size = "";
+  size_t max_attr_len = 20000;
 
 
   for (int i = 1; i < argc; ++i) {
@@ -550,10 +559,14 @@ int main(int argc, char **argv)
       balance_reads = true;
     else if (strcmp(argv[i], "--localize-reads") == 0)
       localize_reads = true;
+    else if (strcmp(argv[i], "--offlen_randomization_ratio") == 0)
+      offlen_randomization_ratio = atoi(argv[++i]);
     else if (strcmp(argv[i], "--pool-snaps") == 0)
       pool_snaps = true;
     else if (strcmp(argv[i], "--write-fadvise-dontneed") == 0)
       write_fadvise_dontneed = true;
+    else if (strcmp(argv[i], "--max-attr-len") == 0)
+      max_attr_len = atoi(argv[++i]);
     else if (strcmp(argv[i], "--ec-pool") == 0) {
       if (!op_weights.empty()) {
 	cerr << "--ec-pool must be specified prior to any ops" << std::endl;
@@ -627,6 +640,8 @@ int main(int argc, char **argv)
       chunk_algo = chunk_algo_types[j].name;
     } else if (strcmp(argv[i], "--dedup_chunk_size") == 0) {
       chunk_size = argv[++i];
+    } else if (strcmp(argv[i], "--timestamps") == 0) {
+      timestamp = true;
     } else {
       cerr << "unknown arg " << argv[i] << std::endl;
       exit(1);
@@ -698,8 +713,10 @@ int main(int argc, char **argv)
     write_fadvise_dontneed,
     low_tier_pool_name,
     enable_dedup,
+    timestamp,
     chunk_algo,
     chunk_size,
+    max_attr_len,
     id);
 
   TestOpStat stats;
@@ -707,7 +724,8 @@ int main(int argc, char **argv)
     ops, objects,
     op_weights, &stats, max_seconds,
     ec_pool, balance_reads, localize_reads,
-    set_redirect, set_chunk, enable_dedup);
+    offlen_randomization_ratio,
+    set_redirect, set_chunk, enable_dedup, &context);
   int r = context.init();
   if (r < 0) {
     cerr << "Error initializing rados test context: "

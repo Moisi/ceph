@@ -38,12 +38,12 @@ public:
    * Ondisk layout (TODO)
    *
    * ---------------------------------------------------------------------------
-   * | rbm_metadata_header_t | metadatas |        ...      |    data blocks    |
+   * | rbm_superblock_t | metadatas |        ...      |    data blocks    |
    * ---------------------------------------------------------------------------
    */
 
   read_ertr::future<> read(paddr_t addr, bufferptr &buffer) final;
-  write_ertr::future<> write(paddr_t addr, bufferptr &buf) final;
+  write_ertr::future<> write(paddr_t addr, bufferptr buf) final;
   open_ertr::future<> open() final;
   close_ertr::future<> close() final;
 
@@ -54,18 +54,18 @@ public:
    * To do so, alloc_extent() looks into both in-memory allocator
    * and freebitmap blocks.
    *
-   * TODO: multiple allocation
-   *
    */
   paddr_t alloc_extent(size_t size) final; // allocator, return blocks
+
+  allocate_ret_bare alloc_extents(size_t size) final; // allocator, return blocks
 
   void complete_allocation(paddr_t addr, size_t size) final;
 
   size_t get_start_rbm_addr() const {
-    return device->get_journal_start() + device->get_journal_size();
+    return device->get_shard_journal_start() + device->get_journal_size();
   }
   size_t get_size() const final {
-    return device->get_available_size() - get_start_rbm_addr(); 
+    return device->get_shard_end() - get_start_rbm_addr();
   };
   extent_len_t get_block_size() const final { return device->get_block_size(); }
 
@@ -97,7 +97,7 @@ public:
     assert(allocator);
     rbm_abs_addr addr = convert_paddr_to_abs_addr(paddr);
     assert(addr >= get_start_rbm_addr() &&
-	   addr + len <= device->get_available_size());
+	   addr + len <= device->get_shard_end());
     allocator->mark_extent_used(addr, len);
   }
 
@@ -105,7 +105,7 @@ public:
     assert(allocator);
     rbm_abs_addr addr = convert_paddr_to_abs_addr(paddr);
     assert(addr >= get_start_rbm_addr() &&
-	   addr + len <= device->get_available_size());
+	   addr + len <= device->get_shard_end());
     allocator->free_extent(addr, len);
   }
 
@@ -119,9 +119,19 @@ public:
     assert(allocator);
     rbm_abs_addr addr = convert_paddr_to_abs_addr(paddr);
     assert(addr >= get_start_rbm_addr() &&
-	   addr + size <= device->get_available_size());
+	   addr + size <= device->get_shard_end());
     return allocator->get_extent_state(addr, size);
   }
+
+  size_t get_journal_size() const final {
+    return device->get_journal_size();
+  }
+
+  bool check_valid_range(rbm_abs_addr paddr, bufferptr &bptr);
+
+#ifdef UNIT_TESTS_BUILT
+  void prefill_fragmented_device() final;
+#endif
 
 private:
   /*

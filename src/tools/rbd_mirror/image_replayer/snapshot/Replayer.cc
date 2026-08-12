@@ -2,8 +2,12 @@
 // vim: ts=8 sw=2 smarttab
 
 #include "Replayer.h"
+#include "common/Clock.h" // for ceph_clock_now()
 #include "common/debug.h"
 #include "common/errno.h"
+#include "common/perf_counters.h"
+#include "common/perf_counters_collection.h"
+#include "common/perf_counters_key.h"
 #include "include/stringify.h"
 #include "common/Timer.h"
 #include "cls/rbd/cls_rbd_client.h"
@@ -31,7 +35,9 @@
 #include "tools/rbd_mirror/image_replayer/snapshot/ApplyImageStateRequest.h"
 #include "tools/rbd_mirror/image_replayer/snapshot/StateBuilder.h"
 #include "tools/rbd_mirror/image_replayer/snapshot/Utils.h"
+
 #include <set>
+#include <shared_mutex> // for std::shared_lock
 
 #define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_rbd_mirror
@@ -254,6 +260,10 @@ bool Replayer<I>::get_replay_status(std::string* description,
   json_spirit::mObject root_obj;
   root_obj["replay_state"] = replay_state;
   root_obj["remote_snapshot_timestamp"] = remote_snap_info->timestamp.sec();
+  if (m_perf_counters) {
+    m_perf_counters->tset(l_rbd_mirror_snapshot_remote_timestamp,
+                          remote_snap_info->timestamp);
+  }
 
   auto matching_remote_snap_id = util::compute_remote_snap_id(
     m_state_builder->local_image_ctx->image_lock,
@@ -269,6 +279,10 @@ bool Replayer<I>::get_replay_status(std::string* description,
     // synced and not the consistency point in time.
     root_obj["local_snapshot_timestamp"] =
       matching_remote_snap_it->second.timestamp.sec();
+    if (m_perf_counters) {
+      m_perf_counters->tset(l_rbd_mirror_snapshot_local_timestamp,
+                            matching_remote_snap_it->second.timestamp);
+    }
   }
 
   matching_remote_snap_it = m_state_builder->remote_image_ctx->snap_info.find(
@@ -277,9 +291,17 @@ bool Replayer<I>::get_replay_status(std::string* description,
       matching_remote_snap_it !=
         m_state_builder->remote_image_ctx->snap_info.end()) {
     root_obj["syncing_snapshot_timestamp"] = remote_snap_info->timestamp.sec();
-    root_obj["syncing_percent"] = static_cast<uint64_t>(
-        100 * m_local_mirror_snap_ns.last_copied_object_number /
-        static_cast<float>(std::max<uint64_t>(1U, m_local_object_count)));
+
+    if (m_local_object_count > 0) {
+      root_obj["syncing_percent"] =
+	100 * m_local_mirror_snap_ns.last_copied_object_number /
+	m_local_object_count;
+    } else {
+      // Set syncing_percent to 0 if m_local_object_count has
+      // not yet been set (last_copied_object_number may be > 0
+      // if the sync is being resumed).
+      root_obj["syncing_percent"] = 0;
+    }
   }
 
   m_bytes_per_second(0);
@@ -289,6 +311,9 @@ bool Replayer<I>::get_replay_status(std::string* description,
   auto bytes_per_snapshot = boost::accumulators::rolling_mean(
     m_bytes_per_snapshot);
   root_obj["bytes_per_snapshot"] = round_to_two_places(bytes_per_snapshot);
+
+  root_obj["last_snapshot_sync_seconds"] = m_last_snapshot_sync_seconds;
+  root_obj["last_snapshot_bytes"] = m_last_snapshot_bytes;
 
   auto pending_bytes = bytes_per_snapshot * m_pending_snapshots;
   if (bytes_per_second > 0 && m_pending_snapshots > 0) {
@@ -309,6 +334,22 @@ bool Replayer<I>::get_replay_status(std::string* description,
   locker.unlock();
   on_finish->complete(-EEXIST);
   return true;
+}
+
+template <typename I>
+bool Replayer<I>::is_remote_primary() {
+  auto remote_image_ctx = m_state_builder->remote_image_ctx;
+  std::shared_lock image_locker{remote_image_ctx->image_lock};
+  for (auto snap_info_it = remote_image_ctx->snap_info.rbegin();
+       snap_info_it != remote_image_ctx->snap_info.rend(); ++snap_info_it) {
+    const auto& snap_ns = snap_info_it->second.snap_namespace;
+    auto mirror_ns = std::get_if<
+      cls::rbd::MirrorSnapshotNamespace>(&snap_ns);
+    if (mirror_ns != nullptr) {
+      return mirror_ns->state == cls::rbd::MIRROR_SNAPSHOT_STATE_PRIMARY;
+    }
+  }
+  return false;
 }
 
 template <typename I>
@@ -355,48 +396,13 @@ void Replayer<I>::handle_load_local_image_meta(int r) {
     return;
   }
 
-  if (r >= 0 && m_state_builder->local_image_meta->resync_requested) {
-    m_resync_requested = true;
-
-    dout(10) << "local image resync requested" << dendl;
-    handle_replay_complete(0, "resync requested");
-    return;
-  }
-
-  refresh_local_image();
-}
-
-template <typename I>
-void Replayer<I>::refresh_local_image() {
-  if (!m_state_builder->local_image_ctx->state->is_refresh_required()) {
-    refresh_remote_image();
-    return;
-  }
-
-  dout(10) << dendl;
-  auto ctx = create_context_callback<
-    Replayer<I>, &Replayer<I>::handle_refresh_local_image>(this);
-  m_state_builder->local_image_ctx->state->refresh(ctx);
-}
-
-template <typename I>
-void Replayer<I>::handle_refresh_local_image(int r) {
-  dout(10) << "r=" << r << dendl;
-
-  if (r < 0) {
-    derr << "failed to refresh local image: " << cpp_strerror(r) << dendl;
-    handle_replay_complete(r, "failed to refresh local image");
-    return;
-  }
-
   refresh_remote_image();
 }
 
 template <typename I>
 void Replayer<I>::refresh_remote_image() {
   if (!m_state_builder->remote_image_ctx->state->is_refresh_required()) {
-    std::unique_lock locker{m_lock};
-    scan_local_mirror_snapshots(&locker);
+    refresh_local_image();
     return;
   }
 
@@ -413,6 +419,42 @@ void Replayer<I>::handle_refresh_remote_image(int r) {
   if (r < 0) {
     derr << "failed to refresh remote image: " << cpp_strerror(r) << dendl;
     handle_replay_complete(r, "failed to refresh remote image");
+    return;
+  }
+
+  refresh_local_image();
+}
+
+template <typename I>
+void Replayer<I>::refresh_local_image() {
+  if (m_state_builder->local_image_meta->resync_requested &&
+      is_remote_primary()) {
+    std::unique_lock locker{m_lock};
+    m_resync_requested = true;
+
+    dout(10) << "local image resync requested" << dendl;
+    handle_replay_complete(&locker, 0, "resync requested");
+    return;
+  }
+  if (!m_state_builder->local_image_ctx->state->is_refresh_required()) {
+    std::unique_lock locker{m_lock};
+    scan_local_mirror_snapshots(&locker);
+    return;
+  }
+
+  dout(10) << dendl;
+  auto ctx = create_context_callback<
+    Replayer<I>, &Replayer<I>::handle_refresh_local_image>(this);
+  m_state_builder->local_image_ctx->state->refresh(ctx);
+}
+
+template <typename I>
+void Replayer<I>::handle_refresh_local_image(int r) {
+  dout(10) << "r=" << r << dendl;
+
+  if (r < 0) {
+    derr << "failed to refresh local image: " << cpp_strerror(r) << dendl;
+    handle_replay_complete(r, "failed to refresh local image");
     return;
   }
 
@@ -521,6 +563,11 @@ void Replayer<I>::scan_local_mirror_snapshots(
     if (m_local_mirror_snap_ns.is_non_primary() &&
         m_local_mirror_snap_ns.primary_mirror_uuid !=
           m_state_builder->remote_mirror_uuid) {
+      if (m_local_mirror_snap_ns.is_orphan()) {
+        dout(5) << "local image being force promoted" << dendl;
+        handle_replay_complete(locker, 0, "orphan (force promoting)");
+        return;
+      }
       // TODO support multiple peers
       derr << "local image linked to unknown peer: "
            << m_local_mirror_snap_ns.primary_mirror_uuid << dendl;
@@ -1102,21 +1149,26 @@ void Replayer<I>::handle_copy_image(int r) {
 
   {
     std::unique_lock locker{m_lock};
+    m_last_snapshot_bytes = m_snapshot_bytes;
     m_bytes_per_snapshot(m_snapshot_bytes);
-    auto time = ceph_clock_now() - m_snapshot_replay_start;
+    utime_t duration = ceph_clock_now() - m_snapshot_replay_start;
+    m_last_snapshot_sync_seconds = duration.sec();
+
     if (g_snapshot_perf_counters) {
-      g_snapshot_perf_counters->inc(l_rbd_mirror_snapshot_replay_bytes,
+      g_snapshot_perf_counters->inc(l_rbd_mirror_snapshot_sync_bytes,
                                     m_snapshot_bytes);
-      g_snapshot_perf_counters->inc(l_rbd_mirror_snapshot_replay_snapshots);
-      g_snapshot_perf_counters->tinc(
-        l_rbd_mirror_snapshot_replay_snapshots_time, time);
+      g_snapshot_perf_counters->inc(l_rbd_mirror_snapshot_snapshots);
+      g_snapshot_perf_counters->tinc(l_rbd_mirror_snapshot_sync_time,
+                                     duration);
     }
     if (m_perf_counters) {
-      m_perf_counters->inc(l_rbd_mirror_snapshot_replay_bytes, m_snapshot_bytes);
-      m_perf_counters->inc(l_rbd_mirror_snapshot_replay_snapshots);
-      m_perf_counters->tinc(l_rbd_mirror_snapshot_replay_snapshots_time, time);
+      m_perf_counters->inc(l_rbd_mirror_snapshot_sync_bytes, m_snapshot_bytes);
+      m_perf_counters->inc(l_rbd_mirror_snapshot_snapshots);
+      m_perf_counters->tinc(l_rbd_mirror_snapshot_sync_time, duration);
+      m_perf_counters->tset(l_rbd_mirror_snapshot_last_sync_time, duration);
+      m_perf_counters->set(l_rbd_mirror_snapshot_last_sync_bytes,
+                           m_snapshot_bytes);
     }
-    m_snapshot_bytes = 0;
   }
 
   apply_image_state();
@@ -1267,7 +1319,7 @@ void Replayer<I>::unlink_peer(uint64_t remote_snap_id) {
     Replayer<I>, &Replayer<I>::handle_unlink_peer>(this);
   auto req = librbd::mirror::snapshot::UnlinkPeerRequest<I>::create(
     m_state_builder->remote_image_ctx, remote_snap_id,
-    m_remote_mirror_peer_uuid, ctx);
+    m_remote_mirror_peer_uuid, false, ctx);
   req->send();
 }
 
@@ -1550,16 +1602,32 @@ void Replayer<I>::register_perf_counters() {
 
   auto cct = static_cast<CephContext *>(m_state_builder->local_image_ctx->cct);
   auto prio = cct->_conf.get_val<int64_t>("rbd_mirror_image_perf_stats_prio");
-  PerfCountersBuilder plb(g_ceph_context,
-                          "rbd_mirror_snapshot_image_" + m_image_spec,
-                          l_rbd_mirror_snapshot_first,
+
+  auto local_image_ctx = m_state_builder->local_image_ctx;
+  std::string labels = ceph::perf_counters::key_create(
+      "rbd_mirror_snapshot_image",
+      {{"pool", local_image_ctx->md_ctx.get_pool_name()},
+       {"namespace", local_image_ctx->md_ctx.get_namespace()},
+       {"image", local_image_ctx->name}});
+
+  PerfCountersBuilder plb(g_ceph_context, labels, l_rbd_mirror_snapshot_first,
                           l_rbd_mirror_snapshot_last);
-  plb.add_u64_counter(l_rbd_mirror_snapshot_replay_snapshots,
-                      "snapshots", "Snapshots", "r", prio);
-  plb.add_time_avg(l_rbd_mirror_snapshot_replay_snapshots_time,
-                   "snapshots_time", "Snapshots time", "rl", prio);
-  plb.add_u64_counter(l_rbd_mirror_snapshot_replay_bytes, "replay_bytes",
-                      "Replayed data", "rb", prio, unit_t(UNIT_BYTES));
+  plb.add_u64_counter(l_rbd_mirror_snapshot_snapshots, "snapshots",
+                      "Number of snapshots synced", nullptr, prio);
+  plb.add_time_avg(l_rbd_mirror_snapshot_sync_time, "sync_time",
+                   "Average sync time", nullptr, prio);
+  plb.add_u64_counter(l_rbd_mirror_snapshot_sync_bytes, "sync_bytes",
+                      "Total bytes synced", nullptr, prio, unit_t(UNIT_BYTES));
+  plb.add_time(l_rbd_mirror_snapshot_remote_timestamp, "remote_timestamp",
+               "Timestamp of the remote snapshot", nullptr, prio);
+  plb.add_time(l_rbd_mirror_snapshot_local_timestamp, "local_timestamp",
+               "Timestamp of the local snapshot", nullptr, prio);
+  plb.add_time(l_rbd_mirror_snapshot_last_sync_time, "last_sync_time",
+               "Time taken to sync the last snapshot", nullptr, prio);
+  plb.add_u64(l_rbd_mirror_snapshot_last_sync_bytes, "last_sync_bytes",
+              "Bytes synced for the last snapshot", nullptr, prio,
+              unit_t(UNIT_BYTES));
+
   m_perf_counters = plb.create_perf_counters();
   g_ceph_context->get_perfcounters_collection()->add(m_perf_counters);
 }

@@ -4,7 +4,8 @@ add_library(librados_impl STATIC
   RadosClient.cc
   librados_util.cc
   librados_tp.cc)
-
+target_link_libraries(librados_impl
+  PRIVATE legacy-option-headers)
 # C/C++ API
 add_library(librados ${CEPH_SHARED}
   librados_c.cc
@@ -28,6 +29,7 @@ if(ENABLE_SHARED)
     set_property(TARGET librados APPEND_STRING PROPERTY
       LINK_FLAGS " -static-libstdc++ -static-libgcc")
   endif()
+  target_compile_definitions(librados PRIVATE -DLIBRADOS_SHARED=1)
 endif()
 target_link_libraries(librados PRIVATE
   librados_impl osdc ceph-common cls_lock_client

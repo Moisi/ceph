@@ -17,6 +17,80 @@
 
 #include "rgw_sal.h"
 
+/**
+ * @brief State for a StoreObject
+ */
+struct RGWObjState {
+  rgw_obj obj;
+  bool is_atomic{false};
+  bool has_attrs{false};
+  bool exists{false};
+  bool is_dm{false};
+  uint64_t size{0}; //< size of raw object
+  uint64_t accounted_size{0}; //< size before compression, encryption
+  ceph::real_time mtime;
+  uint64_t epoch{0};
+  bufferlist obj_tag;
+  bufferlist tail_tag;
+  std::string write_tag;
+  bool fake_tag{false};
+  std::string shadow_obj;
+  bool has_data{false};
+  bufferlist data;
+  bool prefetch_data{false};
+  bool is_olh{false};
+  bufferlist olh_tag;
+  uint64_t pg_ver{false};
+  uint32_t zone_short_id{0};
+  bool compressed{false};
+
+  /* important! don't forget to update copy constructor */
+
+  RGWObjVersionTracker objv_tracker;
+
+  std::map<std::string, ceph::buffer::list> attrset;
+
+  RGWObjState() {};
+  RGWObjState(const RGWObjState &rhs) : obj(rhs.obj) {
+    is_atomic = rhs.is_atomic;
+    has_attrs = rhs.has_attrs;
+    exists = rhs.exists;
+    size = rhs.size;
+    accounted_size = rhs.accounted_size;
+    mtime = rhs.mtime;
+    epoch = rhs.epoch;
+    if (rhs.obj_tag.length()) {
+      obj_tag = rhs.obj_tag;
+    }
+    if (rhs.tail_tag.length()) {
+      tail_tag = rhs.tail_tag;
+    }
+    write_tag = rhs.write_tag;
+    fake_tag = rhs.fake_tag;
+    shadow_obj = rhs.shadow_obj;
+    has_data = rhs.has_data;
+    if (rhs.data.length()) {
+      data = rhs.data;
+    }
+    prefetch_data = rhs.prefetch_data;
+    is_olh = rhs.is_olh;
+    objv_tracker = rhs.objv_tracker;
+    pg_ver = rhs.pg_ver;
+    compressed = rhs.compressed;
+  }
+
+  ~RGWObjState() {};
+
+  bool get_attr(std::string name, bufferlist& dest) {
+    auto iter = attrset.find(name);
+    if (iter != attrset.end()) {
+      dest = iter->second;
+      return true;
+    }
+    return false;
+  }
+};
+
 namespace rgw { namespace sal {
 
 class StoreDriver : public Driver {
@@ -26,6 +100,55 @@ class StoreDriver : public Driver {
 
     virtual uint64_t get_new_req_id() override {
       return ceph::util::generate_random_number<uint64_t>();
+    }
+
+    int read_topics(const std::string& tenant, rgw_pubsub_topics& topics, RGWObjVersionTracker* objv_tracker,
+        optional_yield y, const DoutPrefixProvider *dpp) override {return -EOPNOTSUPP;}
+    int stat_topics_v1(const std::string& tenant, optional_yield y, const DoutPrefixProvider *dpp) override {return -EOPNOTSUPP;}
+    int write_topics(const std::string& tenant, const rgw_pubsub_topics& topics, RGWObjVersionTracker* objv_tracker,
+	optional_yield y, const DoutPrefixProvider *dpp) override {return -ENOENT;}
+    int remove_topics(const std::string& tenant, RGWObjVersionTracker* objv_tracker,
+        optional_yield y, const DoutPrefixProvider *dpp) override {return -ENOENT;}
+    int read_topic_v2(const std::string& topic_name,
+                      const std::string& tenant,
+                      rgw_pubsub_topic& topic,
+                      RGWObjVersionTracker* objv_tracker,
+                      optional_yield y,
+                      const DoutPrefixProvider* dpp) override {
+      return -EOPNOTSUPP;
+    }
+    int write_topic_v2(const rgw_pubsub_topic& topic, bool exclusive,
+                       RGWObjVersionTracker& objv_tracker,
+                       optional_yield y,
+                       const DoutPrefixProvider* dpp) override {
+      return -EOPNOTSUPP;
+    }
+    int remove_topic_v2(const std::string& topic_name,
+                        const std::string& tenant,
+                        RGWObjVersionTracker& objv_tracker,
+                        optional_yield y,
+                        const DoutPrefixProvider* dpp) override {
+      return -EOPNOTSUPP;
+    }
+    int update_bucket_topic_mapping(const rgw_pubsub_topic& topic,
+                                    const std::string& bucket_key,
+                                    bool add_mapping,
+                                    optional_yield y,
+                                    const DoutPrefixProvider* dpp) override {
+      return -EOPNOTSUPP;
+    }
+    int remove_bucket_mapping_from_topics(
+        const rgw_pubsub_bucket_topics& bucket_topics,
+        const std::string& bucket_key,
+        optional_yield y,
+        const DoutPrefixProvider* dpp) override {
+      return -EOPNOTSUPP;
+    }
+    int get_bucket_topic_mapping(const rgw_pubsub_topic& topic,
+                                 std::set<std::string>& bucket_keys,
+                                 optional_yield y,
+                                 const DoutPrefixProvider* dpp) override {
+      return -EOPNOTSUPP;
     }
 };
 
@@ -51,12 +174,20 @@ class StoreUser : public User {
     virtual const rgw_user& get_id() const override { return info.user_id; }
     virtual uint32_t get_type() const override { return info.type; }
     virtual int32_t get_max_buckets() const override { return info.max_buckets; }
+    virtual void set_max_buckets(int32_t _max_buckets) override {
+      info.max_buckets = _max_buckets;
+    }
     virtual const RGWUserCaps& get_caps() const override { return info.caps; }
     virtual RGWObjVersionTracker& get_version_tracker() override { return objv_tracker; }
     virtual Attrs& get_attrs() override { return attrs; }
     virtual void set_attrs(Attrs& _attrs) override { attrs = _attrs; }
     virtual bool empty() const override { return info.user_id.id.empty(); }
     virtual RGWUserInfo& get_info() override { return info; }
+    virtual void set_info(RGWQuotaInfo& _quota) override {
+      info.quota.user_quota.max_size = _quota.max_size;
+      info.quota.user_quota.max_objects = _quota.max_objects;
+    }
+
     virtual void print(std::ostream& out) const override { out << info.user_id; }
 
     friend class StoreBucket;
@@ -64,9 +195,7 @@ class StoreUser : public User {
 
 class StoreBucket : public Bucket {
   protected:
-    RGWBucketEnt ent;
     RGWBucketInfo info;
-    User* owner = nullptr;
     Attrs attrs;
     obj_version bucket_version;
     ceph::real_time mtime;
@@ -74,48 +203,18 @@ class StoreBucket : public Bucket {
   public:
 
     StoreBucket() = default;
-    StoreBucket(User* _u) :
-      owner(_u) { }
-    StoreBucket(const rgw_bucket& _b) { ent.bucket = _b; info.bucket = _b; }
-    StoreBucket(const RGWBucketEnt& _e) : ent(_e) {
-      info.bucket = ent.bucket;
-      info.placement_rule = ent.placement_rule;
-      info.creation_time = ent.creation_time;
-    }
-    StoreBucket(const RGWBucketInfo& _i) : info(_i) {
-      ent.bucket = info.bucket;
-      ent.placement_rule = info.placement_rule;
-      ent.creation_time = info.creation_time;
-    }
-    StoreBucket(const rgw_bucket& _b, User* _u) :
-      owner(_u) { ent.bucket = _b; info.bucket = _b; }
-    StoreBucket(const RGWBucketEnt& _e, User* _u) : ent(_e), owner(_u) {
-      info.bucket = ent.bucket;
-      info.placement_rule = ent.placement_rule;
-      info.creation_time = ent.creation_time;
-    }
-    StoreBucket(const RGWBucketInfo& _i, User* _u) : info(_i), owner(_u) {
-      ent.bucket = info.bucket;
-      ent.placement_rule = info.placement_rule;
-      ent.creation_time = info.creation_time;
-    }
+    StoreBucket(const rgw_bucket& b) { info.bucket = b; }
+    StoreBucket(const RGWBucketInfo& i) : info(i) {}
     virtual ~StoreBucket() = default;
 
     virtual Attrs& get_attrs(void) override { return attrs; }
     virtual int set_attrs(Attrs a) override { attrs = a; return 0; }
-    virtual void set_owner(rgw::sal::User* _owner) override {
-      owner = _owner;
-    }
-    virtual User* get_owner(void) override { return owner; };
-    virtual ACLOwner get_acl_owner(void) override { return ACLOwner(info.owner); };
+    virtual const rgw_owner& get_owner() const override { return info.owner; }
     virtual bool empty() const override { return info.bucket.name.empty(); }
     virtual const std::string& get_name() const override { return info.bucket.name; }
     virtual const std::string& get_tenant() const override { return info.bucket.tenant; }
     virtual const std::string& get_marker() const override { return info.bucket.marker; }
     virtual const std::string& get_bucket_id() const override { return info.bucket.bucket_id; }
-    virtual size_t get_size() const override { return ent.size; }
-    virtual size_t get_size_rounded() const override { return ent.size_rounded; }
-    virtual uint64_t get_count() const override { return ent.count; }
     virtual rgw_placement_rule& get_placement_rule() override { return info.placement_rule; }
     virtual ceph::real_time& get_creation_time() override { return info.creation_time; }
     virtual ceph::real_time& get_modification_time() override { return mtime; }
@@ -147,53 +246,60 @@ class StoreBucket : public Bucket {
 	     (info.bucket.bucket_id != sb.info.bucket.bucket_id);
     }
 
+    int read_topics(rgw_pubsub_bucket_topics& notifications, RGWObjVersionTracker* objv_tracker, 
+        optional_yield y, const DoutPrefixProvider *dpp) override {return 0;}
+    int write_topics(const rgw_pubsub_bucket_topics& notifications, RGWObjVersionTracker* objv_tracker, 
+        optional_yield y, const DoutPrefixProvider *dpp) override {return 0;}
+    int remove_topics(RGWObjVersionTracker* objv_tracker, 
+        optional_yield y, const DoutPrefixProvider *dpp) override {return 0;}
+    int get_logging_object_name(std::string& obj_name,
+        const std::string& prefix,
+        optional_yield y,
+        const DoutPrefixProvider *dpp,
+        RGWObjVersionTracker* objv_tracker) override { return 0; }
+    int set_logging_object_name(const std::string& obj_name,
+        const std::string& prefix,
+        optional_yield y,
+        const DoutPrefixProvider *dpp,
+        bool new_obj,
+        RGWObjVersionTracker* objv_tracker) override { return 0; }
+    int remove_logging_object_name(const std::string& prefix,
+        optional_yield y,
+        const DoutPrefixProvider *dpp,
+        RGWObjVersionTracker* objv_tracker) override { return 0; }
+    int commit_logging_object(const std::string& obj_name, optional_yield y, const DoutPrefixProvider *dpp, const std::string& prefix, std::string* last_committed) override { return 0; }
+    int remove_logging_object(const std::string& obj_name, optional_yield y, const DoutPrefixProvider *dpp) override { return 0; }
+    int write_logging_object(const std::string& obj_name, const std::string& record, optional_yield y, const DoutPrefixProvider *dpp, bool async_completion) override {
+      return 0;
+    }
+
     friend class BucketList;
-  protected:
-    virtual void set_ent(RGWBucketEnt& _ent) { ent = _ent; info.bucket = ent.bucket; info.placement_rule = ent.placement_rule; }
 };
 
 class StoreObject : public Object {
   protected:
     RGWObjState state;
-    Bucket* bucket;
-    Attrs attrs;
-    bool delete_marker{false};
+    Bucket* bucket = nullptr;
+    jspan_context trace_ctx{false, false};
 
   public:
-
-    struct StoreReadOp : ReadOp {
-      virtual ~StoreReadOp() = default;
-    };
-
-    struct StoreDeleteOp : DeleteOp {
-      virtual ~StoreDeleteOp() = default;
-    };
-
-    StoreObject()
-      : state(),
-      bucket(nullptr),
-      attrs()
-      {}
+    StoreObject() = default;
     StoreObject(const rgw_obj_key& _k)
-      : state(),
-      bucket(),
-      attrs()
-      { state.obj.key = _k; }
+    { state.obj.key = _k; }
     StoreObject(const rgw_obj_key& _k, Bucket* _b)
-      : state(),
-      bucket(_b),
-      attrs()
-      { state.obj.init(_b->get_key(), _k); }
-    StoreObject(StoreObject& _o) = default;
+      : bucket(_b)
+    { state.obj.init(_b->get_key(), _k); }
+    StoreObject(const StoreObject& _o) = default;
 
     virtual ~StoreObject() = default;
 
-    virtual void set_atomic() override { state.is_atomic = true; }
+    virtual void set_atomic(bool atomic) override { state.is_atomic = atomic; }
     virtual bool is_atomic() override { return state.is_atomic; }
     virtual void set_prefetch_data() override { state.prefetch_data = true; }
     virtual bool is_prefetch_data() override { return state.prefetch_data; }
     virtual void set_compressed() override { state.compressed = true; }
     virtual bool is_compressed() override { return state.compressed; }
+    virtual bool is_delete_marker() override { return state.is_dm; }
     virtual void invalidate() override {
       rgw_obj obj = state.obj;
       bool is_atomic = state.is_atomic;
@@ -213,15 +319,32 @@ class StoreObject : public Object {
     virtual const Attrs& get_attrs(void) const override { return state.attrset; }
     virtual int set_attrs(Attrs a) override { state.attrset = a; state.has_attrs = true; return 0; }
     virtual bool has_attrs(void) override { return state.has_attrs; }
+    virtual bool get_attr(const std::string& name, bufferlist &dest) override {
+      if (!has_attrs())
+	return false;
+      auto iter = state.attrset.find(name);
+      if (iter != state.attrset.end()) {
+        dest = iter->second;
+        return true;
+      }
+      return false;
+    }
     virtual ceph::real_time get_mtime(void) const override { return state.mtime; }
-    virtual uint64_t get_obj_size(void) const override { return state.size; }
+    virtual void set_mtime(ceph::real_time& mtime) override { state.mtime = mtime; }
+    virtual uint64_t get_size(void) const override { return state.size; }
+    virtual uint64_t get_accounted_size(void) const override { return state.accounted_size; }
+    virtual void set_accounted_size(uint64_t size) override { state.accounted_size = size; }
+    virtual uint64_t get_epoch(void) const override { return state.epoch; }
+    virtual void set_epoch(uint64_t epoch) override { state.epoch = epoch; }
+    virtual uint32_t get_short_zone_id(void) const override { return state.zone_short_id; }
+    virtual void set_short_zone_id(uint32_t id) override { state.zone_short_id = id; }
     virtual Bucket* get_bucket(void) const override { return bucket; }
     virtual void set_bucket(Bucket* b) override { bucket = b; state.obj.bucket = b->get_key(); }
     virtual std::string get_hash_source(void) override { return state.obj.index_hash_source; }
     virtual void set_hash_source(std::string s) override { state.obj.index_hash_source = s; }
     virtual std::string get_oid(void) const override { return state.obj.key.get_oid(); }
-    virtual bool get_delete_marker(void) override { return delete_marker; }
     virtual bool get_in_extra_data(void) override { return state.obj.is_in_extra_data(); }
+    virtual bool exists(void) override { return state.exists; }
     virtual void set_in_extra_data(bool i) override { state.obj.set_in_extra_data(i); }
     int range_to_ofs(uint64_t obj_size, int64_t &ofs, int64_t &end);
     virtual void set_obj_size(uint64_t s) override { state.size = s; }
@@ -245,6 +368,29 @@ class StoreObject : public Object {
        * work with lifecycle */
       return -1;
     }
+    virtual int restore_obj_from_cloud(Bucket* bucket,
+			   rgw::sal::PlacementTier* tier,
+			   CephContext* cct,
+		           std::optional<uint64_t> days,
+			   bool& in_progress,
+			   const DoutPrefixProvider* dpp,
+			   optional_yield y) override {
+      return -1;
+    }
+    jspan_context& get_trace() override { return trace_ctx; }
+    void set_trace (jspan_context&& _trace_ctx) override { trace_ctx = std::move(_trace_ctx); }
+
+    virtual int get_torrent_info(const DoutPrefixProvider* dpp,
+                                 optional_yield y, bufferlist& bl) override {
+      const auto& attrs = get_attrs();
+      if (auto i = attrs.find(RGW_ATTR_TORRENT); i != attrs.end()) {
+        bl = i->second;
+        return 0;
+      }
+      return -ENOENT;
+    }
+
+    virtual RGWObjVersionTracker& get_version_tracker() override { return state.objv_tracker; }
 
     virtual void print(std::ostream& out) const override {
       if (bucket)
@@ -272,7 +418,7 @@ public:
 
   virtual std::map<uint32_t, std::unique_ptr<MultipartPart>>& get_parts() override { return parts; }
 
-  virtual const jspan_context& get_trace() override { return trace_ctx; }
+  virtual jspan_context& get_trace() override { return trace_ctx; }
 
   virtual void print(std::ostream& out) const override {
     out << get_meta();
@@ -309,86 +455,39 @@ public:
   virtual void print(std::ostream& out) const override { out << oid; }
 };
 
-class StoreLifecycle : public Lifecycle {
+class StoreRestoreSerializer : public RestoreSerializer {
+
+protected:
+  std::string oid;
+
 public:
-  struct StoreLCHead : LCHead {
-    time_t start_date{0};
-    time_t shard_rollover_date{0};
-    std::string marker;
+  StoreRestoreSerializer() {}
+  StoreRestoreSerializer(std::string _oid) : oid(_oid) {}
 
-    StoreLCHead() = default;
-    StoreLCHead(time_t _start_date, time_t _rollover_date, std::string& _marker) : start_date(_start_date), shard_rollover_date(_rollover_date), marker(_marker) {}
+  virtual ~StoreRestoreSerializer() = default;
+  virtual void print(std::ostream& out) const override { out << oid; }
+};
 
-    StoreLCHead& operator=(LCHead& _h) {
-      start_date = _h.get_start_date();
-      shard_rollover_date = _h.get_shard_rollover_date();
-      marker = _h.get_marker();
+class StoreRestore : public Restore {
 
-      return *this;
-    }
-
-    virtual time_t& get_start_date() override { return start_date; }
-    virtual void set_start_date(time_t _date) override { start_date = _date; }
-    virtual std::string& get_marker() override { return marker; }
-    virtual void set_marker(const std::string& _marker) override { marker = _marker; }
-    virtual time_t& get_shard_rollover_date() override { return shard_rollover_date; }
-    virtual void set_shard_rollover_date(time_t _date) override { shard_rollover_date = _date; }
-  };
-
-  struct StoreLCEntry : LCEntry {
-    std::string bucket;
-    std::string oid;
-    uint64_t start_time{0};
-    uint32_t status{0};
-
-    StoreLCEntry() = default;
-    StoreLCEntry(std::string& _bucket, uint64_t _time, uint32_t _status) : bucket(_bucket), start_time(_time), status(_status) {}
-    StoreLCEntry(std::string& _bucket, std::string _oid, uint64_t _time, uint32_t _status) : bucket(_bucket), oid(_oid), start_time(_time), status(_status) {}
-    StoreLCEntry(const StoreLCEntry& _e) = default;
-
-    StoreLCEntry& operator=(LCEntry& _e) {
-      bucket = _e.get_bucket();
-      oid = _e.get_oid();
-      start_time = _e.get_start_time();
-      status = _e.get_status();
-
-      return *this;
-    }
-
-    virtual std::string& get_bucket() override { return bucket; }
-    virtual void set_bucket(const std::string& _bucket) override { bucket = _bucket; }
-    virtual std::string& get_oid() override { return oid; }
-    virtual void set_oid(const std::string& _oid) override { oid = _oid; }
-    virtual uint64_t get_start_time() override { return start_time; }
-    virtual void set_start_time(uint64_t _time) override { start_time = _time; }
-    virtual uint32_t get_status() override { return status; }
-    virtual void set_status(uint32_t _status) override { status = _status; }
-    virtual void print(std::ostream& out) const override {
-      out << bucket << ":" << oid << ":" << start_time << ":" << status;
-    }
-  };
-
-  StoreLifecycle() = default;
-  virtual ~StoreLifecycle() = default;
-
-  virtual std::unique_ptr<LCEntry> get_entry() override {
-      return std::make_unique<StoreLCEntry>();
-  }
-  using Lifecycle::get_entry;
+public:
+  StoreRestore() = default;
+  virtual ~StoreRestore() = default;
 };
 
 class StoreNotification : public Notification {
 protected:
   Object* obj;
   Object* src_obj;
-  rgw::notify::EventType event_type;
+  rgw::notify::EventTypeList event_types;
 
-  public:
-    StoreNotification(Object* _obj, Object* _src_obj, rgw::notify::EventType _type)
-      : obj(_obj), src_obj(_src_obj), event_type(_type)
-    {}
+ public:
+  StoreNotification(Object* _obj,
+                    Object* _src_obj,
+                    rgw::notify::EventTypeList _types)
+      : obj(_obj), src_obj(_src_obj), event_types(std::move(_types)) {}
 
-    virtual ~StoreNotification() = default;
+  virtual ~StoreNotification() = default;
 };
 
 class StoreWriter : public Writer {
@@ -417,7 +516,18 @@ class StoreZone : public Zone {
 };
 
 class StoreLuaManager : public LuaManager {
+protected:
+  std::string _luarocks_path;
 public:
+  const std::string& luarocks_path() const override {
+    return _luarocks_path;
+  }
+  void set_luarocks_path(const std::string& path) override {
+    _luarocks_path = path;
+  }
+  StoreLuaManager() = default;
+  StoreLuaManager(const std::string& __luarocks_path) :
+    _luarocks_path(__luarocks_path) {}
   virtual ~StoreLuaManager() = default;
 };
 

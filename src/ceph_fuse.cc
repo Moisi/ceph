@@ -21,6 +21,7 @@
 #include "common/async/context_pool.h"
 #include "common/config.h"
 #include "common/errno.h"
+#include "log/Log.h" // for g_ceph_context->_log
 
 #include "client/Client.h"
 #include "client/fuse_ll.h"
@@ -31,6 +32,7 @@
 
 #include "common/Timer.h"
 #include "common/ceph_argparse.h"
+#include "common/debug.h"
 #if defined(__linux__)
 #include "common/linux_version.h"
 #endif
@@ -81,9 +83,10 @@ static void fuse_usage()
 void usage()
 {
   cout <<
-"usage: ceph-fuse [-n client.username] [-m mon-ip-addr:mon-port] <mount point> [OPTIONS]\n"
-"  --client_mountpoint/-r <sub_directory>\n"
-"                    use sub_directory as the mounted root, rather than the full Ceph tree.\n"
+"\nusage: ceph-fuse [-n client.username] [-m mon-ip-addr:mon-port] [--client_fs <fsname>] [--client_mountpoint/-r <sub_directory>] <mount point> [OPTIONS]\n\n"
+
+"  --client_mountpoint/-r: use sub_directory as the mounted root, rather than the full CephFS tree.\n"
+"  --client_fs: named file system to mount (default: usually the first file system created).\n"
 "\n";
   fuse_usage();
   generic_client_usage();
@@ -198,14 +201,21 @@ int main(int argc, const char **argv, const char *envp[]) {
       ~RemountTest() override {}
       void *entry() override {
 #if defined(__linux__)
-	int ver = get_linux_version();
-	ceph_assert(ver != 0);
-        bool client_try_dentry_invalidate = g_conf().get_val<bool>(
-          "client_try_dentry_invalidate");
-	bool can_invalidate_dentries =
-          client_try_dentry_invalidate && ver < KERNEL_VERSION(3, 18, 0);
-	auto test_result = client->test_dentry_handling(can_invalidate_dentries);
-	int tr = test_result.first;
+        bool can_invalidate_dentries = g_conf().get_val<bool>(
+	  "client_try_dentry_invalidate");
+        uint64_t max_retries = g_conf().get_val<uint64_t>(
+          "client_max_retries_on_remount_failure");
+        std::pair<int, bool> test_result;
+        uint64_t i = 0;
+        int tr = 0;
+        do {
+          test_result = client->test_dentry_handling(can_invalidate_dentries);
+          tr = test_result.first;
+          if (tr) {
+            sleep(1);
+          }
+        } while (++i < max_retries && tr);
+
 	bool abort_on_failure = test_result.second;
         bool client_die_on_failed_dentry_invalidate = g_conf().get_val<bool>(
           "client_die_on_failed_dentry_invalidate");

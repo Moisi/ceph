@@ -17,6 +17,13 @@
 
 #include <memory>
 
+#include <boost/asio/bind_executor.hpp>
+#include <boost/asio/defer.hpp>
+#include <boost/asio/dispatch.hpp>
+#include <boost/asio/executor_work_guard.hpp>
+#include <boost/asio/recycling_allocator.hpp>
+#include <boost/asio/post.hpp>
+
 #include "bind_handler.h"
 #include "forward_handler.h"
 
@@ -167,7 +174,8 @@ class CompletionImpl final : public Completion<void(Args...), T> {
   Handler handler;
 
   // use Handler's associated allocator
-  using Alloc2 = boost::asio::associated_allocator_t<Handler>;
+  using DefaultAlloc = boost::asio::recycling_allocator<void>;
+  using Alloc2 = boost::asio::associated_allocator_t<Handler, DefaultAlloc>;
   using Traits2 = std::allocator_traits<Alloc2>;
   using RebindAlloc2 = typename Traits2::template rebind_alloc<CompletionImpl>;
   using RebindTraits2 = std::allocator_traits<RebindAlloc2>;
@@ -181,36 +189,41 @@ class CompletionImpl final : public Completion<void(Args...), T> {
     RebindTraits2::deallocate(alloc2, static_cast<CompletionImpl*>(p), 1);
   }
 
-  static auto bind_and_forward(Handler&& h, std::tuple<Args...>&& args) {
-    return forward_handler(CompletionHandler{std::move(h), std::move(args)});
+  static auto bind_and_forward(const Executor2& ex, Handler&& h,
+                               std::tuple<Args...>&& args) {
+    return forward_handler(CompletionHandler{
+        boost::asio::bind_executor(ex, std::move(h)), std::move(args)});
   }
 
   void destroy_defer(std::tuple<Args...>&& args) override {
     auto w = std::move(work);
-    auto f = bind_and_forward(std::move(handler), std::move(args));
-    RebindAlloc2 alloc2 = boost::asio::get_associated_allocator(handler);
+    auto ex2 = w.second.get_executor();
+    RebindAlloc2 alloc2 = boost::asio::get_associated_allocator(handler, DefaultAlloc{});
+    auto f = bind_and_forward(ex2, std::move(handler), std::move(args));
     RebindTraits2::destroy(alloc2, this);
     RebindTraits2::deallocate(alloc2, this, 1);
-    w.second.get_executor().defer(std::move(f), alloc2);
+    boost::asio::defer(std::move(f));
   }
   void destroy_dispatch(std::tuple<Args...>&& args) override {
     auto w = std::move(work);
-    auto f = bind_and_forward(std::move(handler), std::move(args));
-    RebindAlloc2 alloc2 = boost::asio::get_associated_allocator(handler);
+    auto ex2 = w.second.get_executor();
+    RebindAlloc2 alloc2 = boost::asio::get_associated_allocator(handler, DefaultAlloc{});
+    auto f = bind_and_forward(ex2, std::move(handler), std::move(args));
     RebindTraits2::destroy(alloc2, this);
     RebindTraits2::deallocate(alloc2, this, 1);
-    w.second.get_executor().dispatch(std::move(f), alloc2);
+    boost::asio::dispatch(std::move(f));
   }
   void destroy_post(std::tuple<Args...>&& args) override {
     auto w = std::move(work);
-    auto f = bind_and_forward(std::move(handler), std::move(args));
-    RebindAlloc2 alloc2 = boost::asio::get_associated_allocator(handler);
+    auto ex2 = w.second.get_executor();
+    RebindAlloc2 alloc2 = boost::asio::get_associated_allocator(handler, DefaultAlloc{});
+    auto f = bind_and_forward(ex2, std::move(handler), std::move(args));
     RebindTraits2::destroy(alloc2, this);
     RebindTraits2::deallocate(alloc2, this, 1);
-    w.second.get_executor().post(std::move(f), alloc2);
+    boost::asio::post(std::move(f));
   }
   void destroy() override {
-    RebindAlloc2 alloc2 = boost::asio::get_associated_allocator(handler);
+    RebindAlloc2 alloc2 = boost::asio::get_associated_allocator(handler, DefaultAlloc{});
     RebindTraits2::destroy(alloc2, this);
     RebindTraits2::deallocate(alloc2, this, 1);
   }
@@ -227,14 +240,23 @@ class CompletionImpl final : public Completion<void(Args...), T> {
  public:
   template <typename ...TArgs>
   static auto create(const Executor1& ex, Handler&& handler, TArgs&& ...args) {
-    auto alloc2 = boost::asio::get_associated_allocator(handler);
+    auto alloc2 = boost::asio::get_associated_allocator(handler, DefaultAlloc{});
     using Ptr = std::unique_ptr<CompletionImpl>;
     return Ptr{new (alloc2) CompletionImpl(ex, std::move(handler),
                                            std::forward<TArgs>(args)...)};
   }
 
-  static void operator delete(void *p) {
-    static_cast<CompletionImpl*>(p)->destroy();
+  // C++20 destroying delete.
+  // When this overload is selected by `delete ptr`, the compiler does NOT call
+  // ~CompletionImpl(). We must do the full teardown here. We route through
+  // destroy() so that:
+  //  - the completion’s custom lifecycle (defer/dispatch/post) is honored,
+  //  - the object’s destructor is invoked, and
+  //  - deallocation is performed using the matching allocator (RebindAlloc2).
+  // Keep this function noexcept; destroy() is responsible for both destruction
+  // and allocator-aware deallocation.
+  static void operator delete(CompletionImpl* ptr, std::destroying_delete_t) noexcept {
+    ptr->destroy();
   }
 };
 

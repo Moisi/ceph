@@ -89,7 +89,7 @@ def pre_process(ctx, config):
 
         ctx.cluster.only(client).run(
             args=[
-                'cd', '/home/ubuntu/.aws/models/s3/2006-03-01/', run.Raw('&&'), 'cp', '{tdir}/ceph/examples/boto3/service-2.sdk-extras.json'.format(tdir=test_dir), 'service-2.sdk-extras.json'
+                'cd', '/home/ubuntu/.aws/models/s3/2006-03-01/', run.Raw('&&'), 'cp', '{tdir}/ceph/examples/rgw/boto3/service-2.sdk-extras.json'.format(tdir=test_dir), 'service-2.sdk-extras.json'
                 ],
             )
 
@@ -220,7 +220,7 @@ def run_tests(ctx, config):
     for client, client_config in config.items():
         (remote,) = ctx.cluster.only(client).remotes.keys()
 
-        attr = ["!kafka_test", "!amqp_test", "!amqp_ssl_test", "!kafka_ssl_test", "!modification_required", "!manual_test"]
+        attr = ["basic_test"]
 
         if 'extra_attr' in client_config:
             attr = client_config.get('extra_attr')
@@ -291,6 +291,7 @@ def task(ctx,config):
         endpoint = ctx.rgw.role_endpoints.get(client)
         assert endpoint, 'bntests: no rgw endpoint for {}'.format(client)
 
+        cluster_name, _, _ = teuthology.split_role(client)
         bntests_conf[client] = ConfigObj(
             indent_type='',
             infile={
@@ -298,6 +299,9 @@ def task(ctx,config):
                     {
                     'port':endpoint.port,
                     'host':endpoint.dns_name,
+                    'zonegroup':ctx.rgw.zonegroup,
+                    'cluster':cluster_name,
+                    'version':'v2'
                     },
                 's3 main':{}
             }

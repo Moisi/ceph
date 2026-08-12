@@ -3,12 +3,16 @@
 
 #include "include/Context.h"
 #include "common/ceph_json.h"
+#include "common/Clock.h" // for ceph_clock_now()
 #include "rgw_coroutine.h"
+#include "rgw_asio_thread.h"
 
 // re-include our assert to clobber the system one; fix dout:
 #include "include/ceph_assert.h"
 
 #include <boost/asio/yield.hpp>
+
+#include <shared_mutex> // for std::shared_lock
 
 #define dout_subsys ceph_subsys_rgw
 #define dout_context g_ceph_context
@@ -615,6 +619,8 @@ void RGWCoroutinesManager::io_complete(RGWCoroutine *cr, const rgw_io_id& io_id)
 
 int RGWCoroutinesManager::run(const DoutPrefixProvider *dpp, list<RGWCoroutinesStack *>& stacks)
 {
+  maybe_warn_about_blocking(dpp);
+
   int ret = 0;
   int blocked_count = 0;
   int interval_wait_count = 0;
@@ -1077,8 +1083,21 @@ int RGWSimpleCoroutine::operate(const DoutPrefixProvider *dpp)
   int ret = 0;
   reenter(this) {
     yield return state_init();
-    yield return state_send_request(dpp);
-    yield return state_request_complete();
+
+    for (tries = 0; tries < max_eio_retries; tries++) {
+      yield return state_send_request(dpp);
+      yield return state_request_complete();
+
+      if (op_ret == -ERR_INTERNAL_ERROR && tries < max_eio_retries - 1) {
+        ldout(cct, 20) << "request IO error. retries=" << tries << dendl;
+        continue;
+      } else if (op_ret < 0) {
+        call_cleanup();
+        return set_state(RGWCoroutine_Error, op_ret);
+      }
+      break;
+    }
+
     yield return state_all_complete();
     drain_all();
     call_cleanup();
@@ -1109,10 +1128,10 @@ int RGWSimpleCoroutine::state_send_request(const DoutPrefixProvider *dpp)
 
 int RGWSimpleCoroutine::state_request_complete()
 {
-  int ret = request_complete();
-  if (ret < 0) {
+  op_ret = request_complete();
+  if (op_ret < 0 && op_ret != -ERR_INTERNAL_ERROR) {
     call_cleanup();
-    return set_state(RGWCoroutine_Error, ret);
+    return set_state(RGWCoroutine_Error, op_ret);
   }
   return 0;
 }

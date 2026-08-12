@@ -20,6 +20,7 @@
 #include "include/mempool.h"
 
 // re-include our assert to clobber boost's
+#include "common/admin_finisher.h" // for asok_finisher
 #include "include/ceph_assert.h" 
 #include "include/common_fwd.h"
 
@@ -48,6 +49,7 @@
 #include <memory>
 #include <string>
 #include <tuple>
+#include <vector>
 
 //#define DEBUG_RECOVERY_OIDS   // track std::set of recovering oids explicitly, to find counting bugs
 //#define PG_DEBUG_REFS    // track provenance of pg refs, helpful for finding leaks
@@ -67,7 +69,6 @@ class ScrubBackend;
 namespace Scrub {
   class Store;
   class ReplicaReservations;
-  class LocalReservation;
   class ReservedByRemotePrimary;
   enum class schedule_result_t;
 }
@@ -78,6 +79,7 @@ namespace Scrub {
   void put_with_id(PG *pg, uint64_t id);
   typedef TrackedIntPtr<PG> PGRef;
 #else
+#include <boost/intrusive_ptr.hpp>
   typedef boost::intrusive_ptr<PG> PGRef;
 #endif
 
@@ -179,13 +181,6 @@ public:
   /// and be removed only in the PrimaryLogPG destructor.
   std::unique_ptr<ScrubPgIF> m_scrubber;
 
-  /// flags detailing scheduling/operation characteristics of the next scrub 
-  requested_scrub_t m_planned_scrub;
-
-  const requested_scrub_t& get_planned_scrub() const {
-    return m_planned_scrub;
-  }
-
   /// scrubbing state for both Primary & replicas
   bool is_scrub_active() const { return m_scrubber->is_scrub_active(); }
 
@@ -257,6 +252,20 @@ public:
     return !waiting_for_unreadable_object.empty();
   }
 
+  bool get_is_nonprimary_shard(const pg_shard_t &shard) const final
+  {
+    return get_pgbackend()->get_is_nonprimary_shard(shard.shard);
+  }
+
+  bool get_is_hinfo_required() const final
+  {
+    return get_pgbackend()->get_is_hinfo_required();
+  }
+
+  bool get_is_ec_optimized() const final {
+    return get_pgbackend()->get_is_ec_optimized();
+  }
+
   static void set_last_scrub_stamp(
     utime_t t, pg_history_t &history, pg_stat_t &stats) {
     stats.last_scrub_stamp = t;
@@ -269,6 +278,7 @@ public:
 	set_last_scrub_stamp(t, history, stats);
 	return true;
       });
+    on_scrub_schedule_input_change();
   }
 
   static void set_last_deep_scrub_stamp(
@@ -281,8 +291,10 @@ public:
     recovery_state.update_stats(
       [t](auto &history, auto &stats) {
 	set_last_deep_scrub_stamp(t, history, stats);
+	set_last_scrub_stamp(t, history, stats);
 	return true;
       });
+    on_scrub_schedule_input_change();
   }
 
   static void add_objects_scrubbed_count(
@@ -360,6 +372,9 @@ public:
   const std::set<pg_shard_t> &get_acting_recovery_backfill() const {
     return recovery_state.get_acting_recovery_backfill();
   }
+  const shard_id_set &get_acting_recovery_backfill_shard_id_set() const {
+    return recovery_state.get_acting_recovery_backfill_shard_id_set();
+  }
   bool is_acting(pg_shard_t osd) const {
     return recovery_state.is_acting(osd);
   }
@@ -422,19 +437,6 @@ public:
     forward_scrub_event(&ScrubPgIF::initiate_regular_scrub, queued, "StartScrub");
   }
 
-  /**
-   *  a special version of PG::scrub(), which:
-   *  - is initiated after repair, and
-   * (not true anymore:)
-   *  - is not required to allocate local/remote OSD scrub resources
-   */
-  void recovery_scrub(epoch_t queued, ThreadPool::TPHandle& handle)
-  {
-    // a new scrub
-    forward_scrub_event(&ScrubPgIF::initiate_scrub_after_repair, queued,
-			"AfterRepairScrub");
-  }
-
   void replica_scrub(epoch_t queued,
 		     Scrub::act_token_t act_token,
 		     ThreadPool::TPHandle& handle);
@@ -445,17 +447,6 @@ public:
   {
     forward_scrub_event(&ScrubPgIF::send_sched_replica, queued, act_token,
 			"SchedReplica");
-  }
-
-  void scrub_send_resources_granted(epoch_t queued, ThreadPool::TPHandle& handle)
-  {
-    forward_scrub_event(&ScrubPgIF::send_remotes_reserved, queued, "RemotesReserved");
-  }
-
-  void scrub_send_resources_denied(epoch_t queued, ThreadPool::TPHandle& handle)
-  {
-    forward_scrub_event(&ScrubPgIF::send_reservation_failure, queued,
-			"ReservationFailure");
   }
 
   void scrub_send_scrub_resched(epoch_t queued, ThreadPool::TPHandle& handle)
@@ -485,11 +476,6 @@ public:
     forward_scrub_event(&ScrubPgIF::digest_update_notification, queued, "DigestUpdate");
   }
 
-  void scrub_send_local_map_ready(epoch_t queued, ThreadPool::TPHandle& handle)
-  {
-    forward_scrub_event(&ScrubPgIF::send_local_map_done, queued, "IntLocalMapDone");
-  }
-
   void scrub_send_replmaps_ready(epoch_t queued, ThreadPool::TPHandle& handle)
   {
     forward_scrub_event(&ScrubPgIF::send_replica_maps_ready, queued, "GotReplicas");
@@ -499,11 +485,6 @@ public:
   {
     forward_scrub_event(&ScrubPgIF::send_replica_pushes_upd, queued,
 			"ReplicaPushesUpd");
-  }
-
-  void scrub_send_maps_compared(epoch_t queued, ThreadPool::TPHandle& handle)
-  {
-    forward_scrub_event(&ScrubPgIF::send_maps_compared, queued, "MapsCompared");
   }
 
   void scrub_send_get_next_chunk(epoch_t queued, ThreadPool::TPHandle& handle)
@@ -538,11 +519,18 @@ public:
   void on_pool_change() override;
   virtual void plpg_on_pool_change() = 0;
 
-  void on_info_history_change() override;
-
-  void on_primary_status_change(bool was_primary, bool now_primary) override;
-
-  void reschedule_scrub() override;
+  /**
+   * on_scrub_schedule_input_change
+   *
+   * To be called when inputs to scrub scheduling may have changed.
+   * - OSD config params related to scrub such as  osd_scrub_min_interval,
+   *   osd_scrub_max_interval
+   * - Pool params related to scrub such as osd_scrub_min_interval,
+   *   osd_scrub_max_interval
+   * - pg stat scrub timestamps
+   * - etc
+   */
+  void on_scrub_schedule_input_change();
 
   void scrub_requested(scrub_level_t scrub_level, scrub_type_t scrub_type) override;
 
@@ -593,7 +581,7 @@ public:
   void clear_publish_stats() override;
   void clear_primary_state() override;
 
-  epoch_t oldest_stored_osdmap() override;
+  epoch_t cluster_osdmap_trim_lower_bound() override;
   OstreamTemp get_clog_error() override;
   OstreamTemp get_clog_info() override;
   OstreamTemp get_clog_debug() override;
@@ -621,15 +609,11 @@ public:
 
   void on_active_exit() override;
 
-  Context *on_clean() override {
-    if (is_active()) {
-      kick_snap_trim();
-    }
-    requeue_ops(waiting_for_clean_to_primary_repair);
-    return finish_recovery();
-  }
+  Context *on_clean() override;
 
   void on_activate(interval_set<snapid_t> snaps) override;
+
+  void on_replica_activate() override;
 
   void on_activate_committed() override;
 
@@ -639,7 +623,8 @@ public:
   void queue_snap_retrim(snapid_t snap);
 
   void on_backfill_reserved() override;
-  void on_backfill_canceled() override;
+  void on_backfill_suspended() override;
+  void on_recovery_cancelled() override {}
   void on_recovery_reserved() override;
 
   bool is_forced_recovery_or_backfill() const {
@@ -678,7 +663,14 @@ public:
     std::vector<int>& newup, int up_primary,
     std::vector<int>& newacting, int acting_primary,
     PeeringCtx &rctx);
-  void handle_activate_map(PeeringCtx &rctx);
+
+  /**
+   *  \note: handle_activate_map() is not guaranteed to be called for
+   *  each epoch in sequence. Thus we supply it with the full range of
+   *  epochs that were skipped.
+   */
+  void handle_activate_map(PeeringCtx &rctx, epoch_t range_starts_at);
+
   void handle_initialize(PeeringCtx &rxcx);
   void handle_query_state(ceph::Formatter *f);
 
@@ -706,44 +698,19 @@ public:
   void shutdown();
   virtual void on_shutdown() = 0;
 
-  bool get_must_scrub() const;
-  Scrub::schedule_result_t sched_scrub();
+  Scrub::schedule_result_t start_scrubbing(
+    const Scrub::SchedEntry& candidate,
+    Scrub::OSDRestrictions osd_restrictions);
 
-  unsigned int scrub_requeue_priority(Scrub::scrub_prio_t with_priority, unsigned int suggested_priority) const;
+  unsigned int scrub_requeue_priority(
+      Scrub::scrub_prio_t with_priority,
+      unsigned int suggested_priority) const;
   /// the version that refers to flags_.priority
   unsigned int scrub_requeue_priority(Scrub::scrub_prio_t with_priority) const;
+
 private:
   // auxiliaries used by sched_scrub():
   double next_deepscrub_interval() const;
-
-  /// should we perform deep scrub?
-  bool is_time_for_deep(bool allow_deep_scrub,
-                        bool allow_shallow_scrub,
-                        bool has_deep_errors,
-                        const requested_scrub_t& planned) const;
-
-  /**
-   * Validate the various 'next scrub' flags in m_planned_scrub against configuration
-   * and scrub-related timestamps.
-   *
-   * @returns an updated copy of the m_planned_flags (or nothing if no scrubbing)
-   */
-  std::optional<requested_scrub_t> validate_scrub_mode() const;
-
-  std::optional<requested_scrub_t> validate_periodic_mode(
-    bool allow_deep_scrub,
-    bool try_to_auto_repair,
-    bool allow_shallow_scrub,
-    bool time_for_deep,
-    bool has_deep_errors,
-    const requested_scrub_t& planned) const;
-
-  std::optional<requested_scrub_t> validate_initiated_scrub(
-    bool allow_deep_scrub,
-    bool try_to_auto_repair,
-    bool time_for_deep,
-    bool has_deep_errors,
-    const requested_scrub_t& planned) const;
 
   using ScrubAPI = void (ScrubPgIF::*)(epoch_t epoch_queued);
   void forward_scrub_event(ScrubAPI fn, epoch_t epoch_queued, std::string_view desc);
@@ -765,10 +732,10 @@ public:
 
   virtual void snap_trimmer(epoch_t epoch_queued) = 0;
   virtual void do_command(
-    const std::string_view& prefix,
+    std::string_view prefix,
     const cmdmap_t& cmdmap,
     const ceph::buffer::list& idata,
-    std::function<void(int,const std::string&,ceph::buffer::list&)> on_finish) = 0;
+    asok_finisher on_finish) = 0;
 
   virtual bool agent_work(int max) = 0;
   virtual bool agent_work(int max, int agent_flush_quota) = 0;
@@ -780,7 +747,9 @@ public:
   struct C_DeleteMore : public Context {
     PGRef pg;
     epoch_t epoch;
-    C_DeleteMore(PG *p, epoch_t e) : pg(p), epoch(e) {}
+    int64_t num_objects;
+    C_DeleteMore(PG *p, epoch_t e, int64_t num) : pg(p), epoch(e),
+	                                          num_objects(num){}
     void finish(int r) override {
       ceph_abort();
     }
@@ -917,8 +886,8 @@ protected:
   std::set<int> probe_targets;
 
 protected:
-  BackfillInterval backfill_info;
-  std::map<pg_shard_t, BackfillInterval> peer_backfill_info;
+  PrimaryBackfillInterval backfill_info;
+  std::map<pg_shard_t, ReplicaBackfillInterval> peer_backfill_info;
   bool backfill_reserving;
 
   // The primary's num_bytes and local num_bytes for this pg, only valid
@@ -1024,6 +993,19 @@ public:
     return num_bytes;
   }
 
+  uint64_t get_average_object_size() {
+    ceph_assert(ceph_mutex_is_locked_by_me(_lock));
+    auto num_bytes = static_cast<uint64_t>(
+      std::max<int64_t>(
+        0, // ensure bytes is non-negative
+        info.stats.stats.sum.num_bytes));
+    auto num_objects = static_cast<uint64_t>(
+      std::max<int64_t>(
+        1, // ensure objects is non-negative and non-zero
+        info.stats.stats.sum.num_objects));
+    return std::max<uint64_t>(num_bytes / num_objects, 1);
+  }
+
 protected:
 
   /*
@@ -1107,6 +1089,7 @@ protected:
 
   std::set<hobject_t> objects_blocked_on_cache_full;
   std::map<hobject_t,snapid_t> objects_blocked_on_degraded_snap;
+  std::map<hobject_t,snapid_t> objects_blocked_on_unreadable_snap;
   std::map<hobject_t,ObjectContextRef> objects_blocked_on_snap_promotion;
 
   // Callbacks should assume pg (and nothing else) is locked
@@ -1162,6 +1145,11 @@ protected:
     }
     void trim(const pg_log_entry_t &entry) override {
       pg->get_pgbackend()->trim(entry, t);
+    }
+    void partial_write(pg_info_t *info, eversion_t previous_version,
+                       const pg_log_entry_t &entry
+      ) override {
+      pg->get_pgbackend()->partial_write(info, previous_version, entry);
     }
   };
 
@@ -1234,8 +1222,6 @@ public:
 
   // -- scrub --
 protected:
-  bool scrub_after_recovery;
-
   int active_pushes;
 
   [[nodiscard]] bool ops_blocked_by_scrub() const;
@@ -1279,6 +1265,7 @@ protected:
 
 public:
   int pg_stat_adjust(osd_stat_t *new_stat);
+  bool is_degraded() const { return recovery_state.is_degraded(); }
 protected:
   bool delete_needs_sleep = false;
 
@@ -1302,7 +1289,6 @@ protected:
   bool is_backfill_unfound() const { return recovery_state.is_backfill_unfound(); }
   bool is_incomplete() const { return recovery_state.is_incomplete(); }
   bool is_clean() const { return recovery_state.is_clean(); }
-  bool is_degraded() const { return recovery_state.is_degraded(); }
   bool is_undersized() const { return recovery_state.is_undersized(); }
   bool is_scrubbing() const { return state_test(PG_STATE_SCRUBBING); } // Primary only
   bool is_remapped() const { return recovery_state.is_remapped(); }
@@ -1369,7 +1355,6 @@ protected:
   virtual void snap_trimmer_scrub_complete() = 0;
 
   void queue_recovery();
-  void queue_scrub_after_repair();
   unsigned int get_scrub_priority();
 
   bool try_flush_or_schedule_async() override;
@@ -1420,11 +1405,6 @@ public:
 
  OSDService* get_pg_osd(ScrubberPasskey) const { return osd; }
 
- requested_scrub_t& get_planned_scrub(ScrubberPasskey)
- {
-   return m_planned_scrub;
- }
-
  void force_object_missing(ScrubberPasskey,
                            const std::set<pg_shard_t>& peer,
                            const hobject_t& oid,
@@ -1433,10 +1413,53 @@ public:
    recovery_state.force_object_missing(peer, oid, version);
  }
 
- uint64_t logical_to_ondisk_size(uint64_t logical_size) const final
- {
-   return get_pgbackend()->be_get_ondisk_size(logical_size);
+ uint64_t logical_to_ondisk_size(uint64_t logical_size,
+                                 shard_id_t shard_id) const final {
+   return get_pgbackend()->be_get_ondisk_size(logical_size, shard_id_t(shard_id));
  }
+
+ bool ec_can_decode(const shard_id_set &available_shards) const final {
+   return get_pgbackend()->ec_can_decode(available_shards);
+ }
+
+ shard_id_map<bufferlist> ec_encode_acting_set(
+     const bufferlist &in_bl) const final {
+   return get_pgbackend()->ec_encode_acting_set(in_bl);
+ }
+
+ shard_id_map<bufferlist> ec_decode_acting_set(
+     const shard_id_map<bufferlist> &shard_map, int chunk_size) const final {
+   return get_pgbackend()->ec_decode_acting_set(shard_map, chunk_size);
+ }
+
+ bool get_ec_supports_crc_encode_decode() const final {
+   return get_pgbackend()->get_ec_supports_crc_encode_decode();
+ }
+
+ ECUtil::stripe_info_t get_ec_sinfo() const final {
+   return get_pgbackend()->ec_get_sinfo();
+ }
+};
+
+/**
+ * Initialized with a locked PG. That PG is unlocked in the
+ * destructor.
+ * Used by OsdScrub when initiating a scrub.
+ */
+class PGLockWrapper {
+ public:
+  template <typename A_PG_REF>
+  explicit PGLockWrapper(A_PG_REF&& locked_pg)
+      : m_pg{std::forward<A_PG_REF>(locked_pg)}
+  {}
+  PGRef pg() { return m_pg; }
+  ~PGLockWrapper();
+  PGLockWrapper(PGLockWrapper&& rhs) noexcept : m_pg(std::move(rhs.m_pg)) {
+    rhs.m_pg = nullptr;
+  }
+  PGLockWrapper(const PGLockWrapper& rhs) = delete;
+ private:
+  PGRef m_pg;
 };
 
 #endif

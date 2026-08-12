@@ -39,6 +39,8 @@ export class GrafanaComponent implements OnInit, OnChanges {
   uid: string;
   @Input()
   title: string;
+  @Input()
+  scrollable: string = 'yes';
 
   constructor(private sanitizer: DomSanitizer, private settingsService: SettingsService) {
     this.grafanaTimes = [
@@ -155,7 +157,8 @@ export class GrafanaComponent implements OnInit, OnChanges {
       one: 'grafana_one',
       two: 'grafana_two',
       three: 'grafana_three',
-      four: 'grafana_four'
+      four: 'grafana_four',
+      five: 'grafana_five'
     };
 
     this.datasource = this.type === 'metrics' ? 'Dashboard1' : 'Loki';
@@ -172,13 +175,13 @@ export class GrafanaComponent implements OnInit, OnChanges {
   getFrame() {
     this.settingsService
       .validateGrafanaDashboardUrl(this.uid)
-      .subscribe((data: any) => (this.dashboardExist = data === 200));
+      .subscribe((data: any) => (this.dashboardExist = data === 200 || data === 401)); // 401 because grafana API shows unauthorized when anonymous access is disabled
     if (this.type === 'metrics') {
       this.url = `${this.baseUrl}${this.uid}/${this.grafanaPath}&refresh=2s&var-datasource=${this.datasource}${this.mode}&${this.time}`;
     } else {
-      this.url = `${this.baseUrl.slice(0, -2)}${this.grafanaPath}orgId=1&left=["now-1h","now","${
+      this.url = `${this.baseUrl.slice(0, -2)}${this.grafanaPath}orgId=1&left={"datasource": "${
         this.datasource
-      }",{"refId":"A"}]${this.mode}`;
+      }", "queries": [{"refId": "A"}], "range": {"from": "now-1h", "to": "now"}}${this.mode}`;
     }
     this.grafanaSrc = this.sanitizer.bypassSecurityTrustResourceUrl(this.url);
   }

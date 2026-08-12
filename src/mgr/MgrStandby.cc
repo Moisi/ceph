@@ -40,6 +40,28 @@
 using std::map;
 using std::string;
 using std::vector;
+using namespace std::literals;
+
+class MgrHook : public AdminSocketHook {
+  MgrStandby* mgr;
+public:
+  explicit MgrHook(MgrStandby *m) : mgr(m) {}
+  int call(std::string_view admin_command,
+           const cmdmap_t& cmdmap,
+           const bufferlist& inbl,
+           Formatter *f,
+           std::ostream& errss,
+           bufferlist& outbl) override {
+    int r = 0;
+    try {
+      r = mgr->asok_command(admin_command, cmdmap, f, errss);
+    } catch (const TOPNSPC::common::bad_cmd_get& e) {
+      errss << e.what();
+      r = -EINVAL;
+    }
+    return r;
+  }
+};
 
 MgrStandby::MgrStandby(int argc, const char **argv) :
   Dispatcher(g_ceph_context),
@@ -50,9 +72,8 @@ MgrStandby::MgrStandby(int argc, const char **argv) :
 			cct->_conf.get_val<std::string>("ms_type") : cct->_conf.get_val<std::string>("ms_public_type"),
 		     entity_name_t::MGR(),
 		     "mgr",
-		     Messenger::get_pid_nonce())),
+		     Messenger::get_random_nonce())),
   objecter{g_ceph_context, client_messenger.get(), &monc, poolctx},
-  client{client_messenger.get(), &monc, &objecter},
   mgrc(g_ceph_context, client_messenger.get(), &monc.monmap),
   log_client(g_ceph_context, client_messenger.get(), &monc.monmap, LogClient::NO_FLAGS),
   clog(log_client.create_channel(CLOG_CHANNEL_CLUSTER)),
@@ -67,25 +88,28 @@ MgrStandby::MgrStandby(int argc, const char **argv) :
 {
 }
 
-MgrStandby::~MgrStandby() = default;
+MgrStandby::~MgrStandby() {
+  if (asok_hook) {
+    g_ceph_context->get_admin_socket()->unregister_commands(asok_hook.get());
+    asok_hook.reset();
+  }
+}
 
-const char** MgrStandby::get_tracked_conf_keys() const
+std::vector<std::string> MgrStandby::get_tracked_keys() const noexcept
 {
-  static const char* KEYS[] = {
+  return {
     // clog & admin clog
-    "clog_to_monitors",
-    "clog_to_syslog",
-    "clog_to_syslog_facility",
-    "clog_to_syslog_level",
-    "clog_to_graylog",
-    "clog_to_graylog_host",
-    "clog_to_graylog_port",
-    "mgr_standby_modules",
-    "host",
-    "fsid",
-    NULL
+    "clog_to_monitors"s,
+    "clog_to_syslog"s,
+    "clog_to_syslog_facility"s,
+    "clog_to_syslog_level"s,
+    "clog_to_graylog"s,
+    "clog_to_graylog_host"s,
+    "clog_to_graylog_port"s,
+    "mgr_standby_modules"s,
+    "host"s,
+    "fsid"s
   };
-  return KEYS;
 }
 
 void MgrStandby::handle_conf_change(
@@ -116,6 +140,18 @@ void MgrStandby::handle_conf_change(
   }
 }
 
+int MgrStandby::asok_command(std::string_view cmd, const cmdmap_t& cmdmap, Formatter* f, std::ostream& errss)
+{
+  dout(10) << __func__ << ": " << cmd << dendl;
+  if (cmd == "status") {
+    f->open_object_section("status");
+    f->close_section();
+    return 0;
+  } else {
+    return -ENOSYS;
+  }
+}
+
 int MgrStandby::init()
 {
   init_async_signal_handler();
@@ -131,8 +167,14 @@ int MgrStandby::init()
   // Initialize Messenger
   client_messenger->add_dispatcher_tail(this);
   client_messenger->add_dispatcher_head(&objecter);
-  client_messenger->add_dispatcher_tail(&client);
   client_messenger->start();
+
+  AdminSocket *admin_socket = g_ceph_context->get_admin_socket();
+  asok_hook.reset(new MgrHook(this));
+  {
+    int r = admin_socket->register_command("status", asok_hook.get(), "show status");
+    ceph_assert(r == 0);
+  }
 
   poolctx.start(2);
 
@@ -198,7 +240,6 @@ int MgrStandby::init()
   objecter.set_client_incarnation(0);
   objecter.init();
   objecter.start();
-  client.init();
   timer.init();
 
   py_module_registry.init();
@@ -295,41 +336,6 @@ void MgrStandby::tick()
   ));
 }
 
-void MgrStandby::shutdown()
-{
-  finisher.queue(new LambdaContext([&](int) {
-    std::lock_guard l(lock);
-
-    dout(4) << "Shutting down" << dendl;
-
-    py_module_registry.shutdown();
-    // stop sending beacon first, I use monc to talk with monitors
-    timer.shutdown();
-    // client uses monc and objecter
-    client.shutdown();
-    mgrc.shutdown();
-    // Stop asio threads, so leftover events won't call into shut down
-    // monclient/objecter.
-    poolctx.finish();
-    // stop monc, so mon won't be able to instruct me to shutdown/activate after
-    // the active_mgr is stopped
-    monc.shutdown();
-    if (active_mgr) {
-      active_mgr->shutdown();
-    }
-    // objecter is used by monc and active_mgr
-    objecter.shutdown();
-    // client_messenger is used by all of them, so stop it in the end
-    client_messenger->shutdown();
-  }));
-
-  // Then stop the finisher to ensure its enqueued contexts aren't going
-  // to touch references to the things we're about to tear down
-  finisher.wait_for_empty();
-  finisher.stop();
-  mgr_perf_stop(g_ceph_context);
-}
-
 void MgrStandby::respawn()
 {
   // --- WARNING TO FUTURE COPY/PASTERS ---
@@ -404,7 +410,7 @@ void MgrStandby::handle_mgr_map(ref_t<MMgrMap> mmap)
       dout(1) << "Activating!" << dendl;
       active_mgr.reset(new Mgr(&monc, map, &py_module_registry,
                                client_messenger.get(), &objecter,
-			       &client, clog, audit_clog));
+			       clog, audit_clog));
       active_mgr->background_init(new LambdaContext(
             [this](int r){
               // Advertise our active-ness ASAP instead of waiting for
@@ -440,26 +446,24 @@ void MgrStandby::handle_mgr_map(ref_t<MMgrMap> mmap)
   }
 }
 
-bool MgrStandby::ms_dispatch2(const ref_t<Message>& m)
+Dispatcher::dispatch_result_t MgrStandby::ms_dispatch2(const ref_t<Message>& m)
 {
   std::lock_guard l(lock);
   dout(10) << state_str() << " " << *m << dendl;
 
+  Dispatcher::dispatch_result_t r;
+
   if (m->get_type() == MSG_MGR_MAP) {
     handle_mgr_map(ref_cast<MMgrMap>(m));
+    r = Dispatcher::ACKNOWLEDGED();
   }
-  bool handled = false;
   if (active_mgr) {
     auto am = active_mgr;
     lock.unlock();
-    handled = am->ms_dispatch2(m);
+    r = am->ms_dispatch2(m);
     lock.lock();
   }
-  if (m->get_type() == MSG_MGR_MAP) {
-    // let this pass through for mgrc
-    handled = false;
-  }
-  return handled;
+  return r;
 }
 
 

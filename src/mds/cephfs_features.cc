@@ -1,13 +1,14 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab
 
-#include <array>
 #include "cephfs_features.h"
 #include "mdstypes.h"
+#include "common/Formatter.h"
+#include "common/StackStringStream.h"
 
-#undef FMT_HEADER_ONLY
-#define FMT_HEADER_ONLY 1
 #include <fmt/format.h>
+
+#include <array>
 
 static const std::array feature_names
 {
@@ -29,6 +30,12 @@ static const std::array feature_names
   "alternate_name",
   "notify_session_state",
   "op_getvxattr",
+  "32bits_retry_fwd",
+  "new_snaprealm_info",
+  "has_owner_uidgid",
+  "client_mds_auth_caps",
+  "charmap",
+  "blockdiff"
 };
 static_assert(feature_names.size() == CEPHFS_FEATURE_MAX + 1);
 

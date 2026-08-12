@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <deque>
 #include <limits>
 #include <numeric>
 #include <optional>
@@ -14,15 +15,57 @@
 
 #include "include/byteorder.h"
 #include "include/denc.h"
+#include "include/encoding.h"
 #include "include/buffer.h"
 #include "include/intarith.h"
 #include "include/interval_set.h"
 #include "include/uuid.h"
+#include "include/rados.h"
+
+#include "crimson/common/errorator.h"
 
 namespace crimson::os::seastore {
 
+using base_ertr = crimson::errorator<
+  crimson::ct_error::input_output_error>;
+
+class cache_hint_t {
+  enum hint_t {
+    TOUCH,
+    NOCACHE
+  };
+public:
+  static constexpr cache_hint_t get_touch() {
+    return hint_t::TOUCH;
+  }
+  static constexpr cache_hint_t get_nocache() {
+    return hint_t::NOCACHE;
+  }
+  cache_hint_t(uint32_t flags) {
+    if (unlikely(flags & CEPH_OSD_OP_FLAG_FADVISE_DONTNEED) ||
+	unlikely(flags & CEPH_OSD_OP_FLAG_FADVISE_NOCACHE)) {
+      hint = NOCACHE;
+    }
+  }
+  bool operator==(const cache_hint_t &other) const {
+    return hint == other.hint;
+  }
+  bool operator!=(const cache_hint_t &other) const {
+    return hint != other.hint;
+  }
+private:
+  constexpr cache_hint_t(hint_t hint) : hint(hint) {}
+  hint_t hint = hint_t::TOUCH;
+};
+
+inline constexpr cache_hint_t CACHE_HINT_TOUCH = cache_hint_t::get_touch();
+inline constexpr cache_hint_t CACHE_HINT_NOCACHE = cache_hint_t::get_nocache();
+
 /* using a special xattr key "omap_header" to store omap header */
   const std::string OMAP_HEADER_XATTR_KEY = "omap_header";
+
+using transaction_id_t = uint64_t;
+constexpr transaction_id_t TRANS_ID_NULL = 0;
 
 /*
  * Note: NULL value is usually the default and max value.
@@ -36,6 +79,14 @@ inline depth_le_t init_depth_le(uint32_t i) {
 }
 
 using checksum_t = uint32_t;
+using checksum_le_t = ceph_le32;
+constexpr checksum_t CRC_NULL = 0;
+
+// XXX: It happens to be true that the width of node
+// 	index in lba and omap tree are the same.
+using btreenode_pos_t = uint16_t;
+constexpr auto BTREENODE_POS_MAX = std::numeric_limits<btreenode_pos_t>::max();
+constexpr auto BTREENODE_POS_NULL = BTREENODE_POS_MAX;
 
 // Immutable metadata for seastore to set at mkfs time
 struct seastore_meta_t {
@@ -71,6 +122,11 @@ constexpr device_id_t DEVICE_ID_MAX_VALID_SEGMENT = DEVICE_ID_MAX >> 1;
 constexpr device_id_t DEVICE_ID_SEGMENTED_MIN = 0;
 constexpr device_id_t DEVICE_ID_RANDOM_BLOCK_MIN = 
   1 << (std::numeric_limits<device_id_t>::digits - 1);
+
+// TODO this Signature is only applicable for segment devices(SSD/HDD) not
+// for other two devices like ZBD/RANDOM_BLOCK_SSD
+constexpr const char SEASTORE_SUPERBLOCK_SIGN[] = "seastore block device\n";
+constexpr std::size_t SEASTORE_SUPERBLOCK_SIGN_LEN = sizeof(SEASTORE_SUPERBLOCK_SIGN) - 1;
 
 struct device_id_printer_t {
   device_id_t id;
@@ -188,7 +244,7 @@ private:
 std::ostream &operator<<(std::ostream &out, const segment_id_t&);
 
 // ondisk type of segment_id_t
-struct __attribute((packed)) segment_id_le_t {
+struct __attribute__((packed)) segment_id_le_t {
   ceph_le32 segment = ceph_le32(segment_id_t().segment);
 
   segment_id_le_t(const segment_id_t id) :
@@ -207,7 +263,7 @@ constexpr segment_id_t NULL_SEG_ID = MAX_SEG_ID;
 
 /* Monotonically increasing segment seq, uniquely identifies
  * the incarnation of a segment */
-using segment_seq_t = uint32_t;
+using segment_seq_t = uint64_t;
 static constexpr segment_seq_t MAX_SEG_SEQ =
   std::numeric_limits<segment_seq_t>::max();
 static constexpr segment_seq_t NULL_SEG_SEQ = MAX_SEG_SEQ;
@@ -485,6 +541,7 @@ constexpr device_off_t decode_device_off(internal_paddr_t addr) {
 struct seg_paddr_t;
 struct blk_paddr_t;
 struct res_paddr_t;
+struct pladdr_t;
 struct paddr_t {
 public:
   // P_ADDR_MAX == P_ADDR_NULL == paddr_t{}
@@ -523,10 +580,6 @@ public:
 
   device_id_t get_device_id() const {
     return static_cast<device_id_t>(internal_paddr >> DEVICE_OFF_BITS);
-  }
-
-  paddr_types_t get_addr_type() const {
-    return device_id_to_paddr_type(get_device_id());
   }
 
   paddr_t add_offset(device_off_t o) const;
@@ -608,18 +661,42 @@ public:
   }
 
   /**
-   * is_real
+   * is_absolute()
    *
-   * indicates whether addr reflects a physical location, absolute, relative,
-   * or delayed.  FAKE segments also count as real so as to reflect the way in
-   * which unit tests use them.
+   * indicates whether addr reflects an absolute location
+   * which can be found on disk.
+   *
+   * Note, fake paddrs should work like the absolute ones.
    */
-  bool is_real() const {
-    return !is_zero() && !is_null() && !is_root();
+  bool is_absolute() const {
+#ifdef UNIT_TESTS_BUILT
+    return get_addr_type() != paddr_types_t::RESERVED ||
+           is_fake();
+#else
+    return get_addr_type() != paddr_types_t::RESERVED;
+#endif
   }
 
-  bool is_absolute() const {
-    return get_addr_type() != paddr_types_t::RESERVED;
+  bool is_absolute_random_block() const {
+    return get_addr_type() == paddr_types_t::RANDOM_BLOCK;
+  }
+
+  bool is_absolute_segmented() const {
+    return get_addr_type() == paddr_types_t::SEGMENT;
+  }
+
+  bool is_fake() const {
+    return get_device_id() == DEVICE_ID_FAKE;
+  }
+
+  /**
+   * is_real_location
+   *
+   * indicates whether addr reflects a real location (valid in lba) --
+   * absolute, record-relative, or delayed.
+   */
+  bool is_real_location() const {
+    return is_absolute() || is_delayed() || is_record_relative();
   }
 
   auto operator<=>(const paddr_t &) const = default;
@@ -650,7 +727,7 @@ private:
               encode_device_off(offset)) {
     assert(offset >= DEVICE_OFF_MIN);
     assert(offset <= DEVICE_OFF_MAX);
-    assert(get_addr_type() != paddr_types_t::SEGMENT);
+    assert(!is_absolute_segmented());
   }
 
   paddr_t(internal_paddr_t val);
@@ -660,7 +737,13 @@ private:
     : internal_paddr((static_cast<internal_paddr_t>(d_id) << DEVICE_OFF_BITS) |
                      static_cast<u_device_off_t>(offset)) {}
 
+  paddr_types_t get_addr_type() const {
+    return device_id_to_paddr_type(get_device_id());
+  }
+
   friend struct paddr_le_t;
+  friend struct pladdr_le_t;
+
 };
 
 std::ostream &operator<<(std::ostream &out, const paddr_t &rhs);
@@ -774,22 +857,22 @@ inline paddr_t make_delayed_temp_paddr(device_off_t off) {
 }
 
 inline const seg_paddr_t& paddr_t::as_seg_paddr() const {
-  assert(get_addr_type() == paddr_types_t::SEGMENT);
+  assert(is_absolute_segmented());
   return *static_cast<const seg_paddr_t*>(this);
 }
 
 inline seg_paddr_t& paddr_t::as_seg_paddr() {
-  assert(get_addr_type() == paddr_types_t::SEGMENT);
+  assert(is_absolute_segmented());
   return *static_cast<seg_paddr_t*>(this);
 }
 
 inline const blk_paddr_t& paddr_t::as_blk_paddr() const {
-  assert(get_addr_type() == paddr_types_t::RANDOM_BLOCK);
+  assert(is_absolute_random_block());
   return *static_cast<const blk_paddr_t*>(this);
 }
 
 inline blk_paddr_t& paddr_t::as_blk_paddr() {
-  assert(get_addr_type() == paddr_types_t::RANDOM_BLOCK);
+  assert(is_absolute_random_block());
   return *static_cast<blk_paddr_t*>(this);
 }
 
@@ -842,7 +925,7 @@ inline paddr_t paddr_t::block_relative_to(paddr_t rhs) const {
   return as_res_paddr().block_relative_to(rhs.as_res_paddr());
 }
 
-struct __attribute((packed)) paddr_le_t {
+struct __attribute__((packed)) paddr_le_t {
   ceph_le64 internal_paddr =
     ceph_le64(P_ADDR_NULL.internal_paddr);
 
@@ -875,8 +958,9 @@ enum class device_type_t : uint8_t {
   NONE = 0,
   HDD,
   SSD,
-  ZNS,
-  SEGMENTED_EPHEMERAL,
+  ZBD,            // ZNS SSD or SMR HDD
+  EPHEMERAL_COLD,
+  EPHEMERAL_MAIN,
   RANDOM_BLOCK_SSD,
   RANDOM_BLOCK_EPHEMERAL,
   NUM_TYPES
@@ -888,18 +972,17 @@ bool can_delay_allocation(device_type_t type);
 device_type_t string_to_device_type(std::string type);
 
 enum class backend_type_t {
-  SEGMENTED,    // SegmentManager: SSD, ZNS, HDD
+  SEGMENTED,    // SegmentManager: SSD, ZBD, HDD
   RANDOM_BLOCK  // RBMDevice:      RANDOM_BLOCK_SSD
 };
 
 std::ostream& operator<<(std::ostream& out, backend_type_t);
-using journal_type_t = backend_type_t;
 
 constexpr backend_type_t get_default_backend_of_device(device_type_t dtype) {
   assert(dtype != device_type_t::NONE &&
 	 dtype != device_type_t::NUM_TYPES);
   if (dtype >= device_type_t::HDD &&
-      dtype <= device_type_t::SEGMENTED_EPHEMERAL) {
+      dtype <= device_type_t::EPHEMERAL_MAIN) {
     return backend_type_t::SEGMENTED;
   } else {
     return backend_type_t::RANDOM_BLOCK;
@@ -922,13 +1005,13 @@ struct journal_seq_t {
 
   // produces a pseudo journal_seq_t relative to this by offset
   journal_seq_t add_offset(
-      journal_type_t type,
+      backend_type_t type,
       device_off_t off,
       device_off_t roll_start,
       device_off_t roll_size) const;
 
   device_off_t relative_to(
-      journal_type_t type,
+      backend_type_t type,
       const journal_seq_t& r,
       device_off_t roll_start,
       device_off_t roll_size) const;
@@ -956,18 +1039,15 @@ private:
     }
     using ret_t = std::pair<device_off_t, segment_id_t>;
     auto to_pair = [](const paddr_t &addr) -> ret_t {
-      if (addr.get_addr_type() == paddr_types_t::SEGMENT) {
+      if (addr.is_absolute_segmented()) {
 	auto &seg_addr = addr.as_seg_paddr();
 	return ret_t(seg_addr.get_segment_off(), seg_addr.get_segment_id());
-      } else if (addr.get_addr_type() == paddr_types_t::RANDOM_BLOCK) {
+      } else if (addr.is_absolute_random_block()) {
 	auto &blk_addr = addr.as_blk_paddr();
 	return ret_t(blk_addr.get_device_off(), MAX_SEG_ID);
-      } else if (addr.get_addr_type() == paddr_types_t::RESERVED) {
+      } else {
         auto &res_addr = addr.as_res_paddr();
         return ret_t(res_addr.get_device_off(), MAX_SEG_ID);
-      } else {
-	assert(0 == "impossible");
-	return ret_t(0, MAX_SEG_ID);
       }
     };
     auto left = to_pair(offset);
@@ -995,36 +1075,10 @@ constexpr journal_seq_t JOURNAL_SEQ_MAX{
 // JOURNAL_SEQ_NULL == JOURNAL_SEQ_MAX == journal_seq_t{}
 constexpr journal_seq_t JOURNAL_SEQ_NULL = JOURNAL_SEQ_MAX;
 
-// logical addr, see LBAManager, TransactionManager
-using laddr_t = uint64_t;
-constexpr laddr_t L_ADDR_MIN = std::numeric_limits<laddr_t>::min();
-constexpr laddr_t L_ADDR_MAX = std::numeric_limits<laddr_t>::max();
-constexpr laddr_t L_ADDR_NULL = L_ADDR_MAX;
-constexpr laddr_t L_ADDR_ROOT = L_ADDR_MAX - 1;
-constexpr laddr_t L_ADDR_LBAT = L_ADDR_MAX - 2;
+// logical offset between two laddr_t
+using loffset_t = uint64_t;
 
-struct __attribute((packed)) laddr_le_t {
-  ceph_le64 laddr = ceph_le64(L_ADDR_NULL);
-
-  using orig_type = laddr_t;
-
-  laddr_le_t() = default;
-  laddr_le_t(const laddr_le_t &) = default;
-  explicit laddr_le_t(const laddr_t &addr)
-    : laddr(ceph_le64(addr)) {}
-
-  operator laddr_t() const {
-    return laddr_t(laddr);
-  }
-  laddr_le_t& operator=(laddr_t addr) {
-    ceph_le64 val;
-    val = addr;
-    laddr = val;
-    return *this;
-  }
-};
-
-// logical offset, see LBAManager, TransactionManager
+// logical offset within an extent
 using extent_len_t = uint32_t;
 constexpr extent_len_t EXTENT_LEN_MAX =
   std::numeric_limits<extent_len_t>::max();
@@ -1033,6 +1087,357 @@ using extent_len_le_t = ceph_le32;
 inline extent_len_le_t init_extent_len_le(extent_len_t len) {
   return ceph_le32(len);
 }
+
+// logical addr, see LBAManager, TransactionManager
+class laddr_t {
+public:
+  // the type of underlying integer
+  using Unsigned = uint64_t;
+  static constexpr Unsigned RAW_VALUE_MAX =
+      std::numeric_limits<Unsigned>::max();
+
+  constexpr laddr_t() : laddr_t(RAW_VALUE_MAX) {}
+
+  // laddr_t is block aligned, one logical address represents one 4KiB block in disk
+  static constexpr unsigned UNIT_SHIFT = 12;
+  static constexpr unsigned UNIT_SIZE = 1 << UNIT_SHIFT; // 4096
+  static constexpr unsigned UNIT_MASK = UNIT_SIZE - 1;
+
+  static laddr_t from_byte_offset(Unsigned value) {
+    assert((value & UNIT_MASK) == 0);
+    return laddr_t(value >> UNIT_SHIFT);
+  }
+
+  static constexpr laddr_t from_raw_uint(Unsigned v) {
+    return laddr_t(v);
+  }
+
+  /// laddr_t works like primitive integer type, encode/decode it manually
+  void encode(::ceph::buffer::list::contiguous_appender& p) const {
+    p.append(reinterpret_cast<const char *>(&value), sizeof(Unsigned));
+  }
+  void bound_encode(size_t& p) const {
+    p += sizeof(Unsigned);
+  }
+  void decode(::ceph::buffer::ptr::const_iterator& p) {
+    assert(static_cast<std::size_t>(p.get_end() - p.get_pos()) >= sizeof(Unsigned));
+    memcpy((char *)&value, p.get_pos_add(sizeof(Unsigned)), sizeof(Unsigned));
+  }
+
+  // laddr_offset_t contains one base laddr and one block not aligned
+  // offset(< laddr_t::UNIT_SIZE). It is the return type of plus/minus
+  // overloads for laddr_t and loffset_t.
+  struct laddr_offset_t {
+    explicit laddr_offset_t(laddr_t base)
+	: base(base.value), offset(0) {}
+    laddr_offset_t(laddr_t base, extent_len_t offset)
+	: base(base.value), offset(offset) {
+      assert(offset < laddr_t::UNIT_SIZE);
+    }
+
+    laddr_t get_roundup_laddr(size_t alignment) const {
+      ceph_assert(alignment % laddr_t::UNIT_SIZE == 0);
+      if (offset == 0) {
+	return laddr_t(p2roundup(base, alignment >> laddr_t::UNIT_SHIFT));
+      } else {
+	assert(offset < laddr_t::UNIT_SIZE);
+	return laddr_t(p2roundup(base + 1, alignment >> laddr_t::UNIT_SHIFT));
+      }
+    }
+    laddr_t get_aligned_laddr(size_t alignment) const {
+      ceph_assert(alignment % laddr_t::UNIT_SIZE == 0);
+      return laddr_t(p2align(base, alignment >> laddr_t::UNIT_SHIFT));
+    }
+    laddr_t get_laddr() const {
+      return laddr_t{base};
+    }
+    extent_len_t get_offset() const {
+      assert(offset < laddr_t::UNIT_SIZE);
+      return offset;
+    }
+    bool has_offset() const {
+      return offset != 0;
+    }
+    bool is_aligned(size_t alignment) const {
+      assert(alignment % laddr_t::UNIT_SIZE == 0);
+      return !has_offset() &&
+	base % (alignment >> UNIT_SHIFT) == 0;
+    }
+    laddr_t checked_to_laddr() const {
+      assert(offset == 0);
+      return laddr_t(base);
+    }
+
+    template<std::unsigned_integral U>
+    U get_byte_distance(const laddr_t &l) const {
+      assert(offset < UNIT_SIZE);
+      if (base >= l.value) {
+	Unsigned udiff = base - l.value;
+	assert(udiff <= (std::numeric_limits<U>::max() >> UNIT_SHIFT));
+	return (static_cast<U>(udiff) << UNIT_SHIFT) + offset;
+      } else { // base < l.value
+	Unsigned udiff = l.value - base;
+	assert(udiff <= (std::numeric_limits<U>::max() >> UNIT_SHIFT));
+	return (static_cast<U>(udiff) << UNIT_SHIFT) - offset;
+      }
+    }
+
+    template<std::unsigned_integral U>
+    U get_byte_distance(const laddr_offset_t &l) const {
+      assert(offset < UNIT_SIZE);
+      if (*this >= l) {
+	Unsigned udiff = base - l.base;
+	assert(udiff <= (std::numeric_limits<U>::max() >> UNIT_SHIFT));
+	return ((static_cast<U>(udiff) << UNIT_SHIFT) + offset) - l.offset;
+      } else { // *this < l
+	Unsigned udiff = l.base - base;
+	assert(udiff <= (std::numeric_limits<U>::max() >> UNIT_SHIFT));
+	return ((static_cast<U>(udiff) << UNIT_SHIFT) + l.offset) - offset;
+      }
+    }
+
+    friend bool operator==(const laddr_offset_t&, const laddr_offset_t&) = default;
+    friend auto operator<=>(const laddr_offset_t&, const laddr_offset_t&) = default;
+    friend std::ostream &operator<<(std::ostream&, const laddr_offset_t&);
+    friend laddr_offset_t operator+(const laddr_offset_t &laddr_offset,
+				    const loffset_t &offset) {
+      // laddr_offset_t could access (laddr_t + loffset_t) overload.
+      return laddr_offset.get_laddr() + (laddr_offset.get_offset() + offset);
+    }
+    friend laddr_offset_t operator+(const loffset_t &offset,
+				    const laddr_offset_t &loffset) {
+      return loffset + offset;
+    }
+
+    friend laddr_offset_t operator-(const laddr_offset_t &laddr_offset,
+				    const loffset_t &offset) {
+      if (laddr_offset.get_offset() >= offset) {
+	return laddr_offset_t(
+	  laddr_offset.get_laddr(),
+	  laddr_offset.get_offset() - offset);
+      } else {
+	// laddr_offset_t could access (laddr_t - loffset_t) overload.
+	return laddr_offset.get_laddr()
+	    - (offset - laddr_offset.get_offset());
+      }
+    }
+
+    friend class laddr_t;
+  private:
+    // use Unsigned here to avoid incomplete type of laddr_t
+    Unsigned base;
+    extent_len_t offset;
+  };
+
+  template<std::unsigned_integral U>
+  U get_byte_distance(const laddr_offset_t &l) const {
+    if (value <= l.base) {
+      Unsigned udiff = l.base - value;
+      assert(udiff <= (std::numeric_limits<U>::max() >> UNIT_SHIFT));
+      return (static_cast<U>(udiff) << UNIT_SHIFT) + l.offset;
+    } else { // value > l.base
+      Unsigned udiff = value - l.base;
+      assert(udiff <= (std::numeric_limits<U>::max() >> UNIT_SHIFT));
+      return (static_cast<U>(udiff) << UNIT_SHIFT) - l.offset;
+    }
+  }
+
+  template<std::unsigned_integral U>
+  U get_byte_distance(const laddr_t &l) const {
+    Unsigned diff = value > l.value
+	? value - l.value
+	: l.value - value;
+    assert(diff <= (std::numeric_limits<U>::max() >> UNIT_SHIFT));
+    return static_cast<U>(diff) << UNIT_SHIFT;
+  }
+
+  friend std::ostream &operator<<(std::ostream &, const laddr_t &);
+  friend bool operator==(const laddr_t&, const laddr_t&) = default;
+  friend bool operator==(const laddr_t &laddr,
+			 const laddr_offset_t &laddr_offset) {
+    return laddr == laddr_offset.get_laddr()
+	&& 0 == laddr_offset.get_offset();
+  }
+  friend bool operator==(const laddr_offset_t &laddr_offset,
+			 const laddr_t &laddr) {
+    return laddr_offset.get_laddr() == laddr
+	&& laddr_offset.get_offset() == 0;
+  }
+  friend auto operator<=>(const laddr_t&, const laddr_t&) = default;
+  friend auto operator<=>(const laddr_t &laddr,
+			  const laddr_offset_t &laddr_offset) {
+    return laddr_offset_t(laddr, 0) <=> laddr_offset;
+  }
+  friend auto operator<=>(const laddr_offset_t &laddr_offset,
+			  const laddr_t &laddr) {
+    return laddr_offset <=> laddr_offset_t(laddr, 0);
+  }
+
+  friend laddr_offset_t operator+(const laddr_t &laddr,
+				  const loffset_t &offset) {
+    auto base = laddr;
+    base.value += offset >> laddr_t::UNIT_SHIFT;
+    assert(base.value >= laddr.value);
+    return laddr_offset_t(base, offset & laddr_t::UNIT_MASK);
+  }
+  friend laddr_offset_t operator+(const loffset_t &offset,
+				  const laddr_t &laddr) {
+    return laddr + offset;
+  }
+
+  friend laddr_offset_t operator-(const laddr_t &laddr, loffset_t offset) {
+    auto base = laddr;
+    auto diff = (offset + laddr_t::UNIT_SIZE - 1) >> laddr_t::UNIT_SHIFT;
+    base.value -= diff;
+    assert(base.value <= laddr.value);
+    offset = (diff << laddr_t::UNIT_SHIFT) - offset;
+    return laddr_offset_t(base, offset);
+  }
+
+  friend struct laddr_le_t;
+  friend struct pladdr_le_t;
+
+  struct laddr_hash_t {
+    std::size_t operator()(const laddr_t &laddr) const {
+      return static_cast<std::size_t>(laddr.value);
+    }
+  };
+private:
+  // Prevent direct construction of laddr_t with an integer,
+  // always use laddr_t::from_raw_uint instead.
+  constexpr explicit laddr_t(Unsigned value) : value(value) {}
+  Unsigned value;
+};
+using laddr_offset_t = laddr_t::laddr_offset_t;
+
+constexpr laddr_t L_ADDR_MAX = laddr_t::from_raw_uint(laddr_t::RAW_VALUE_MAX);
+constexpr laddr_t L_ADDR_MIN = laddr_t::from_raw_uint(0);
+constexpr laddr_t L_ADDR_NULL = L_ADDR_MAX;
+
+struct __attribute__((packed)) laddr_le_t {
+  ceph_le64 laddr;
+
+  using orig_type = laddr_t;
+
+  laddr_le_t() : laddr_le_t(L_ADDR_NULL) {}
+  laddr_le_t(const laddr_le_t &) = default;
+  explicit laddr_le_t(const laddr_t &addr)
+    : laddr(addr.value) {}
+
+  operator laddr_t() const {
+    return laddr_t(laddr);
+  }
+  laddr_le_t& operator=(laddr_t addr) {
+    ceph_le64 val;
+    val = addr.value;
+    laddr = val;
+    return *this;
+  }
+
+  bool operator==(const laddr_le_t&) const = default;
+};
+
+constexpr uint64_t PL_ADDR_NULL = std::numeric_limits<uint64_t>::max();
+
+struct pladdr_t {
+  std::variant<laddr_t, paddr_t> pladdr;
+
+  pladdr_t() = default;
+  pladdr_t(const pladdr_t &) = default;
+  pladdr_t(laddr_t laddr)
+    : pladdr(laddr) {}
+  pladdr_t(paddr_t paddr)
+    : pladdr(paddr) {}
+
+  bool is_laddr() const {
+    return pladdr.index() == 0;
+  }
+
+  bool is_paddr() const {
+    return pladdr.index() == 1;
+  }
+
+  pladdr_t& operator=(paddr_t paddr) {
+    pladdr = paddr;
+    return *this;
+  }
+
+  pladdr_t& operator=(laddr_t laddr) {
+    pladdr = laddr;
+    return *this;
+  }
+
+  bool operator==(const pladdr_t &) const = default;
+
+  paddr_t get_paddr() const {
+    assert(pladdr.index() == 1);
+    return paddr_t(std::get<1>(pladdr));
+  }
+
+  laddr_t get_laddr() const {
+    assert(pladdr.index() == 0);
+    return laddr_t(std::get<0>(pladdr));
+  }
+
+};
+
+std::ostream &operator<<(std::ostream &out, const pladdr_t &pladdr);
+
+enum class addr_type_t : uint8_t {
+  PADDR=0,
+  LADDR=1,
+  MAX=2	// or NONE
+};
+
+struct __attribute__((packed)) pladdr_le_t {
+  ceph_le64 pladdr = ceph_le64(PL_ADDR_NULL);
+  addr_type_t addr_type = addr_type_t::MAX;
+
+  pladdr_le_t() = default;
+  pladdr_le_t(const pladdr_le_t &) = default;
+  explicit pladdr_le_t(const pladdr_t &addr)
+    : pladdr(
+	ceph_le64(
+	  addr.is_laddr() ?
+	    std::get<0>(addr.pladdr).value :
+	    std::get<1>(addr.pladdr).internal_paddr)),
+      addr_type(
+	addr.is_laddr() ?
+	  addr_type_t::LADDR :
+	  addr_type_t::PADDR)
+  {}
+
+  operator pladdr_t() const {
+    if (addr_type == addr_type_t::LADDR) {
+      return pladdr_t(laddr_t(pladdr));
+    } else {
+      assert(addr_type == addr_type_t::PADDR);
+      return pladdr_t(paddr_t(pladdr));
+    }
+  }
+};
+
+template <typename T>
+struct min_max_t {};
+
+template <>
+struct min_max_t<laddr_t> {
+  static constexpr laddr_t max = L_ADDR_MAX;
+  static constexpr laddr_t min = L_ADDR_MIN;
+  static constexpr laddr_t null = L_ADDR_NULL;
+};
+
+template <>
+struct min_max_t<paddr_t> {
+  static constexpr paddr_t max = P_ADDR_MAX;
+  static constexpr paddr_t min = P_ADDR_MIN;
+  static constexpr paddr_t null = P_ADDR_NULL;
+};
+
+using extent_ref_count_t = uint32_t;
+constexpr extent_ref_count_t EXTENT_DEFAULT_REF_COUNT = 1;
+
+using extent_ref_count_le_t = ceph_le32;
 
 struct laddr_list_t : std::list<std::pair<laddr_t, extent_len_t>> {
   template <typename... T>
@@ -1058,23 +1463,25 @@ enum class extent_types_t : uint8_t {
   ROOT = 0,
   LADDR_INTERNAL = 1,
   LADDR_LEAF = 2,
-  OMAP_INNER = 3,
-  OMAP_LEAF = 4,
-  ONODE_BLOCK_STAGED = 5,
-  COLL_BLOCK = 6,
-  OBJECT_DATA_BLOCK = 7,
-  RETIRED_PLACEHOLDER = 8,
+  DINK_LADDR_LEAF = 3, // should only be used for unitttests
+  ROOT_META = 4,
+  OMAP_INNER = 5,
+  OMAP_LEAF = 6,
+  ONODE_BLOCK_STAGED = 7,
+  COLL_BLOCK = 8,
+  OBJECT_DATA_BLOCK = 9,
+  RETIRED_PLACEHOLDER = 10,
   // the following two types are not extent types,
   // they are just used to indicates paddr allocation deltas
-  ALLOC_INFO = 9,
-  JOURNAL_TAIL = 10,
+  ALLOC_INFO = 11,
+  JOURNAL_TAIL = 12,
   // Test Block Types
-  TEST_BLOCK = 11,
-  TEST_BLOCK_PHYSICAL = 12,
-  BACKREF_INTERNAL = 13,
-  BACKREF_LEAF = 14,
+  TEST_BLOCK = 13,
+  TEST_BLOCK_PHYSICAL = 14,
+  BACKREF_INTERNAL = 15,
+  BACKREF_LEAF = 16,
   // None and the number of valid extent_types_t
-  NONE = 15,
+  NONE = 17,
 };
 using extent_types_le_t = uint8_t;
 constexpr auto EXTENT_TYPES_MAX = static_cast<uint8_t>(extent_types_t::NONE);
@@ -1083,34 +1490,98 @@ constexpr size_t BACKREF_NODE_SIZE = 4096;
 
 std::ostream &operator<<(std::ostream &out, extent_types_t t);
 
+constexpr bool is_data_type(extent_types_t type) {
+  return type == extent_types_t::OBJECT_DATA_BLOCK ||
+         type == extent_types_t::TEST_BLOCK;
+}
+
+constexpr bool is_logical_metadata_type(extent_types_t type) {
+  return type >= extent_types_t::ROOT_META &&
+         type <= extent_types_t::COLL_BLOCK;
+}
+
 constexpr bool is_logical_type(extent_types_t type) {
-  switch (type) {
-  case extent_types_t::ROOT:
-  case extent_types_t::LADDR_INTERNAL:
-  case extent_types_t::LADDR_LEAF:
-  case extent_types_t::BACKREF_INTERNAL:
-  case extent_types_t::BACKREF_LEAF:
-    return false;
-  default:
+  if ((type >= extent_types_t::ROOT_META &&
+       type <= extent_types_t::OBJECT_DATA_BLOCK) ||
+      type == extent_types_t::TEST_BLOCK) {
+    assert(is_logical_metadata_type(type) ||
+           is_data_type(type));
     return true;
+  } else {
+    assert(!is_logical_metadata_type(type) &&
+           !is_data_type(type));
+    return false;
   }
 }
 
-constexpr bool is_retired_placeholder(extent_types_t type)
-{
+constexpr bool is_retired_placeholder_type(extent_types_t type) {
   return type == extent_types_t::RETIRED_PLACEHOLDER;
 }
 
-constexpr bool is_lba_node(extent_types_t type)
-{
-  return type == extent_types_t::LADDR_INTERNAL ||
-    type == extent_types_t::LADDR_LEAF;
+constexpr bool is_root_type(extent_types_t type) {
+  return type == extent_types_t::ROOT;
 }
 
-constexpr bool is_backref_node(extent_types_t type)
-{
+constexpr bool is_lba_node(extent_types_t type) {
+  return type == extent_types_t::LADDR_INTERNAL ||
+         type == extent_types_t::LADDR_LEAF ||
+         type == extent_types_t::DINK_LADDR_LEAF;
+}
+
+constexpr bool is_backref_node(extent_types_t type) {
   return type == extent_types_t::BACKREF_INTERNAL ||
-    type == extent_types_t::BACKREF_LEAF;
+         type == extent_types_t::BACKREF_LEAF;
+}
+
+constexpr bool is_lba_backref_node(extent_types_t type) {
+  return is_lba_node(type) || is_backref_node(type);
+}
+
+constexpr bool is_physical_type(extent_types_t type) {
+  if (type <= extent_types_t::DINK_LADDR_LEAF ||
+      (type >= extent_types_t::TEST_BLOCK_PHYSICAL &&
+       type <= extent_types_t::BACKREF_LEAF)) {
+    assert(is_root_type(type) ||
+           is_lba_backref_node(type) ||
+           type == extent_types_t::TEST_BLOCK_PHYSICAL);
+    return true;
+  } else {
+    assert(!is_root_type(type) &&
+           !is_lba_backref_node(type) &&
+           type != extent_types_t::TEST_BLOCK_PHYSICAL);
+    return false;
+  }
+}
+
+constexpr bool is_backref_mapped_type(extent_types_t type) {
+  if ((type >= extent_types_t::LADDR_INTERNAL &&
+       type <= extent_types_t::OBJECT_DATA_BLOCK) ||
+      type == extent_types_t::TEST_BLOCK ||
+      type == extent_types_t::TEST_BLOCK_PHYSICAL) {
+    assert(is_logical_type(type) ||
+	   is_lba_node(type) ||
+	   type == extent_types_t::TEST_BLOCK_PHYSICAL);
+    return true;
+  } else {
+    assert(!is_logical_type(type) &&
+	   !is_lba_node(type) &&
+	   type != extent_types_t::TEST_BLOCK_PHYSICAL);
+    return false;
+  }
+}
+
+constexpr bool is_real_type(extent_types_t type) {
+  if (type <= extent_types_t::OBJECT_DATA_BLOCK ||
+      (type >= extent_types_t::TEST_BLOCK &&
+       type <= extent_types_t::BACKREF_LEAF)) {
+    assert(is_logical_type(type) ||
+           is_physical_type(type));
+    return true;
+  } else {
+    assert(!is_logical_type(type) &&
+           !is_physical_type(type));
+    return false;
+  }
 }
 
 std::ostream &operator<<(std::ostream &out, extent_types_t t);
@@ -1144,15 +1615,6 @@ constexpr rewrite_gen_t OOL_GENERATION = 2;
 
 // All the rewritten extents start with MIN_REWRITE_GENERATION
 constexpr rewrite_gen_t MIN_REWRITE_GENERATION = 3;
-constexpr rewrite_gen_t MAX_REWRITE_GENERATION = 4;
-
-/**
- * TODO:
- * For tiering, might introduce 5 and 6 for the cold tier, and 1 ~ 4 for the
- * hot tier.
- */
-
-constexpr rewrite_gen_t REWRITE_GENERATIONS = MAX_REWRITE_GENERATION + 1;
 constexpr rewrite_gen_t NULL_GENERATION =
   std::numeric_limits<rewrite_gen_t>::max();
 
@@ -1168,16 +1630,20 @@ constexpr std::size_t generation_to_writer(rewrite_gen_t gen) {
 }
 
 // before EPM decision
-constexpr bool is_target_rewrite_generation(rewrite_gen_t gen) {
+constexpr bool is_target_rewrite_generation(
+  rewrite_gen_t gen,
+  rewrite_gen_t max_gen) {
   return gen == INIT_GENERATION ||
          (gen >= MIN_REWRITE_GENERATION &&
-          gen <= REWRITE_GENERATIONS);
+	  gen <= max_gen + 1);
 }
 
 // after EPM decision
-constexpr bool is_rewrite_generation(rewrite_gen_t gen) {
+constexpr bool is_rewrite_generation(
+  rewrite_gen_t gen,
+  rewrite_gen_t max_gen) {
   return gen >= INLINE_GENERATION &&
-         gen < REWRITE_GENERATIONS;
+	 gen <= max_gen;
 }
 
 enum class data_category_t : uint8_t {
@@ -1189,13 +1655,14 @@ enum class data_category_t : uint8_t {
 std::ostream &operator<<(std::ostream &out, data_category_t c);
 
 constexpr data_category_t get_extent_category(extent_types_t type) {
-  if (type == extent_types_t::OBJECT_DATA_BLOCK ||
-      type == extent_types_t::COLL_BLOCK) {
+  if (is_data_type(type)) {
     return data_category_t::DATA;
   } else {
     return data_category_t::METADATA;
   }
 }
+
+bool can_inplace_rewrite(extent_types_t type);
 
 // type for extent modification time, milliseconds since the epoch
 using sea_time_point = seastar::lowres_system_clock::time_point;
@@ -1254,8 +1721,8 @@ struct delta_info_t {
   extent_types_t type = extent_types_t::NONE;  ///< delta type
   paddr_t paddr;                               ///< physical address
   laddr_t laddr = L_ADDR_NULL;                 ///< logical address
-  uint32_t prev_crc = 0;
-  uint32_t final_crc = 0;
+  checksum_t prev_crc = 0;
+  checksum_t final_crc = 0;
   extent_len_t length = 0;                     ///< extent length
   extent_version_t pversion;                   ///< prior version
   segment_seq_t ext_seq;		       ///< seq of the extent's segment
@@ -1374,17 +1841,27 @@ struct __attribute__((packed)) object_data_le_t {
   }
 };
 
+enum class omap_type_t : uint8_t {
+  XATTR = 0,
+  OMAP,
+  LOG,
+  NONE
+};
+std::ostream &operator<<(std::ostream &out, const omap_type_t &type);
+
 struct omap_root_t {
   laddr_t addr = L_ADDR_NULL;
   depth_t depth = 0;
   laddr_t hint = L_ADDR_MIN;
   bool mutated = false;
+  omap_type_t type = omap_type_t::NONE;
 
   omap_root_t() = default;
-  omap_root_t(laddr_t addr, depth_t depth, laddr_t addr_min)
+  omap_root_t(laddr_t addr, depth_t depth, laddr_t addr_min, omap_type_t type)
     : addr(addr),
       depth(depth),
-      hint(addr_min) {}
+      hint(addr_min),
+      type(type) {}
 
   omap_root_t(const omap_root_t &o) = default;
   omap_root_t(omap_root_t &&o) = default;
@@ -1399,11 +1876,12 @@ struct omap_root_t {
     return mutated;
   }
   
-  void update(laddr_t _addr, depth_t _depth, laddr_t _hint) {
+  void update(laddr_t _addr, depth_t _depth, laddr_t _hint, omap_type_t _type) {
     mutated = true;
     addr = _addr;
     depth = _depth;
     hint = _hint;
+    type = _type;
   }
   
   laddr_t get_location() const {
@@ -1417,18 +1895,25 @@ struct omap_root_t {
   laddr_t get_hint() const {
     return hint;
   }
+
+  omap_type_t get_type() const {
+    return type;
+  }
 };
 std::ostream &operator<<(std::ostream &out, const omap_root_t &root);
 
 class __attribute__((packed)) omap_root_le_t {
   laddr_le_t addr = laddr_le_t(L_ADDR_NULL);
   depth_le_t depth = init_depth_le(0);
+  omap_type_t type = omap_type_t::NONE;
 
 public: 
   omap_root_le_t() = default;
   
-  omap_root_le_t(laddr_t addr, depth_t depth)
-    : addr(addr), depth(init_depth_le(depth)) {}
+  omap_root_le_t(laddr_t addr, depth_t depth, omap_type_t type)
+    : addr(addr), depth(init_depth_le(depth)), type(type) {}
+
+  omap_root_le_t(omap_type_t type) : type(type) {}
 
   omap_root_le_t(const omap_root_le_t &o) = default;
   omap_root_le_t(omap_root_le_t &&o) = default;
@@ -1438,10 +1923,15 @@ public:
   void update(const omap_root_t &nroot) {
     addr = nroot.get_location();
     depth = init_depth_le(nroot.get_depth());
+    type = nroot.get_type();
   }
   
   omap_root_t get(laddr_t hint) const {
-    return omap_root_t(addr, depth, hint);
+    return omap_root_t(addr, depth, hint, type);
+  }
+  
+  omap_type_t get_type() const {
+    return type;
   }
 };
 
@@ -1563,54 +2053,29 @@ using backref_root_t = phy_tree_root_t;
  * TODO: generalize this to permit more than one lba_manager implementation
  */
 struct __attribute__((packed)) root_t {
-  using meta_t = std::map<std::string, std::string>;
-
-  static constexpr int MAX_META_LENGTH = 1024;
-
   backref_root_t backref_root;
   lba_root_t lba_root;
   laddr_le_t onode_root;
   coll_root_le_t collection_root;
+  laddr_le_t meta;
 
-  char meta[MAX_META_LENGTH];
-
-  root_t() {
-    set_meta(meta_t{});
-  }
+  root_t() = default;
 
   void adjust_addrs_from_base(paddr_t base) {
     lba_root.adjust_addrs_from_base(base);
     backref_root.adjust_addrs_from_base(base);
   }
-
-  meta_t get_meta() {
-    bufferlist bl;
-    bl.append(ceph::buffer::create_static(MAX_META_LENGTH, meta));
-    meta_t ret;
-    auto iter = bl.cbegin();
-    decode(ret, iter);
-    return ret;
-  }
-
-  void set_meta(const meta_t &m) {
-    ceph::bufferlist bl;
-    encode(m, bl);
-    ceph_assert(bl.length() < MAX_META_LENGTH);
-    bl.rebuild();
-    auto &bptr = bl.front();
-    ::memset(meta, 0, MAX_META_LENGTH);
-    ::memcpy(meta, bptr.c_str(), bl.length());
-  }
 };
 
 struct alloc_blk_t {
   alloc_blk_t(
-    paddr_t paddr,
-    laddr_t laddr,
+    const paddr_t& paddr,
+    const laddr_t& laddr,
     extent_len_t len,
     extent_types_t type)
-    : paddr(paddr), laddr(laddr), len(len), type(type)
-  {}
+    : paddr(paddr), laddr(laddr), len(len), type(type) {
+    assert(len > 0);
+  }
 
   explicit alloc_blk_t() = default;
 
@@ -1625,6 +2090,26 @@ struct alloc_blk_t {
     denc(v.len, p);
     denc(v.type, p);
     DENC_FINISH(p);
+  }
+
+  static alloc_blk_t create_alloc(
+      const paddr_t& paddr,
+      const laddr_t& laddr,
+      extent_len_t len,
+      extent_types_t type) {
+    assert(is_backref_mapped_type(type));
+    assert(laddr != L_ADDR_NULL);
+    return alloc_blk_t(paddr, laddr, len, type);
+  }
+
+  static alloc_blk_t create_retire(
+      const paddr_t& paddr,
+      extent_len_t len,
+      extent_types_t type) {
+    assert(is_backref_mapped_type(type) ||
+	   is_backref_node(type) ||
+	   is_retired_placeholder_type(type));
+    return alloc_blk_t(paddr, L_ADDR_NULL, len, type);
   }
 };
 
@@ -1682,6 +2167,8 @@ using segment_nonce_t = uint32_t;
  * 4) Replay from the latest tails
  */
 struct segment_header_t {
+  mod_time_point_t modify_time;
+
   segment_seq_t segment_seq;
   segment_id_t physical_segment_id; // debugging
 
@@ -1700,6 +2187,7 @@ struct segment_header_t {
 
   DENC(segment_header_t, v, p) {
     DENC_START(1, 1, p);
+    denc(v.modify_time, p);
     denc(v.segment_seq, p);
     denc(v.physical_segment_id, p);
     denc(v.dirty_tail, p);
@@ -1746,7 +2234,8 @@ enum class transaction_type_t : uint8_t {
   READ, // including weak and non-weak read transactions
   TRIM_DIRTY,
   TRIM_ALLOC,
-  CLEANER,
+  CLEANER_MAIN,
+  CLEANER_COLD,
   MAX
 };
 
@@ -1761,6 +2250,10 @@ constexpr bool is_valid_transaction(transaction_type_t type) {
   return type < transaction_type_t::MAX;
 }
 
+constexpr bool is_user_transaction(transaction_type_t type) {
+  return type <= transaction_type_t::READ;
+}
+
 constexpr bool is_background_transaction(transaction_type_t type) {
   return (type >= transaction_type_t::TRIM_DIRTY &&
           type < transaction_type_t::MAX);
@@ -1771,7 +2264,25 @@ constexpr bool is_trim_transaction(transaction_type_t type) {
       type == transaction_type_t::TRIM_ALLOC);
 }
 
+constexpr bool is_modify_transaction(transaction_type_t type) {
+  return (type == transaction_type_t::MUTATE ||
+      is_background_transaction(type));
+}
+
+// Note: It is possible to statically introduce structs for OOL, which must be
+// more efficient, but that requires to specialize the RecordSubmitter as well.
+// Let's delay this optimization until necessary.
+enum class record_type_t {
+  JOURNAL = 0,
+  OOL, // no header, no metadata, so no padding
+  MAX
+};
+std::ostream &operator<<(std::ostream&, const record_type_t&);
+
+static constexpr auto RECORD_TYPE_NULL = record_type_t::MAX;
+
 struct record_size_t {
+  record_type_t record_type = RECORD_TYPE_NULL; // must not be NULL in use
   extent_len_t plain_mdlength = 0; // mdlength without the record header
   extent_len_t dlength = 0;
 
@@ -1795,22 +2306,30 @@ struct record_size_t {
 std::ostream &operator<<(std::ostream&, const record_size_t&);
 
 struct record_t {
-  transaction_type_t type = TRANSACTION_TYPE_NULL;
+  transaction_type_t trans_type = TRANSACTION_TYPE_NULL;
   std::vector<extent_t> extents;
   std::vector<delta_info_t> deltas;
   record_size_t size;
   sea_time_point modify_time = NULL_TIME;
 
-  record_t(transaction_type_t type) : type{type} { }
+  record_t(record_type_t r_type,
+           transaction_type_t t_type)
+  : trans_type{t_type} {
+    assert(r_type != RECORD_TYPE_NULL);
+    size.record_type = r_type;
+  }
 
   // unit test only
   record_t() {
-    type = transaction_type_t::MUTATE;
+    trans_type = transaction_type_t::MUTATE;
+    size.record_type = record_type_t::JOURNAL;
   }
 
   // unit test only
   record_t(std::vector<extent_t>&& _extents,
            std::vector<delta_info_t>&& _deltas) {
+    trans_type = transaction_type_t::MUTATE;
+    size.record_type = record_type_t::JOURNAL;
     auto modify_time = seastar::lowres_system_clock::now();
     for (auto& e: _extents) {
       push_back(std::move(e), modify_time);
@@ -1818,7 +2337,6 @@ struct record_t {
     for (auto& d: _deltas) {
       push_back(std::move(d));
     }
-    type = transaction_type_t::MUTATE;
   }
 
   bool is_empty() const {
@@ -1827,6 +2345,13 @@ struct record_t {
   }
 
   std::size_t get_delta_size() const {
+    assert(size.record_type < record_type_t::MAX);
+    if (size.record_type == record_type_t::OOL) {
+      // OOL won't contain metadata
+      assert(deltas.size() == 0);
+      return 0;
+    }
+    // JOURNAL
     auto delta_size = std::accumulate(
         deltas.begin(), deltas.end(), 0,
         [](uint64_t sum, auto& delta) {
@@ -1896,6 +2421,7 @@ struct record_group_header_t {
 std::ostream& operator<<(std::ostream&, const record_group_header_t&);
 
 struct record_group_size_t {
+  record_type_t record_type = RECORD_TYPE_NULL; // must not be NULL in use
   extent_len_t plain_mdlength = 0; // mdlength without the group header
   extent_len_t dlength = 0;
   extent_len_t block_size = 0;
@@ -1911,7 +2437,14 @@ struct record_group_size_t {
 
   extent_len_t get_mdlength() const {
     assert(block_size > 0);
-    return p2roundup(get_raw_mdlength(), block_size);
+    assert(record_type < record_type_t::MAX);
+    if (record_type == record_type_t::JOURNAL) {
+      return p2roundup(get_raw_mdlength(), block_size);
+    } else {
+      // OOL won't contain metadata
+      assert(get_raw_mdlength() == 0);
+      return 0;
+    }
   }
 
   extent_len_t get_encoded_length() const {
@@ -2045,6 +2578,7 @@ struct scan_valid_records_cursor {
   journal_seq_t seq;
   journal_seq_t last_committed;
   std::size_t num_consumed_records = 0;
+  extent_len_t block_size = 0;
 
   struct found_record_group_t {
     paddr_t offset;
@@ -2071,10 +2605,12 @@ struct scan_valid_records_cursor {
     return seq.offset.as_seg_paddr().get_segment_off();
   }
 
+  extent_len_t get_block_size() const {
+    return block_size;
+  }
+
   void increment_seq(segment_off_t off) {
-    auto& seg_addr = seq.offset.as_seg_paddr();
-    seg_addr.set_segment_off(
-      seg_addr.get_segment_off() + off);
+    seq.offset = seq.offset.add_offset(off);
   }
 
   void emplace_record_group(const record_group_header_t&, ceph::bufferlist&&);
@@ -2091,10 +2627,489 @@ struct scan_valid_records_cursor {
 };
 std::ostream& operator<<(std::ostream&, const scan_valid_records_cursor&);
 
+template <typename CounterT>
+using counter_by_src_t = std::array<CounterT, TRANSACTION_TYPE_MAX>;
+
+template <typename CounterT>
+CounterT& get_by_src(
+    counter_by_src_t<CounterT>& counters_by_src,
+    transaction_type_t src) {
+  assert(static_cast<std::size_t>(src) < counters_by_src.size());
+  return counters_by_src[static_cast<std::size_t>(src)];
+}
+
+template <typename CounterT>
+const CounterT& get_by_src(
+    const counter_by_src_t<CounterT>& counters_by_src,
+    transaction_type_t src) {
+  assert(static_cast<std::size_t>(src) < counters_by_src.size());
+  return counters_by_src[static_cast<std::size_t>(src)];
+}
+
+template <typename CounterT>
+void add_srcs(counter_by_src_t<CounterT>& base,
+              const counter_by_src_t<CounterT>& by) {
+  for (std::size_t i=0; i<TRANSACTION_TYPE_MAX; ++i) {
+    base[i] += by[i];
+  }
+}
+
+template <typename CounterT>
+void minus_srcs(counter_by_src_t<CounterT>& base,
+                const counter_by_src_t<CounterT>& by) {
+  for (std::size_t i=0; i<TRANSACTION_TYPE_MAX; ++i) {
+    base[i] -= by[i];
+  }
+}
+
+template <typename CounterT>
+using counter_by_extent_t = std::array<CounterT, EXTENT_TYPES_MAX>;
+
+template <typename CounterT>
+CounterT& get_by_ext(
+    counter_by_extent_t<CounterT>& counters_by_ext,
+    extent_types_t ext) {
+  auto index = static_cast<uint8_t>(ext);
+  assert(index < EXTENT_TYPES_MAX);
+  return counters_by_ext[index];
+}
+
+template <typename CounterT>
+const CounterT& get_by_ext(
+    const counter_by_extent_t<CounterT>& counters_by_ext,
+    extent_types_t ext) {
+  auto index = static_cast<uint8_t>(ext);
+  assert(index < EXTENT_TYPES_MAX);
+  return counters_by_ext[index];
+}
+
+struct grouped_io_stats {
+  uint64_t num_io = 0;
+  uint64_t num_io_grouped = 0;
+
+  double average() const {
+    return static_cast<double>(num_io_grouped)/num_io;
+  }
+
+  bool is_empty() const {
+    return num_io == 0;
+  }
+
+  void add(const grouped_io_stats &o) {
+    num_io += o.num_io;
+    num_io_grouped += o.num_io_grouped;
+  }
+
+  void minus(const grouped_io_stats &o) {
+    num_io -= o.num_io;
+    num_io_grouped -= o.num_io_grouped;
+  }
+
+  void increment(uint64_t num_grouped_io) {
+    add({1, num_grouped_io});
+  }
+};
+
+struct device_stats_t {
+  uint64_t num_io = 0;
+  uint64_t total_depth = 0;
+  uint64_t total_bytes = 0;
+
+  void add(const device_stats_t& other) {
+    num_io += other.num_io;
+    total_depth += other.total_depth;
+    total_bytes += other.total_bytes;
+  }
+};
+
+struct trans_writer_stats_t {
+  uint64_t num_records = 0;
+  uint64_t metadata_bytes = 0;
+  uint64_t data_bytes = 0;
+
+  bool is_empty() const {
+    return num_records == 0;
+  }
+
+  uint64_t get_total_bytes() const {
+    return metadata_bytes + data_bytes;
+  }
+
+  trans_writer_stats_t&
+  operator+=(const trans_writer_stats_t& o) {
+    num_records += o.num_records;
+    metadata_bytes += o.metadata_bytes;
+    data_bytes += o.data_bytes;
+    return *this;
+  }
+
+  trans_writer_stats_t&
+  operator-=(const trans_writer_stats_t& o) {
+    num_records -= o.num_records;
+    metadata_bytes -= o.metadata_bytes;
+    data_bytes -= o.data_bytes;
+    return *this;
+  }
+};
+struct tw_stats_printer_t {
+  double seconds;
+  const trans_writer_stats_t &stats;
+};
+std::ostream& operator<<(std::ostream&, const tw_stats_printer_t&);
+
+struct writer_stats_t {
+  grouped_io_stats record_batch_stats;
+  grouped_io_stats io_depth_stats;
+  uint64_t record_group_padding_bytes = 0;
+  uint64_t record_group_metadata_bytes = 0;
+  uint64_t data_bytes = 0;
+  counter_by_src_t<trans_writer_stats_t> stats_by_src;
+
+  bool is_empty() const {
+    return io_depth_stats.is_empty();
+  }
+
+  uint64_t get_total_bytes() const {
+    return record_group_padding_bytes +
+           record_group_metadata_bytes +
+           data_bytes;
+  }
+
+  void add(const writer_stats_t &o) {
+    record_batch_stats.add(o.record_batch_stats);
+    io_depth_stats.add(o.io_depth_stats);
+    record_group_padding_bytes += o.record_group_padding_bytes;
+    record_group_metadata_bytes += o.record_group_metadata_bytes;
+    data_bytes += o.data_bytes;
+    add_srcs(stats_by_src, o.stats_by_src);
+  }
+
+  void minus(const writer_stats_t &o) {
+    record_batch_stats.minus(o.record_batch_stats);
+    io_depth_stats.minus(o.io_depth_stats);
+    record_group_padding_bytes -= o.record_group_padding_bytes;
+    record_group_metadata_bytes -= o.record_group_metadata_bytes;
+    data_bytes -= o.data_bytes;
+    minus_srcs(stats_by_src, o.stats_by_src);
+  }
+};
+struct writer_stats_printer_t {
+  double seconds;
+  const writer_stats_t &stats;
+};
+std::ostream& operator<<(std::ostream&, const writer_stats_printer_t&);
+
+struct shard_stats_t {
+  // transaction_type_t::MUTATE
+  uint64_t io_num = 0;
+  uint64_t repeat_io_num = 0;
+  uint64_t pending_io_num = 0;
+  uint64_t starting_io_num = 0;
+  uint64_t waiting_collock_io_num = 0;
+  uint64_t waiting_throttler_io_num = 0;
+  uint64_t processing_inlock_io_num = 0;
+  uint64_t processing_postlock_io_num = 0;
+
+  // transaction_type_t::READ
+  uint64_t read_num = 0;
+  uint64_t repeat_read_num = 0;
+  uint64_t pending_read_num = 0;
+
+  // transaction_type_t::TRIM_DIRTY~CLEANER_COLD
+  uint64_t pending_bg_num = 0;
+  uint64_t trim_alloc_num = 0;
+  uint64_t repeat_trim_alloc_num = 0;
+  uint64_t trim_dirty_num = 0;
+  uint64_t repeat_trim_dirty_num = 0;
+  uint64_t cleaner_main_num = 0;
+  uint64_t repeat_cleaner_main_num = 0;
+  uint64_t cleaner_cold_num = 0;
+  uint64_t repeat_cleaner_cold_num = 0;
+
+  uint64_t flush_num = 0;
+  uint64_t pending_flush_num = 0;
+
+  uint64_t get_bg_num() const {
+    return trim_alloc_num +
+           trim_dirty_num +
+           cleaner_main_num +
+           cleaner_cold_num;
+  }
+
+  uint64_t get_repeat_bg_num() const {
+    return repeat_trim_alloc_num +
+           repeat_trim_dirty_num +
+           repeat_cleaner_main_num +
+           repeat_cleaner_cold_num;
+  }
+
+  void add(const shard_stats_t &o) {
+    io_num += o.io_num;
+    repeat_io_num += o.repeat_io_num;
+    pending_io_num += o.pending_io_num;
+    starting_io_num += o.starting_io_num;
+    waiting_collock_io_num += o.waiting_collock_io_num;
+    waiting_throttler_io_num += o.waiting_throttler_io_num;
+    processing_inlock_io_num += o.processing_inlock_io_num;
+    processing_postlock_io_num += o.processing_postlock_io_num;
+
+    read_num += o.read_num;
+    repeat_read_num += o.repeat_read_num;
+    pending_read_num += o.pending_read_num;
+
+    pending_bg_num += o.pending_bg_num;
+    trim_alloc_num += o.trim_alloc_num;
+    repeat_trim_alloc_num += o.repeat_trim_alloc_num;
+    trim_dirty_num += o.trim_dirty_num;
+    repeat_trim_dirty_num += o.repeat_trim_dirty_num;
+    cleaner_main_num += o.cleaner_main_num;
+    repeat_cleaner_main_num += o.repeat_cleaner_main_num;
+    cleaner_cold_num += o.cleaner_cold_num;
+    repeat_cleaner_cold_num += o.repeat_cleaner_cold_num;
+
+    flush_num += o.flush_num;
+    pending_flush_num += o.pending_flush_num;
+  }
+
+  void minus(const shard_stats_t &o) {
+    // realtime(e.g. pending) stats are not related
+    io_num -= o.io_num;
+    repeat_io_num -= o.repeat_io_num;
+    read_num -= o.read_num;
+    repeat_read_num -= o.repeat_read_num;
+    trim_alloc_num -= o.trim_alloc_num;
+    repeat_trim_alloc_num -= o.repeat_trim_alloc_num;
+    trim_dirty_num -= o.trim_dirty_num;
+    repeat_trim_dirty_num -= o.repeat_trim_dirty_num;
+    cleaner_main_num -= o.cleaner_main_num;
+    repeat_cleaner_main_num -= o.repeat_cleaner_main_num;
+    cleaner_cold_num -= o.cleaner_cold_num;
+    repeat_cleaner_cold_num -= o.repeat_cleaner_cold_num;
+    flush_num -= o.flush_num;
+  }
+};
+
+struct cache_size_stats_t {
+  uint64_t size = 0;
+  uint64_t num_extents = 0;
+
+  bool is_empty() const {
+    return num_extents == 0;
+  }
+
+  double get_mb() const {
+    return (size>>12)/static_cast<double>(256);
+  }
+
+  double get_avg_kb() const {
+    return (size>>10)/static_cast<double>(num_extents);
+  }
+
+  void account_in(extent_len_t sz) {
+    size += sz;
+    ++num_extents;
+  }
+
+  void account_parital_in(extent_len_t sz) {
+    size += sz;
+  }
+
+  void account_out(extent_len_t sz) {
+    assert(size >= sz);
+    assert(num_extents > 0);
+    size -= sz;
+    --num_extents;
+  }
+
+  void add(const cache_size_stats_t& o) {
+    size += o.size;
+    num_extents += o.num_extents;
+  }
+
+  void minus(const cache_size_stats_t& o) {
+    size -= o.size;
+    num_extents -= o.num_extents;
+  }
+
+  void divide_by(unsigned d) {
+    size /= d;
+    num_extents /= d;
+  }
+};
+std::ostream& operator<<(std::ostream&, const cache_size_stats_t&);
+struct cache_size_stats_printer_t {
+  double seconds;
+  const cache_size_stats_t& stats;
+};
+std::ostream& operator<<(std::ostream&, const cache_size_stats_printer_t&);
+
+struct cache_io_stats_t {
+  cache_size_stats_t in_sizes;
+  cache_size_stats_t out_sizes;
+
+  bool is_empty() const {
+    return in_sizes.is_empty() && out_sizes.is_empty();
+  }
+
+  void add(const cache_io_stats_t& o) {
+    in_sizes.add(o.in_sizes);
+    out_sizes.add(o.out_sizes);
+  }
+
+  void minus(const cache_io_stats_t& o) {
+    in_sizes.minus(o.in_sizes);
+    out_sizes.minus(o.out_sizes);
+  }
+
+  void divide_by(unsigned d) {
+    in_sizes.divide_by(d);
+    out_sizes.divide_by(d);
+  }
+};
+struct cache_io_stats_printer_t {
+  double seconds;
+  const cache_io_stats_t& stats;
+};
+std::ostream& operator<<(std::ostream&, const cache_io_stats_printer_t&);
+
+struct dirty_io_stats_t {
+  cache_size_stats_t in_sizes;
+  uint64_t num_replace = 0;
+  cache_size_stats_t out_sizes;
+  uint64_t out_versions = 0;
+
+  double get_avg_out_version() const {
+    return out_versions/static_cast<double>(out_sizes.num_extents);
+  }
+
+  bool is_empty() const {
+    return in_sizes.is_empty() &&
+           num_replace == 0 &&
+           out_sizes.is_empty();
+  }
+
+  void add(const dirty_io_stats_t& o) {
+    in_sizes.add(o.in_sizes);
+    num_replace += o.num_replace;
+    out_sizes.add(o.out_sizes);
+    out_versions += o.out_versions;
+  }
+
+  void minus(const dirty_io_stats_t& o) {
+    in_sizes.minus(o.in_sizes);
+    num_replace -= o.num_replace;
+    out_sizes.minus(o.out_sizes);
+    out_versions -= o.out_versions;
+  }
+
+  void divide_by(unsigned d) {
+    in_sizes.divide_by(d);
+    num_replace /= d;
+    out_sizes.divide_by(d);
+    out_versions /= d;
+  }
+};
+struct dirty_io_stats_printer_t {
+  double seconds;
+  const dirty_io_stats_t& stats;
+};
+std::ostream& operator<<(std::ostream&, const dirty_io_stats_printer_t&);
+
+/*
+ * Doesn't account:
+ *   replay
+ *   rewrite
+ *   retiring/placeholder
+ *   get_caching_extent() -- test only
+ *   get_caching_extent_by_type() -- test only
+ */
+struct cache_access_stats_t {
+  uint64_t trans_pending = 0;
+  uint64_t trans_dirty = 0;
+  uint64_t trans_lru = 0;
+  uint64_t cache_dirty = 0;
+  uint64_t cache_lru = 0;
+
+  uint64_t load_absent = 0;
+  uint64_t load_present = 0;
+
+  uint64_t get_trans_hit() const {
+    return trans_pending + trans_dirty + trans_lru;
+  }
+
+  uint64_t get_cache_hit() const {
+    return cache_dirty + cache_lru;
+  }
+
+  uint64_t get_cache_access() const {
+    return get_cache_hit() + load_absent;
+  }
+
+  uint64_t get_total_access() const {
+    return get_trans_hit() + get_cache_access();
+  }
+
+  bool is_empty() const {
+    return get_total_access() == 0;
+  }
+
+  void add(const cache_access_stats_t& o) {
+    trans_pending += o.trans_pending;
+    trans_dirty += o.trans_dirty;
+    trans_lru += o.trans_lru;
+    cache_dirty += o.cache_dirty;
+    cache_lru += o.cache_lru;
+    load_absent += o.load_absent;
+    load_present += o.load_present;
+  }
+
+  void minus(const cache_access_stats_t& o) {
+    trans_pending -= o.trans_pending;
+    trans_dirty -= o.trans_dirty;
+    trans_lru -= o.trans_lru;
+    cache_dirty -= o.cache_dirty;
+    cache_lru -= o.cache_lru;
+    load_absent -= o.load_absent;
+    load_present -= o.load_present;
+  }
+
+  void divide_by(unsigned d) {
+    trans_pending /= d;
+    trans_dirty /= d;
+    trans_lru /= d;
+    cache_dirty /= d;
+    cache_lru /= d;
+    load_absent /= d;
+    load_present /= d;
+  }
+};
+struct cache_access_stats_printer_t {
+  double seconds;
+  const cache_access_stats_t& stats;
+};
+std::ostream& operator<<(std::ostream&, const cache_access_stats_printer_t&);
+
+struct cache_stats_t {
+  cache_size_stats_t pinboard_sizes;
+  cache_io_stats_t pinboard_io;
+  cache_size_stats_t dirty_sizes;
+  dirty_io_stats_t dirty_io;
+  cache_access_stats_t access;
+
+  void add(const cache_stats_t& o) {
+    pinboard_sizes.add(o.pinboard_sizes);
+    pinboard_io.add(o.pinboard_io);
+    dirty_sizes.add(o.dirty_sizes);
+    dirty_io.add(o.dirty_io);
+    access.add(o.access);
+  }
+};
+
 }
 
 WRITE_CLASS_DENC_BOUNDED(crimson::os::seastore::seastore_meta_t)
 WRITE_CLASS_DENC_BOUNDED(crimson::os::seastore::segment_id_t)
+WRITE_CLASS_DENC_BOUNDED(crimson::os::seastore::laddr_t)
 WRITE_CLASS_DENC_BOUNDED(crimson::os::seastore::paddr_t)
 WRITE_CLASS_DENC_BOUNDED(crimson::os::seastore::journal_seq_t)
 WRITE_CLASS_DENC_BOUNDED(crimson::os::seastore::delta_info_t)
@@ -2108,21 +3123,31 @@ WRITE_CLASS_DENC_BOUNDED(crimson::os::seastore::alloc_delta_t)
 WRITE_CLASS_DENC_BOUNDED(crimson::os::seastore::segment_tail_t)
 
 #if FMT_VERSION >= 90000
+template <> struct fmt::formatter<crimson::os::seastore::cache_access_stats_printer_t> : fmt::ostream_formatter {};
+template <> struct fmt::formatter<crimson::os::seastore::cache_io_stats_printer_t> : fmt::ostream_formatter {};
+template <> struct fmt::formatter<crimson::os::seastore::cache_size_stats_t> : fmt::ostream_formatter {};
+template <> struct fmt::formatter<crimson::os::seastore::cache_size_stats_printer_t> : fmt::ostream_formatter {};
 template <> struct fmt::formatter<crimson::os::seastore::data_category_t> : fmt::ostream_formatter {};
 template <> struct fmt::formatter<crimson::os::seastore::delta_info_t> : fmt::ostream_formatter {};
 template <> struct fmt::formatter<crimson::os::seastore::device_id_printer_t> : fmt::ostream_formatter {};
+template <> struct fmt::formatter<crimson::os::seastore::dirty_io_stats_printer_t> : fmt::ostream_formatter {};
 template <> struct fmt::formatter<crimson::os::seastore::extent_types_t> : fmt::ostream_formatter {};
 template <> struct fmt::formatter<crimson::os::seastore::journal_seq_t> : fmt::ostream_formatter {};
 template <> struct fmt::formatter<crimson::os::seastore::journal_tail_delta_t> : fmt::ostream_formatter {};
+template <> struct fmt::formatter<crimson::os::seastore::laddr_t> : fmt::ostream_formatter {};
+template <> struct fmt::formatter<crimson::os::seastore::laddr_offset_t> : fmt::ostream_formatter {};
 template <> struct fmt::formatter<crimson::os::seastore::laddr_list_t> : fmt::ostream_formatter {};
 template <> struct fmt::formatter<crimson::os::seastore::omap_root_t> : fmt::ostream_formatter {};
 template <> struct fmt::formatter<crimson::os::seastore::paddr_list_t> : fmt::ostream_formatter {};
 template <> struct fmt::formatter<crimson::os::seastore::paddr_t> : fmt::ostream_formatter {};
+template <> struct fmt::formatter<crimson::os::seastore::pladdr_t> : fmt::ostream_formatter {};
 template <> struct fmt::formatter<crimson::os::seastore::placement_hint_t> : fmt::ostream_formatter {};
+template <> struct fmt::formatter<crimson::os::seastore::device_type_t> : fmt::ostream_formatter {};
 template <> struct fmt::formatter<crimson::os::seastore::record_group_header_t> : fmt::ostream_formatter {};
 template <> struct fmt::formatter<crimson::os::seastore::record_group_size_t> : fmt::ostream_formatter {};
 template <> struct fmt::formatter<crimson::os::seastore::record_header_t> : fmt::ostream_formatter {};
 template <> struct fmt::formatter<crimson::os::seastore::record_locator_t> : fmt::ostream_formatter {};
+template <> struct fmt::formatter<crimson::os::seastore::record_type_t> : fmt::ostream_formatter {};
 template <> struct fmt::formatter<crimson::os::seastore::record_t> : fmt::ostream_formatter {};
 template <> struct fmt::formatter<crimson::os::seastore::rewrite_gen_printer_t> : fmt::ostream_formatter {};
 template <> struct fmt::formatter<crimson::os::seastore::scan_valid_records_cursor> : fmt::ostream_formatter {};
@@ -2134,5 +3159,22 @@ template <> struct fmt::formatter<crimson::os::seastore::segment_tail_t> : fmt::
 template <> struct fmt::formatter<crimson::os::seastore::segment_type_t> : fmt::ostream_formatter {};
 template <> struct fmt::formatter<crimson::os::seastore::transaction_type_t> : fmt::ostream_formatter {};
 template <> struct fmt::formatter<crimson::os::seastore::write_result_t> : fmt::ostream_formatter {};
+template <> struct fmt::formatter<crimson::os::seastore::omap_type_t> : fmt::ostream_formatter {};
 template <> struct fmt::formatter<ceph::buffer::list> : fmt::ostream_formatter {};
 #endif
+
+template <>
+struct std::hash<crimson::os::seastore::laddr_t> {
+  using Laddr = crimson::os::seastore::laddr_t;
+  std::size_t operator()(const Laddr &laddr) const {
+    return Laddr::laddr_hash_t()(laddr);
+  }
+};
+
+template <>
+struct boost::hash<crimson::os::seastore::laddr_t> {
+  using Laddr = crimson::os::seastore::laddr_t;
+  std::size_t operator()(const Laddr &laddr) const {
+    return Laddr::laddr_hash_t()(laddr);
+  }
+};

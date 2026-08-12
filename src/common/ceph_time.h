@@ -16,12 +16,10 @@
 #define COMMON_CEPH_TIME_H
 
 #include <chrono>
-#include <iostream>
+#include <iosfwd>
 #include <string>
 #include <optional>
-#if FMT_VERSION >= 90000
-#include <fmt/ostream.h>
-#endif
+#include <fmt/chrono.h>
 #include <sys/time.h>
 
 #if defined(__APPLE__)
@@ -34,9 +32,22 @@ int clock_gettime(int clk_id, struct timespec *tp);
 #endif
 
 #ifdef _WIN32
-#define CLOCK_REALTIME_COARSE CLOCK_REALTIME
-#define CLOCK_MONOTONIC_COARSE CLOCK_MONOTONIC
-// MINGW uses the QueryPerformanceCounter API behind the scenes.
+// Clock precision:
+// mingw < 8.0.1:
+//   * CLOCK_REALTIME: ~10-55ms (GetSystemTimeAsFileTime)
+// mingw >= 8.0.1:
+//   * CLOCK_REALTIME: <1us (GetSystemTimePreciseAsFileTime)
+//   * CLOCK_REALTIME_COARSE: ~10-55ms (GetSystemTimeAsFileTime)
+//
+// * CLOCK_MONOTONIC: <1us if TSC is usable, ~10-55ms otherwise
+//                    (QueryPerformanceCounter)
+// https://github.com/mirror/mingw-w64/commit/dcd990ed423381cf35702df9495d44f1979ebe50
+#ifndef CLOCK_REALTIME_COARSE
+  #define CLOCK_REALTIME_COARSE CLOCK_REALTIME
+#endif
+#ifndef CLOCK_MONOTONIC_COARSE
+  #define CLOCK_MONOTONIC_COARSE CLOCK_MONOTONIC
+#endif
 #endif
 
 struct ceph_timespec;
@@ -105,11 +116,11 @@ public:
   }
 
   static bool is_zero(const time_point& t) {
-    return (t == time_point::min());
+    return (t == zero());
   }
 
   static time_point zero() {
-    return time_point::min();
+    return time_point();
   }
 
   // Allow conversion to/from any clock with the same interface as
@@ -208,11 +219,11 @@ public:
   }
 
   static bool is_zero(const time_point& t) {
-    return (t == time_point::min());
+    return (t == zero());
   }
 
   static time_point zero() {
-    return time_point::min();
+    return time_point();
   }
 
   static time_t to_time_t(const time_point& t) noexcept {
@@ -269,7 +280,7 @@ public:
 // High-resolution monotonic clock
 class mono_clock {
 public:
-  typedef timespan duration;
+  typedef signedspan duration;
   typedef duration::rep rep;
   typedef duration::period period;
   typedef std::chrono::time_point<mono_clock> time_point;
@@ -283,11 +294,11 @@ public:
   }
 
   static bool is_zero(const time_point& t) {
-    return (t == time_point::min());
+    return (t == zero());
   }
 
   static time_point zero() {
-    return time_point::min();
+    return time_point();
   }
 };
 
@@ -295,7 +306,7 @@ public:
 // monotonic clock
 class coarse_mono_clock {
 public:
-  typedef timespan duration;
+  typedef signedspan duration;
   typedef duration::rep rep;
   typedef duration::period period;
   typedef std::chrono::time_point<coarse_mono_clock> time_point;
@@ -320,11 +331,28 @@ public:
   }
 
   static bool is_zero(const time_point& t) {
-    return (t == time_point::min());
+    return (t == zero());
   }
 
   static time_point zero() {
-    return time_point::min();
+    return time_point();
+  }
+};
+
+// Please note time_guard is not thread safety -- multiple threads
+// updating same diff_accumulator can corrupt it.
+template <class ClockT = mono_clock>
+class time_guard {
+  const typename ClockT::time_point start;
+  timespan& diff_accumulator;
+
+public:
+  time_guard(timespan& diff_accumulator)
+    : start(ClockT::now()),
+      diff_accumulator(diff_accumulator) {
+  }
+  ~time_guard() {
+    diff_accumulator += ClockT::now() - start;
   }
 };
 
@@ -433,11 +461,11 @@ auto ceil(const std::chrono::time_point<Clock, Duration>& timepoint,
 	ceil(timepoint.time_since_epoch(), precision));
 }
 
-inline timespan make_timespan(const double d) {
-  return std::chrono::duration_cast<timespan>(
+inline signedspan make_timespan(const double d) {
+  return std::chrono::duration_cast<signedspan>(
     std::chrono::duration<double>(d));
 }
-inline std::optional<timespan> maybe_timespan(const double d) {
+inline std::optional<signedspan> maybe_timespan(const double d) {
   return d ? std::make_optional(make_timespan(d)) : std::nullopt;
 }
 
@@ -515,6 +543,9 @@ struct converts_to_timespec<Clock, std::void_t<decltype(
 template <typename Clock>
 constexpr bool converts_to_timespec_v = converts_to_timespec<Clock>::value;
 
+template <typename Clock>
+concept clock_with_timespec = converts_to_timespec_v<Clock>;
+
 template<typename Rep, typename T>
 static Rep to_seconds(T t) {
   return std::chrono::duration_cast<
@@ -536,9 +567,49 @@ template<typename Rep, typename Period>
 ostream& operator<<(ostream& m, const chrono::duration<Rep, Period>& t);
 }
 
-#if FMT_VERSION >= 90000
-template<typename Clock>
-struct fmt::formatter<std::chrono::time_point<Clock>> : fmt::ostream_formatter {};
-#endif
+// concept helpers for the formatters:
+
+template <typename TimeP>
+concept SteadyTimepoint = TimeP::clock::is_steady;
+
+template <typename TimeP>
+concept UnsteadyTimepoint = ! TimeP::clock::is_steady;
+
+namespace fmt {
+template <UnsteadyTimepoint T>
+struct formatter<T> {
+  constexpr auto parse(fmt::format_parse_context& ctx) { return ctx.begin(); }
+  template <typename FormatContext>
+  auto format(const T& t, FormatContext& ctx) const
+  {
+    struct tm bdt;
+    time_t tt = T::clock::to_time_t(t);
+    localtime_r(&tt, &bdt);
+    char tz[32] = {0};
+    strftime(tz, sizeof(tz), "%z", &bdt);
+
+    return fmt::format_to(
+	ctx.out(), "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}:{:06}{}",
+	(bdt.tm_year + 1900), (bdt.tm_mon + 1), bdt.tm_mday, bdt.tm_hour,
+	bdt.tm_min, bdt.tm_sec,
+	duration_cast<std::chrono::microseconds>(
+	    t.time_since_epoch() % std::chrono::seconds(1))
+	    .count(),
+	tz);
+  }
+};
+
+template <SteadyTimepoint T>
+struct formatter<T> {
+  constexpr auto parse(fmt::format_parse_context& ctx) { return ctx.begin(); }
+  template <typename FormatContext>
+  auto format(const T& t, FormatContext& ctx) const
+  {
+    return fmt::format_to(
+	ctx.out(), "{}s",
+	std::chrono::duration<double>(t.time_since_epoch()).count());
+  }
+};
+}  // namespace fmt
 
 #endif // COMMON_CEPH_TIME_H

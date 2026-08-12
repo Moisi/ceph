@@ -19,13 +19,16 @@
 
 #include <boost/tuple/tuple.hpp>
 #include "include/ceph_assert.h"
+#include "include/types.h" // for client_t
 #include "DynamicPerfStats.h"
 #include "OSD.h"
 #include "PG.h"
 #include "Watch.h"
 #include "TierAgentState.h"
 #include "messages/MOSDOpReply.h"
+#include "common/admin_finisher.h"
 #include "common/Checksummer.h"
+#include "common/intrusive_timer.h"
 #include "common/sharedptr_registry.hpp"
 #include "common/shared_cache.hpp"
 #include "ReplicatedBackend.h"
@@ -55,7 +58,9 @@ void put_with_id(PrimaryLogPG *pg, uint64_t id);
 
 struct inconsistent_snapset_wrapper;
 
-class PrimaryLogPG : public PG, public PGBackend::Listener {
+class PrimaryLogPG : public PG,
+		     public PGBackend::Listener,
+		     public ECListener {
   friend class OSD;
   friend class Watch;
   friend class PrimaryLogScrub;
@@ -301,6 +306,8 @@ public:
   }
 
   /// Listener methods
+  void add_temp_obj(const hobject_t &oid) override { get_pgbackend()->add_temp_obj(oid); }
+  void clear_temp_obj(const hobject_t &oid) override { get_pgbackend()->clear_temp_obj(oid); }
   DoutPrefixProvider *get_dpp() override {
     return this;
   }
@@ -343,6 +350,19 @@ public:
 			     eversion_t v,
 			     Context *on_complete) override;
 
+  void pg_lock() override {
+    lock();
+  }
+  void pg_unlock() override {
+    unlock();
+  }
+  void pg_add_ref() override {
+    intrusive_ptr_add_ref(this);
+  }
+  void pg_dec_ref() override {
+    intrusive_ptr_release(this);
+  }
+
   template<class T> class BlessedGenContext;
   template<class T> class UnlockedBlessedGenContext;
   class BlessedContext;
@@ -373,6 +393,9 @@ public:
   const std::set<pg_shard_t> &get_acting_recovery_backfill_shards() const override {
     return get_acting_recovery_backfill();
   }
+  const shard_id_set &get_acting_recovery_backfill_shard_id_set() const override {
+    return PG::get_acting_recovery_backfill_shard_id_set();
+  }
   const std::set<pg_shard_t> &get_acting_shards() const override {
     return recovery_state.get_actingset();
   }
@@ -391,11 +414,24 @@ public:
   const std::map<pg_shard_t, pg_missing_t> &get_shard_missing() const override {
     return recovery_state.get_peer_missing();
   }
-  using PGBackend::Listener::get_shard_missing;
+  const pg_missing_const_i &get_shard_missing(pg_shard_t peer) const override {
+    auto m = maybe_get_shard_missing(peer);
+    ceph_assert(m);
+    return *m;
+  }
   const std::map<pg_shard_t, pg_info_t> &get_shard_info() const override {
     return recovery_state.get_peer_info();
   }
-  using PGBackend::Listener::get_shard_info;
+  const pg_info_t &get_shard_info(pg_shard_t peer) const override {
+    if (peer == primary_shard()) {
+      return get_info();
+    } else {
+      std::map<pg_shard_t, pg_info_t>::const_iterator i =
+        get_shard_info().find(peer);
+      ceph_assert(i != get_shard_info().end());
+      return i->second;
+    }
+  }
   const pg_missing_tracker_t &get_local_missing() const override {
     return recovery_state.get_pg_log().get_missing();
   }
@@ -419,6 +455,9 @@ public:
   }
   const pg_pool_t &get_pool() const override {
     return pool.info;
+  }
+  eversion_t get_pg_committed_to() const override {
+    return recovery_state.get_pg_committed_to();
   }
 
   ObjectContextRef get_obc(
@@ -478,12 +517,12 @@ public:
     const std::optional<pg_hit_set_history_t> &hset_history,
     const eversion_t &trim_to,
     const eversion_t &roll_forward_to,
-    const eversion_t &min_last_complete_ondisk,
+    const eversion_t &pg_committed_to,
     bool transaction_applied,
     ObjectStore::Transaction &t,
     bool async = false) override {
     if (is_primary()) {
-      ceph_assert(trim_to <= recovery_state.get_last_update_ondisk());
+      ceph_assert(trim_to <= pg_committed_to);
     }
     if (hset_history) {
       recovery_state.update_hset(*hset_history);
@@ -500,7 +539,7 @@ public:
       replica_clear_repop_obc(logv, t);
     }
     recovery_state.append_log(
-      std::move(logv), trim_to, roll_forward_to, min_last_complete_ondisk,
+      std::move(logv), trim_to, roll_forward_to, pg_committed_to,
       t, transaction_applied, async);
   }
 
@@ -533,6 +572,10 @@ public:
     recovery_state.update_last_complete_ondisk(lcod);
   }
 
+  void update_pct(eversion_t pct) override {
+    recovery_state.update_pct(pct);
+  }
+
   void update_stats(
     const pg_stat_t &stat) override {
     recovery_state.update_stats(
@@ -543,7 +586,10 @@ public:
   }
 
   void schedule_recovery_work(
-    GenContext<ThreadPool::TPHandle&> *c) override;
+    GenContext<ThreadPool::TPHandle&> *c,
+    uint64_t cost) override;
+
+  common::intrusive_timer &get_pg_timer() override;
 
   pg_shard_t whoami_shard() const override {
     return pg_whoami;
@@ -560,9 +606,19 @@ public:
   uint64_t min_upacting_features() const override {
     return recovery_state.get_min_upacting_features();
   }
+  pg_feature_vec_t get_pg_acting_features() const override {
+    return recovery_state.get_pg_acting_features();
+  }
   void send_message_osd_cluster(
     int peer, Message *m, epoch_t from_epoch) override {
     osd->send_message_osd_cluster(peer, m, from_epoch);
+  }
+  void send_message_osd_cluster(
+    int osd, MOSDPGPush* msg, epoch_t from_epoch) override {
+    std::vector wrapped_msg {
+      std::make_pair(osd, static_cast<Message*>(msg))
+    };
+    send_message_osd_cluster(wrapped_msg, from_epoch);
   }
   void send_message_osd_cluster(
     std::vector<std::pair<int, Message*>>& messages, epoch_t from_epoch) override {
@@ -575,6 +631,12 @@ public:
   void send_message_osd_cluster(
     Message *m, const ConnectionRef& con) override {
     osd->send_message_osd_cluster(m, con);
+  }
+  void start_mon_command(
+    const std::vector<std::string>& cmd, const bufferlist& inbl,
+    bufferlist *outbl, std::string *outs,
+    Context *onfinish) override {
+    osd->monc->start_mon_command(cmd, inbl, outbl, outs, onfinish);
   }
   ConnectionRef get_con_osd_cluster(int peer, epoch_t from_epoch) override;
   entity_name_t get_cluster_msgr_name() override {
@@ -1087,7 +1149,7 @@ protected:
     }
     {
       f->open_array_section("peer_backfill_info");
-      for (std::map<pg_shard_t, BackfillInterval>::const_iterator pbi =
+      for (std::map<pg_shard_t, ReplicaBackfillInterval>::const_iterator pbi =
 	     peer_backfill_info.begin();
           pbi != peer_backfill_info.end(); ++pbi) {
         f->dump_stream("osd") << pbi->first;
@@ -1276,14 +1338,20 @@ protected:
    * @bi.begin first item should be >= this value
    * @bi [out] resulting std::map of objects to eversion_t's
    */
-  void scan_range(
-    int min, int max, BackfillInterval *bi,
+  void scan_range_replica(
+    int min, int max, ReplicaBackfillInterval *bi,
     ThreadPool::TPHandle &handle
+    );
+
+  void scan_range_primary(
+    int min, int max, PrimaryBackfillInterval *bi,
+    ThreadPool::TPHandle &handle,
+    const std::set<pg_shard_t> &backfill_targets
     );
 
   /// Update a hash range to reflect changes since the last scan
   void update_range(
-    BackfillInterval *bi,        ///< [in,out] interval to update
+    PrimaryBackfillInterval *bi, ///< [in,out] interval to update
     ThreadPool::TPHandle &handle ///< [in] tp handle
     );
 
@@ -1450,6 +1518,7 @@ protected:
   void dec_refcount_by_dirty(OpContext* ctx);
   ObjectContextRef get_prev_clone_obc(ObjectContextRef obc);
   bool recover_adjacent_clones(ObjectContextRef obc, OpRequestRef op);
+  snapid_t do_recover_adjacent_clones(ObjectContextRef obc, OpRequestRef op);
   void get_adjacent_clones(ObjectContextRef src_obc, 
 			   ObjectContextRef& _l, ObjectContextRef& _g);
   bool inc_refcount_by_set(OpContext* ctx, object_manifest_t& tgt,
@@ -1473,14 +1542,15 @@ public:
   PrimaryLogPG(OSDService *o, OSDMapRef curmap,
 	       const PGPool &_pool,
 	       const std::map<std::string,std::string>& ec_profile,
-	       spg_t p);
+	       spg_t p,
+               ECExtentCache::LRU &ec_extent_cache_lru);
   ~PrimaryLogPG() override;
 
   void do_command(
-    const std::string_view& prefix,
+    std::string_view prefix,
     const cmdmap_t& cmdmap,
     const ceph::buffer::list& idata,
-    std::function<void(int,const std::string&,ceph::buffer::list&)> on_finish) override;
+    asok_finisher on_finish) override;
 
   void clear_cache() override;
   int get_cache_obj_count() override {
@@ -1531,12 +1601,6 @@ private:
   /// generate a new temp object name (for recovery)
   hobject_t get_temp_recovery_object(const hobject_t& target,
 				     eversion_t version) override;
-  int get_recovery_op_priority() const {
-    int64_t pri = 0;
-    pool.info.opts.get(pool_opts_t::RECOVERY_OP_PRIORITY, &pri);
-    return  pri > 0 ? pri : cct->_conf->osd_recovery_op_priority;
-  }
-
 public:
   coll_t get_coll() {
     return coll;
@@ -1795,7 +1859,7 @@ private:
       > reactions;
     explicit WaitScrub(my_context ctx)
       : my_base(ctx),
-	NamedState(nullptr, "Trimming/WaitScrub") {
+	NamedState(nullptr, "WaitScrub") {
       context< SnapTrimmer >().log_enter(state_name);
     }
     void exit() {
@@ -1836,8 +1900,12 @@ public:
       !recovery_state.get_missing_loc().readable_with_acting(
 	oid, get_actingset());
   }
+  bool is_missing_any_head_or_clone_of(const hobject_t &hoid) {
+    return recovery_state.is_missing_any_head_or_clone_of(hoid);
+  }
   void maybe_kick_recovery(const hobject_t &soid);
   void wait_for_unreadable_object(const hobject_t& oid, OpRequestRef op);
+  void finish_unreadable_object(const hobject_t oid);
 
   int get_manifest_ref_count(ObjectContextRef obc, std::string& fp_oid, OpRequestRef op);
 
@@ -1868,6 +1936,7 @@ public:
   void block_write_on_snap_rollback(
     const hobject_t& oid, ObjectContextRef obc, OpRequestRef op);
   void block_write_on_degraded_snap(const hobject_t& oid, OpRequestRef op);
+  void block_write_on_unreadable_snap(const hobject_t& snap, OpRequestRef op);
 
   bool maybe_await_blocked_head(const hobject_t &soid, OpRequestRef op);
   void wait_for_blocked_object(const hobject_t& soid, OpRequestRef op);
@@ -1878,7 +1947,7 @@ public:
 
   void mark_all_unfound_lost(
     int what,
-    std::function<void(int,const std::string&,ceph::buffer::list&)> on_finish);
+    asok_finisher on_finish);
   eversion_t pick_newest_available(const hobject_t& oid);
 
   void do_update_log_missing(
@@ -1897,6 +1966,21 @@ public:
   void on_shutdown() override;
   bool check_failsafe_full() override;
   bool maybe_preempt_replica_scrub(const hobject_t& oid) override;
+  struct ECListener *get_eclistener() override;
+  const pg_missing_const_i * maybe_get_shard_missing(
+    pg_shard_t peer) const {
+    if (peer == primary_shard()) {
+      return &get_local_missing();
+    } else {
+      std::map<pg_shard_t, pg_missing_t>::const_iterator i =
+        get_shard_missing().find(peer);
+      if (i == get_shard_missing().end()) {
+        return nullptr;
+      } else {
+        return &(i->second);
+      }
+    }
+  }
   int rep_repair_primary_object(const hobject_t& soid, OpContext *ctx);
 
   // attr cache handling
@@ -1935,6 +2019,7 @@ public:
 
 private:
   DynamicPerfStats m_dynamic_perf_stats;
+
 };
 
 inline ostream& operator<<(ostream& out, const PrimaryLogPG::RepGather& repop)
@@ -1962,6 +2047,5 @@ inline ostream& operator<<(ostream& out,
 
 void intrusive_ptr_add_ref(PrimaryLogPG::RepGather *repop);
 void intrusive_ptr_release(PrimaryLogPG::RepGather *repop);
-
 
 #endif

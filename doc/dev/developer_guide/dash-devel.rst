@@ -50,11 +50,10 @@ optional Ceph internal services are started automatically when it is used to
 start a Ceph cluster. vstart is the basis for the three most commonly used
 development environments in Ceph Dashboard.
 
-You can read more about vstart in `Deploying a development cluster`_.
-Additional information for developers can also be found in the `Developer
-Guide`_.
+You can read more about vstart in :ref:`Deploying a development cluster
+<dev_deploying_a_development_cluster>`. Additional information for developers
+can also be found in the `Developer Guide`_.
 
-.. _Deploying a development cluster: https://docs.ceph.com/docs/master/dev/dev_cluster_deployment/
 .. _Developer Guide: https://docs.ceph.com/docs/master/dev/quick_guide/
 
 Host-based vs Docker-based Development Environments
@@ -162,8 +161,6 @@ dashboard and its URLs::
 
   dashboard urls: https://192.168.178.84:41259, https://192.168.178.84:43259, https://192.168.178.84:45259
     w/ user/pass: admin / admin
-  restful urls: https://192.168.178.84:42259, https://192.168.178.84:44259, https://192.168.178.84:46259
-    w/ user/pass: admin / 598da51f-8cd1-4161-a970-b2944d5ad200
 
 During development (especially in backend development), you also want to
 check on occasions if the dashboard manager module is still running. To do so
@@ -176,8 +173,7 @@ should look similar to the following output:
 
   $ ./bin/ceph mgr services
   {
-      "dashboard": "https://home:41931/",
-      "restful": "https://home:42931/"
+      "dashboard": "https://home:41931/"
   }
 
 By default, this environment uses a randomly chosen port for Ceph Dashboard
@@ -215,8 +211,8 @@ The build process is based on `Node.js <https://nodejs.org/>`_ and requires the
 Prerequisites
 ~~~~~~~~~~~~~
 
- * Node 14.15.0 or higher
- * NPM 6.14.9 or higher
+ * Node 20.18.1 or higher
+ * NPM 10.5.2 or higher
 
 nodeenv:
   During Ceph's build we create a virtualenv with ``node`` and ``npm``
@@ -1087,31 +1083,23 @@ All translations will then be reviewed and later pushed upstream.
 Updating translated messages
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Any time there are new messages translated and reviewed in a specific language
-we should update the translation file upstream.
+1. Download the `transifex CLI tool <https://github.com/transifex/cli>`_
 
-To do that, check the settings in the i18n config file
-``src/pybind/mgr/dashboard/frontend/i18n.config.json``:: and make sure that the
-organization is *ceph*, the project is *ceph-dashboard* and the resource is
-the one you want to pull from and push to e.g. *Master:master*. To find a list
-of available resources visit `<https://www.transifex.com/ceph/ceph-dashboard/content/>`_.
+2. Create an `API token <https://www.transifex.com/user/settings/api/>`_.
 
-After you checked the config go to the directory ``src/pybind/mgr/dashboard/frontend`` and run::
+3. Pushing translation:
 
-  $ npm run i18n
+  $ tx push -s
 
-This command will extract all marked messages from the HTML templates and
-TypeScript files. Once the source file has been created it will push it to
-transifex and pull the latest translations. It will also fill all the
-untranslated strings with the source string.
-The tool will ask you for an api token, unless you added it by running:
+  This will push the source file in transifex.
 
-  $ npm run i18n:token
+4. Pulling translation:
 
-To create a transifex api token visit `<https://www.transifex.com/user/settings/api/>`_.
+  $ tx pull -r ceph-dashboard.<resource_slug> -f
 
-After the command ran successfully, build the UI and check if everything is
-working as expected. You also might want to run the frontend tests.
+  e.g `tx pull -r ceph-dashboard.main`
+
+  This will pull all translations of the resource. 
 
 Add a new release resource to transifex
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1119,24 +1107,32 @@ Add a new release resource to transifex
 In order to organize the translations, we create a
 `transifex resource <https://www.transifex.com/ceph/ceph-dashboard/content/>`_
 for every Ceph release. This means, once a new version has been released, the
-``src/pybind/mgr/dashboard/frontend/i18n.config.json`` needs to be updated on
+``src/pybind/mgr/dashboard/frontend/.tx/config`` needs to be updated on
 the release branch.
 
 Please replace::
-
-"resource": "Master:master"
+`resource_name          = Main`
 
 by::
+`resource_name          = <Release-name>`
 
-"resource": "<Release-name>:<release-name>"
+E.g. the resource definition for the Tentacle release::
+`resource_name          = Tentacle`
 
-E.g. the resource definition for the pacific release::
+And replace::
+`[o:ceph:p:ceph-dashboard:r:main]`
 
-"resource": "Pacific:pacific"
+by::
+`[o:ceph:p:ceph-dashboard:r:<release-name>]`
+
+E.g. the resource definition for the Tentacle release::
+`[o:ceph:p:ceph-dashboard:r:tentacle]`
+
+Once done push the translations::
+  $ tx push -s
 
 Note:
-  The first part of the resource definition (before the colon) needs to be
-  written with a capital letter.
+  Only the <Release-name> is capitalized.
 
 Suggestions
 ~~~~~~~~~~~
@@ -1269,7 +1265,6 @@ Tests can be found under the `a11y folder <./src/pybind/mgr/dashboard/frontend/c
   
     beforeEach(() => {
       cy.login();
-      Cypress.Cookies.preserveOnce('token');
       shared.navigateTo();
     });
   
@@ -2425,8 +2420,10 @@ also manually invoked: ``tox -e openapi-check``.
 If that checker failed, it means that the current Pull Request is modifying the
 Ceph API and therefore:
 
-#. The versioned OpenAPI specification should be updated explicitly: ``tox -e openapi-fix``.
-#. The team @ceph/api will be requested for reviews (this is automated via GitHub CODEOWNERS), in order to asses the impact of changes.
+#. The versioned OpenAPI specification should be updated explicitly: ``tox -e
+   openapi-fix``.
+#. The team @ceph/api will be requested for reviews (this is automated via
+   GitHub CODEOWNERS), in order to assess the impact of changes.
 
 Additionally, Sphinx documentation can be generated from the OpenAPI
 specification with ``tox -e openapi-doc``.

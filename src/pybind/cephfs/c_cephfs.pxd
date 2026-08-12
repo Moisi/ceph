@@ -1,3 +1,6 @@
+# cython: language_level=3
+# cython: legacy_implicit_noexcept=True
+
 from libc.stdint cimport *
 from types cimport *
 
@@ -36,6 +39,13 @@ cdef extern from "cephfs/libcephfs.h" nogil:
         size_t nr_snap_metadata
         snap_metadata *snap_metadata
 
+    cdef struct ceph_snapdiff_info:
+        pass
+
+    cdef struct ceph_snapdiff_entry_t:
+        dirent dir_entry
+        uint64_t snapid
+
     ctypedef void* rados_t
 
     const char *ceph_version(int *major, int *minor, int *patch)
@@ -64,6 +74,10 @@ cdef extern from "cephfs/libcephfs.h" nogil:
 
     int ceph_setattrx(ceph_mount_info *cmount, const char *relpath, statx *stx, int mask, int flags)
     int ceph_fsetattrx(ceph_mount_info *cmount, int fd, statx *stx, int mask)
+
+    ctypedef void (*libcephfs_c_completion_t)(int rc, const void* out, size_t outlen, const void* outs, size_t outslen, void* ud) nogil
+    int ceph_mds_command2(ceph_mount_info* cmount, const char* mds_spec, const char** cmd, size_t cmdlen, const char* inbuf, size_t inbuflen, int one_shot, libcephfs_c_completion_t c, void* ud)
+
     int ceph_mds_command(ceph_mount_info *cmount, const char *mds_spec, const char **cmd, size_t cmdlen,
                          const char *inbuf, size_t inbuflen, char **outbuf, size_t *outbuflen,
                          char **outs, size_t *outslen)
@@ -111,6 +125,14 @@ cdef extern from "cephfs/libcephfs.h" nogil:
     void ceph_seekdir(ceph_mount_info *cmount, ceph_dir_result *dirp, int64_t offset)
     int ceph_chdir(ceph_mount_info *cmount, const char *path)
     dirent * ceph_readdir(ceph_mount_info *cmount, ceph_dir_result *dirp)
+    int ceph_open_snapdiff(ceph_mount_info *cmount,
+                           const char *root_path,
+                           const char *rel_path,
+                           const char *snap1,
+                           const char *snap2,
+                           ceph_snapdiff_info *out)
+    int ceph_readdir_snapdiff(ceph_snapdiff_info *snapdiff, ceph_snapdiff_entry_t *out);
+    int ceph_close_snapdiff(ceph_snapdiff_info *snapdiff)
     int ceph_rmdir(ceph_mount_info *cmount, const char *path)
     const char* ceph_getcwd(ceph_mount_info *cmount)
     int ceph_sync_fs(ceph_mount_info *cmount)

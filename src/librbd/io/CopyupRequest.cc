@@ -26,6 +26,8 @@
 #include <boost/lambda/bind.hpp>
 #include <boost/lambda/construct.hpp>
 
+#include <shared_mutex> // for std::shared_lock
+
 #define dout_subsys ceph_subsys_rbd
 #undef dout_prefix
 #define dout_prefix *_dout << "librbd::io::CopyupRequest: " << this            \
@@ -470,7 +472,7 @@ void CopyupRequest<I>::copyup() {
     ldout(cct, 20) << "copyup with empty snapshot context" << dendl;
 
     auto copyup_io_context = *io_context;
-    copyup_io_context.write_snap_context({});
+    copyup_io_context.set_write_snap_context({});
 
     m_image_ctx->rados_api.execute(
       object, copyup_io_context, std::move(copyup_op),

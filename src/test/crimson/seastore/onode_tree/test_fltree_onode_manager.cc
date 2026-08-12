@@ -30,17 +30,18 @@ struct onode_item_t {
   uint32_t cnt_modify = 0;
 
   void initialize(Transaction& t, Onode& value) const {
-    auto& layout = value.get_mutable_layout(t);
-    layout.size = size;
-    layout.omap_root.update(omap_root_t(id, cnt_modify,
-      value.get_metadata_hint(block_size)));
+    auto &ftvalue = static_cast<FLTreeOnode&>(value);
+    ftvalue.update_onode_size(t, size);
+    auto oroot = omap_root_t(laddr_t::from_raw_uint(id), cnt_modify,
+      value.get_metadata_hint(block_size), omap_type_t::OMAP);
+    ftvalue.update_omap_root(t, oroot);
     validate(value);
   }
 
   void validate(Onode& value) const {
     auto& layout = value.get_layout();
-    ceph_assert(laddr_t(layout.size) == laddr_t{size});
-    ceph_assert(layout.omap_root.get(value.get_metadata_hint(block_size)).addr == id);
+    ceph_assert(uint64_t(layout.size) == uint64_t{size});
+    ceph_assert(layout.omap_root.get(value.get_metadata_hint(block_size)).addr == laddr_t::from_raw_uint(id));
     ceph_assert(layout.omap_root.get(value.get_metadata_hint(block_size)).depth == cnt_modify);
   }
 
@@ -70,15 +71,15 @@ struct fltree_onode_manager_test_t
     return tm_teardown();
   }
 
-
-  virtual void _init() final {
-    TMTestState::_init();
-    manager.reset(new FLTreeOnodeManager(*tm));
+  virtual seastar::future<> _init() final {
+    return TMTestState::_init().then([this] {
+      manager.reset(new FLTreeOnodeManager(*tm));
+    });
   }
 
-  virtual void _destroy() final {
+  virtual seastar::future<> _destroy() final {
     manager.reset();
-    TMTestState::_destroy();
+    return TMTestState::_destroy();
   }
 
   virtual FuturizedStore::mkfs_ertr::future<> _mkfs() final {
@@ -117,11 +118,8 @@ struct fltree_onode_manager_test_t
       auto p_kv = *it;
       auto onode = with_trans_intr(t, [&](auto &t) {
         return manager->get_or_create_onode(t, p_kv->key);
-      }).unsafe_get0();
+      }).unsafe_get();
       std::invoke(f, t, *onode, p_kv->value);
-      with_trans_intr(t, [&](auto &t) {
-        return manager->write_dirty(t, {onode});
-      }).unsafe_get0();
     });
   }
 
@@ -130,7 +128,7 @@ struct fltree_onode_manager_test_t
       auto p_kv = *it;
       auto onode = with_trans_intr(t, [&](auto &t) {
         return manager->get_onode(t,  p_kv->key);
-      }).unsafe_get0();
+      }).unsafe_get();
       p_kv->value.validate(*onode);
     });
   }
@@ -140,7 +138,7 @@ struct fltree_onode_manager_test_t
       auto p_kv = *it;
       auto exist = with_trans_intr(t, [&](auto &t) {
         return manager->contains_onode(t, p_kv->key);
-      }).unsafe_get0();
+      }).unsafe_get();
       ceph_assert(exist == false);
     });
   }
@@ -169,16 +167,13 @@ struct fltree_onode_manager_test_t
         [this, f=std::move(f)] (auto& t, auto& oids, auto& items) {
       auto onodes = with_trans_intr(t, [&](auto &t) {
         return manager->get_or_create_onodes(t, oids);
-      }).unsafe_get0();
+      }).unsafe_get();
       for (auto tup : boost::combine(onodes, items)) {
         OnodeRef onode;
         onode_item_t* p_item;
         boost::tie(onode, p_item) = tup;
         std::invoke(f, t, *onode, *p_item);
       }
-      with_trans_intr(t, [&](auto &t) {
-        return manager->write_dirty(t, onodes);
-      }).unsafe_get0();
     });
   }
 
@@ -192,7 +187,7 @@ struct fltree_onode_manager_test_t
         boost::tie(oid, p_item) = tup;
         auto onode = with_trans_intr(t, [&](auto &t) {
           return manager->get_onode(t, oid);
-        }).unsafe_get0();
+        }).unsafe_get();
         p_item->validate(*onode);
       }
     });
@@ -205,7 +200,7 @@ struct fltree_onode_manager_test_t
       for (auto& oid : oids) {
         auto exist = with_trans_intr(t, [&](auto &t) {
           return manager->contains_onode(t, oid);
-        }).unsafe_get0();
+        }).unsafe_get();
         ceph_assert(exist == false);
       }
     });
@@ -224,7 +219,7 @@ struct fltree_onode_manager_test_t
       while (start != end) {
         auto [list_ret, list_end] = with_trans_intr(t, [&](auto &t) {
           return manager->list_onodes(t, start, end, LIST_LIMIT);
-        }).unsafe_get0();
+        }).unsafe_get();
         listed_oids.insert(listed_oids.end(), list_ret.begin(), list_ret.end());
         start = list_end;
       }
@@ -235,7 +230,7 @@ struct fltree_onode_manager_test_t
   fltree_onode_manager_test_t() {}
 };
 
-TEST_F(fltree_onode_manager_test_t, 1_single)
+TEST_P(fltree_onode_manager_test_t, 1_single)
 {
   run_async([this] {
     uint64_t block_size = tm->get_block_size();
@@ -257,24 +252,25 @@ TEST_F(fltree_onode_manager_test_t, 1_single)
       OnodeRef onode_ref = &onode;
       with_trans_intr(t, [&](auto &t) {
         return manager->erase_onode(t, onode_ref);
-      }).unsafe_get0();
+      }).unsafe_get();
     });
     validate_erased(iter);
   });
 }
 
-TEST_F(fltree_onode_manager_test_t, 2_synthetic)
+TEST_P(fltree_onode_manager_test_t, 2_synthetic)
 {
   run_async([this] {
     uint64_t block_size = tm->get_block_size();
     auto pool = KVPool<onode_item_t>::create_range(
-        {0, 100}, {32, 64, 128, 256, 512}, block_size);
+        {0, 10000}, {32, 64, 128, 256, 512}, block_size);
     auto start = pool.begin();
     auto end = pool.end();
     with_onodes_write(start, end,
         [](auto& t, auto& onode, auto& item) {
       item.initialize(t, onode);
     });
+    restart();
     validate_onodes(start, end);
 
     validate_list_onodes(pool);
@@ -285,6 +281,7 @@ TEST_F(fltree_onode_manager_test_t, 2_synthetic)
         [](auto& t, auto& onode, auto& item) {
       item.modify(t, onode);
     });
+    restart();
     validate_onodes(start, end);
 
     pool.shuffle();
@@ -294,6 +291,7 @@ TEST_F(fltree_onode_manager_test_t, 2_synthetic)
         [](auto& t, auto& onode, auto& item) {
       item.modify(t, onode);
     });
+    restart();
     validate_onodes(start, end);
 
     pool.shuffle();
@@ -304,8 +302,9 @@ TEST_F(fltree_onode_manager_test_t, 2_synthetic)
       OnodeRef onode_ref = &onode;
       with_trans_intr(t, [&](auto &t) {
         return manager->erase_onode(t, onode_ref);
-      }).unsafe_get0();
+      }).unsafe_get();
     });
+    restart();
     validate_erased(rd_start, rd_end);
     pool.erase_from_random(rd_start, rd_end);
     start = pool.begin();
@@ -315,3 +314,16 @@ TEST_F(fltree_onode_manager_test_t, 2_synthetic)
     validate_list_onodes(pool);
   });
 }
+
+INSTANTIATE_TEST_SUITE_P(
+  fltree_onode__manager_test,
+  fltree_onode_manager_test_t,
+  ::testing::Combine(
+    ::testing::Values (
+      "segmented",
+      "circularbounded"
+    ),
+    ::testing::Values(
+      integrity_check_t::FULL_CHECK)
+  )
+);

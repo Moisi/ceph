@@ -20,7 +20,7 @@ and, monitoring an operating cluster.
 	monitoring
 	monitoring-osd-pg
 	user-management
-	pg-repair
+        pgcalc/index
 
 .. raw:: html
 
@@ -39,8 +39,11 @@ CRUSH algorithm.
 	erasure-code
 	cache-tiering
 	placement-groups
-	balancer
+        pg-states
+        pg-concepts
 	upmap
+        read-balancer
+        balancer
 	crush-map
 	crush-map-edits
 	stretch-mode

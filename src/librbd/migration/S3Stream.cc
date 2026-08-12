@@ -17,8 +17,6 @@
 #include "librbd/migration/HttpProcessorInterface.h"
 #include <boost/beast/http.hpp>
 
-#undef FMT_HEADER_ONLY
-#define FMT_HEADER_ONLY 1
 #include <fmt/chrono.h>
 #include <fmt/format.h>
 
@@ -194,6 +192,18 @@ void S3Stream<I>::process_request(HttpRequest& http_request) {
 
   ldout(m_cct, 20) << "string_to_sign=" << string_to_sign << ", "
                    << "authorization=" << authorization << dendl;
+}
+
+template <typename I>
+void S3Stream<I>::list_sparse_extents(io::Extents&& byte_extents,
+                                      io::SparseExtents* sparse_extents,
+                                      Context* on_finish) {
+  // no sparseness information -- list the full range as DATA
+  for (auto [byte_offset, byte_length] : byte_extents) {
+    sparse_extents->insert(byte_offset, byte_length,
+                           {io::SPARSE_EXTENT_STATE_DATA, byte_length});
+  }
+  on_finish->complete(0);
 }
 
 } // namespace migration

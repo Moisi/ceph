@@ -20,6 +20,8 @@ set -e
 #     ceph-backport.sh --troubleshooting | less
 #
 
+CEPH_UPSTREAM=https://github.com/ceph/ceph.git
+
 full_path="$0"
 
 SCRIPT_VERSION="16.0.0.6848"
@@ -94,6 +96,11 @@ declare -A comp_hash=(
 )
 
 declare -A flagged_pr_hash=()
+
+function run {
+    printf '%s\n' "$*" >&2
+    "$@"
+}
 
 function abort_due_to_setup_problem {
     error "problem detected in your setup"
@@ -228,36 +235,38 @@ function cherry_pick_phase {
             false
         fi
     fi
+    base_sha="$(printf '%s' "${remote_api_output}" | jq -r .base.sha)"
+    head_sha="$(printf '%s' "${remote_api_output}" | jq -r .head.sha)"
     merged=$(echo "${remote_api_output}" | jq -r '.merged')
     if [ "$merged" = "true" ] ; then
-        true
-    else
-        error "${original_pr_url} is not merged yet"
-        info "Cowardly refusing to perform automated cherry-pick"
-        false
-    fi
-    number_of_commits=$(echo "${remote_api_output}" | jq '.commits')
-    if [ "$number_of_commits" -eq "$number_of_commits" ] 2>/dev/null ; then
-        # \$number_of_commits is set, and is an integer
-        if [ "$number_of_commits" -eq "1" ] ; then
-            singular_or_plural_commit="commit"
-        else
-            singular_or_plural_commit="commits"
+        # Use the merge commit in case the branch HEAD changes after merge.
+        merge_commit_sha=$(printf '%s' "$remote_api_output" | jq -r '.merge_commit_sha')
+        if [ -z "$merge_commit_sha" ]; then
+            error "Could not determine the merge commit of ${original_pr_url}"
+            bail_out_github_api "$remote_api_output"
+            false
         fi
+        cherry_pick_sha="${merge_commit_sha}^..${merge_commit_sha}^2"
     else
-        error "Could not determine the number of commits in ${original_pr_url}"
-        bail_out_github_api "$remote_api_output"
+        if [ "$FORCE" ] ; then
+            warning "${original_pr_url} is not merged yet"
+            info "--force was given, so continuing anyway"
+            cherry_pick_sha="${base_sha}..${head_sha}"
+        else
+            error "${original_pr_url} is not merged yet"
+            info "Cowardly refusing to perform automated cherry-pick"
+            false
+        fi
     fi
-    info "Found $number_of_commits $singular_or_plural_commit in $original_pr_url"
 
     set -x
-    git fetch "$upstream_remote"
+    git fetch "$CEPH_UPSTREAM" "refs/heads/${milestone}"
 
     if git show-ref --verify --quiet "refs/heads/$local_branch" ; then
         if [ "$FORCE" ] ; then
             if [ "$non_interactive" ] ; then
                 git checkout "$local_branch"
-                git reset --hard "${upstream_remote}/${milestone}"
+                git reset --hard FETCH_HEAD
             else
                 echo
                 echo "A local branch $local_branch already exists and the --force option was given."
@@ -269,7 +278,7 @@ function cherry_pick_phase {
                 [ "$yes_or_no_answer" ] && yes_or_no_answer="${yes_or_no_answer:0:1}"
                 if [ "$yes_or_no_answer" = "y" ] ; then
                     git checkout "$local_branch"
-                    git reset --hard "${upstream_remote}/${milestone}"
+                    git reset --hard FETCH_HEAD
                 else
                     info "OK, bailing out!"
                     false
@@ -282,40 +291,23 @@ function cherry_pick_phase {
             false
         fi
     else
-        git checkout "${upstream_remote}/${milestone}" -b "$local_branch"
+        git checkout -b "$local_branch" FETCH_HEAD
     fi
 
-    git fetch "$upstream_remote" "pull/$original_pr/head:pr-$original_pr"
+    git fetch "$CEPH_UPSTREAM" "$merge_commit_sha"
 
     set +x
     maybe_restore_set_x
-    info "Attempting to cherry pick $number_of_commits commits from ${original_pr_url} into local branch $local_branch"
-    offset="$((number_of_commits - 1))" || true
-    for ((i=offset; i>=0; i--)) ; do
-        info "Running \"git cherry-pick -x\" on $(git log --oneline --max-count=1 --no-decorate "pr-${original_pr}~${i}")"
-        sha1_to_cherry_pick=$(git rev-parse --verify "pr-${original_pr}~${i}")
-        set -x
-        if git cherry-pick -x "$sha1_to_cherry_pick" ; then
-            set +x
-            maybe_restore_set_x
-        else
-            set +x
-            maybe_restore_set_x
-            [ "$VERBOSE" ] && git status
-            error "Cherry pick failed"
-            info "Next, manually fix conflicts and complete the current cherry-pick"
-            if [ "$i" -gt "0" ] >/dev/null 2>&1 ; then
-                info "Then, cherry-pick the remaining commits from ${original_pr_url}, i.e.:"
-                for ((j=i-1; j>=0; j--)) ; do
-                    info "-> missing commit: $(git log --oneline --max-count=1 --no-decorate "pr-${original_pr}~${j}")"
-                done
-                info "Finally, re-run the script"
-            else
-                info "Then re-run the script"
-            fi
-            false
-        fi
-    done
+    info "Attempting to cherry pick ${original_pr_url} into local branch $local_branch"
+    if ! run git cherry-pick -x "$cherry_pick_sha"; then
+        [ "$VERBOSE" ] && git status
+        error "Cherry pick failed due to conflicts?"
+        info "Manually fix conflicts and complete the current cherry-pick:"
+        info "    git cherry-pick --continue"
+        info "Finally, re-run this script"
+        false
+    fi
+
     info "Cherry picking completed without conflicts"
 }
 
@@ -564,10 +556,6 @@ function init_redmine_key {
     fi
 }
 
-function init_upstream_remote {
-    upstream_remote="${upstream_remote:-$(maybe_deduce_remote upstream)}"
-}
-
 function interactive_setup_routine {
     local default_val
     local original_github_token
@@ -647,15 +635,13 @@ function interactive_setup_routine {
     echo "---------------------------------------------------------------------"
     echo "Searching \"git remote -v\" for remote repos"
     echo
-    init_upstream_remote
     init_fork_remote
     vet_remotes
-    echo "Upstream remote is \"$upstream_remote\""
+    echo "Upstream remote is \"$CEPH_UPSTREAM\""
     echo "Fork remote is \"$fork_remote\""
     [ "$setup_ok" ] || abort_due_to_setup_problem
     [ "$github_token" ] || assert_fail "github_token not set, even after completing Steps 1-3 of interactive setup"
     [ "$github_user" ] || assert_fail "github_user not set, even after completing Steps 1-3 of interactive setup"
-    [ "$upstream_remote" ] || assert_fail "upstream_remote not set, even after completing Steps 1-3 of interactive setup"
     [ "$fork_remote" ] || assert_fail "fork_remote not set, even after completing Steps 1-3 of interactive setup"
     echo
     echo "---------------------------------------------------------------------"
@@ -692,7 +678,6 @@ function interactive_setup_routine {
     fi
     [ "$github_token" ] || assert_fail "github_token not set, even after completing Steps 1-4 of interactive setup"
     [ "$github_user" ] || assert_fail "github_user not set, even after completing Steps 1-4 of interactive setup"
-    [ "$upstream_remote" ] || assert_fail "upstream_remote not set, even after completing Steps 1-4 of interactive setup"
     [ "$fork_remote" ] || assert_fail "fork_remote not set, even after completing Steps 1-4 of interactive setup"
     [ "$redmine_key" ] || assert_fail "redmine_key not set, even after completing Steps 1-4 of interactive setup"
     [ "$redmine_user_id" ] || assert_fail "redmine_user_id not set, even after completing Steps 1-4 of interactive setup"
@@ -789,7 +774,7 @@ function maybe_deduce_remote {
     else
         assert_fail "bad remote_type ->$remote_type<- in maybe_deduce_remote"
     fi
-    remote=$(git remote -v | grep --extended-regexp --ignore-case '(://|@)github.com(/|:|:/)'${url_component}'/ceph(\s|\.|\/)' | head -n1 | cut -f 1)
+    remote=$(git remote -v | grep --extended-regexp --ignore-case '(://|@)github.com(/|:|:/)'${url_component}'/ceph(\s|\.|/|-)' | head -n1 | cut -f 1)
     echo "$remote"
 }
 
@@ -932,7 +917,7 @@ function number_to_url {
 
 function populate_original_issue {
     if [ -z "$original_issue" ] ; then
-        original_issue=$(curl --silent "${redmine_url}.json?include=relations" |
+        original_issue=$(curl --silent "${redmine_url}.json?include=relations&key=$redmine_key" |
             jq '.issue.relations[] | select(.relation_type | contains("copied_to")) | .issue_id')
         original_issue_url="$(number_to_url "redmine" "${original_issue}")"
     fi
@@ -941,7 +926,7 @@ function populate_original_issue {
 function populate_original_pr {
     if [ "$original_issue" ] ; then
         if [ -z "$original_pr" ] ; then
-            original_pr=$(curl --silent "${original_issue_url}.json" |
+            original_pr=$(curl --silent "${original_issue_url}.json?key=$redmine_key" |
                           jq -r '.issue.custom_fields[] | select(.id | contains(21)) | .value')
             original_pr_url="$(number_to_url "github" "${original_pr}")"
         fi
@@ -1079,14 +1064,17 @@ function try_known_milestones {
         giant) eol "$mtt" ;;
         hammer) eol "$mtt" ;;
         infernalis) eol "$mtt" ;;
-        jewel) mn="8" ;;
+        jewel) eol "$mtt" ;;
         kraken) eol "$mtt" ;;
-        luminous) mn="10" ;;
-        mimic) mn="11" ;;
-        nautilus) mn="12" ;;
-        octopus) mn="13" ;;
-        pacific) mn="14" ;;
-        quincy) mn="15" ;;
+        luminous) eol "$mtt" ;;
+        mimic) eol "$mtt" ;;
+        nautilus) eol "$mtt" ;;
+        octopus) eol "$mtt" ;;
+        pacific) eol "$mtt" ;;
+        quincy) eol "$mtt" ;;
+        reef) mn="16" ;;
+        squid) mn="20" ;;
+        tentacle) mn="31" ;;
     esac
     echo "$mn"
 }
@@ -1275,13 +1263,6 @@ function vet_prs_for_milestone {
 }
 
 function vet_remotes {
-    if [ "$upstream_remote" ] ; then
-        verbose "Upstream remote is $upstream_remote"
-    else
-        error "Cannot auto-determine upstream remote"
-        "(Could not find any upstream remote in \"git remote -v\")"
-        false
-    fi
     if [ "$fork_remote" ] ; then
         verbose "Fork remote is $fork_remote"
     else
@@ -1303,14 +1284,12 @@ function vet_setup {
     local redmine_user_id_display
     local github_endpoint_display
     local github_user_display
-    local upstream_remote_display
     local fork_remote_display
     local redmine_key_display
     local github_token_display
     debug "Entering vet_setup with argument $argument"
     if [ "$argument" = "--report" ] || [ "$argument" = "--normal-operation" ] ; then
         [ "$github_token" ] && [ "$setup_ok" ] && set_github_user_from_github_token quiet
-        init_upstream_remote
         [ "$github_token" ] && [ "$setup_ok" ] && init_fork_remote
         vet_remotes
         [ "$redmine_key" ] && set_redmine_user_from_redmine_key
@@ -1337,7 +1316,6 @@ function vet_setup {
     redmine_user_id_display="${redmine_user_id:-$not_set}"
     github_endpoint_display="${github_endpoint:-$not_set}"
     github_user_display="${github_user:-$not_set}"
-    upstream_remote_display="${upstream_remote:-$not_set}"
     fork_remote_display="${fork_remote:-$not_set}"
     test "$redmine_endpoint" || failed_mandatory_var_check redmine_endpoint "not set"
     test "$redmine_user_id"  || failed_mandatory_var_check redmine_user_id "could not be determined"
@@ -1345,7 +1323,6 @@ function vet_setup {
     test "$github_endpoint"  || failed_mandatory_var_check github_endpoint "not set"
     test "$github_user"      || failed_mandatory_var_check github_user "could not be determined"
     test "$github_token"     || failed_mandatory_var_check github_token "not set"
-    test "$upstream_remote"  || failed_mandatory_var_check upstream_remote "could not be determined"
     test "$fork_remote"      || failed_mandatory_var_check fork_remote "could not be determined"
     if [ "$argument" = "--report" ] || [ "$argument" == "--interactive" ] ; then
         read -r -d '' setup_summary <<EOM || true > /dev/null 2>&1
@@ -1355,7 +1332,7 @@ redmine_key      $redmine_key_display
 github_endpoint  $github_endpoint
 github_user      $github_user_display
 github_token     $github_token_display
-upstream_remote  $upstream_remote_display
+upstream_remote  $CEPH_UPSTREAM
 fork_remote      $fork_remote_display
 EOM
         log bare
@@ -1373,7 +1350,6 @@ EOM
         verbose "github_endpoint  $github_endpoint_display"
         verbose "github_user      $github_user_display"
         verbose "github_token     $github_token_display"
-        verbose "upstream_remote  $upstream_remote_display"
         verbose "fork_remote      $fork_remote_display"
     fi
     if [ "$argument" = "--report" ] || [ "$argument" = "--interactive" ] ; then
@@ -1578,7 +1554,8 @@ fi
 redmine_url="$(number_to_url "redmine" "${issue}")"
 debug "Considering Redmine issue: $redmine_url - is it in the Backport tracker?"
 
-remote_api_output="$(curl --silent "${redmine_url}.json")"
+remote_api_output="$(curl --silent "${redmine_url}.json?key=$redmine_key")"
+debug $remote_api_output
 tracker="$(echo "$remote_api_output" | jq -r '.issue.tracker.name')"
 if [ "$tracker" = "Backport" ]; then
     debug "Yes, $redmine_url is a Backport issue"
@@ -1589,7 +1566,7 @@ else
 fi
 
 debug "Looking up release/milestone of $redmine_url"
-milestone="$(echo "$remote_api_output" | jq -r '.issue.custom_fields[0].value')"
+milestone="$(echo "$remote_api_output" | jq -r '.issue.custom_fields[] | select(.id == 16) | .value')"
 if [ "$milestone" ] ; then
     debug "Release/milestone: $milestone"
 else
@@ -1749,7 +1726,6 @@ fi
 
 if [ "$PR_PHASE" ] || [ "$EXISTING_PR" ] ; then
     maybe_update_pr_milestone_labels
-    pgrep firefox >/dev/null && firefox "${backport_pr_url}"
 fi
 
 if [ "$TRACKER_PHASE" ] ; then
@@ -1758,9 +1734,9 @@ if [ "$TRACKER_PHASE" ] ; then
     desc_should_be="${backport_pr_url}"
     assignee_should_be="${redmine_user_id}"
     if [ "$EXISTING_PR" ] ; then
-        data_binary="{\"issue\":{\"description\":\"${desc_should_be}\",\"status_id\":${status_should_be}}}"
+        data_binary="{\"issue\":{\"description\":\"${desc_should_be}\",\"status_id\":${status_should_be},\"custom_fields\":[{\"id\":21,\"value\":\"${backport_pr_number}\"}]}}"
     else
-        data_binary="{\"issue\":{\"description\":\"${desc_should_be}\",\"status_id\":${status_should_be},\"assigned_to_id\":${assignee_should_be}}}"
+        data_binary="{\"issue\":{\"description\":\"${desc_should_be}\",\"status_id\":${status_should_be},\"assigned_to_id\":${assignee_should_be},\"custom_fields\":[{\"id\":21,\"value\":\"${backport_pr_number}\"}]}}"
     fi
     remote_api_status_code="$(curl --write-out '%{http_code}' --output /dev/null --silent -X PUT --header "Content-type: application/json" --data-binary "${data_binary}" "${redmine_url}.json?key=$redmine_key")"
     if [ "$FORCE" ] || [ "$EXISTING_PR" ] ; then 
@@ -1800,12 +1776,10 @@ if [ "$TRACKER_PHASE" ] ; then
     if [ "$tracker_is_in_desired_state" ] ; then
         [ "$tracker_was_updated" ] && info "Backport tracker ${redmine_url} was updated"
         info "Backport tracker ${redmine_url} is in the desired state"
-        pgrep firefox >/dev/null && firefox "${redmine_url}"
         exit 0
     fi
     if [ "$tracker_was_updated" ] ; then
         warning "backport tracker ${redmine_url} was updated, but is not in the desired state. Please check it."
-        pgrep firefox >/dev/null && firefox "${redmine_url}"
         exit 1
     else
         data_binary="{\"issue\":{\"notes\":\"please link this Backport tracker issue with GitHub PR ${desc_should_be}\nceph-backport.sh version ${SCRIPT_VERSION}\"}}"

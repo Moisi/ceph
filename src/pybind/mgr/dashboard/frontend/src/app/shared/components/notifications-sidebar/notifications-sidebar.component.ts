@@ -102,17 +102,9 @@ export class NotificationsSidebarComponent implements OnInit, OnDestroy {
     );
 
     this.subs.add(
-      this.notificationService.sidebarSubject.subscribe((forceClose) => {
-        if (forceClose) {
-          this.isSidebarOpened = false;
-        } else {
-          this.isSidebarOpened = !this.isSidebarOpened;
-        }
-
-        window.clearTimeout(this.timeout);
-        this.timeout = window.setTimeout(() => {
-          this.cdRef.detectChanges();
-        }, 0);
+      this.notificationService.panelState$.subscribe((state) => {
+        this.isSidebarOpened = state.isOpen && !state.useNewPanel;
+        this.cdRef.detectChanges();
       })
     );
 
@@ -147,8 +139,8 @@ export class NotificationsSidebarComponent implements OnInit, OnDestroy {
   }
 
   _handleTasks(executingTasks: ExecutingTask[]) {
-    for (const excutingTask of executingTasks) {
-      excutingTask.description = this.taskMessageService.getRunningTitle(excutingTask);
+    for (const executingTask of executingTasks) {
+      executingTask.description = this.taskMessageService.getRunningTitle(executingTask);
     }
     this.executingTasks = executingTasks;
   }
@@ -167,7 +159,7 @@ export class NotificationsSidebarComponent implements OnInit, OnDestroy {
   }
 
   closeSidebar() {
-    this.isSidebarOpened = false;
+    this.notificationService.toggleSidebar(false, false);
   }
 
   trackByFn(index: number) {

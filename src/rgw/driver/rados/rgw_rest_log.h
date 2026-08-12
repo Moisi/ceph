@@ -88,7 +88,7 @@ public:
 };
 
 class RGWOp_MDLog_List : public RGWRESTOp {
-  std::list<cls_log_entry> entries;
+  std::vector<cls::log::entry> entries;
   std::string last_marker;
   bool truncated;
 public:
@@ -209,6 +209,7 @@ class RGWOp_DATALog_List : public RGWRESTOp {
   std::string last_marker;
   bool truncated;
   bool extra_info;
+  ceph::real_time last_update;
 public:
   RGWOp_DATALog_List() : truncated(false), extra_info(false) {}
   ~RGWOp_DATALog_List() override {}
@@ -331,7 +332,7 @@ public:
   RGWHandler_REST* get_handler(rgw::sal::Driver* driver,
 			       req_state* const,
                                const rgw::auth::StrategyRegistry& auth_registry,
-                               const std::string& frontend_prefixs) override {
+                               const std::string& frontend_prefixes) override {
     return new RGWHandler_Log(auth_registry);
   }
 };

@@ -6,6 +6,7 @@
 #include "crimson/common/config_proxy.h"
 #include "crimson/os/alienstore/thread_pool.h"
 #include "include/msgr.h"
+#include "test/crimson/ctest_utils.h"
 
 using namespace std::chrono_literals;
 using ThreadPool = crimson::os::ThreadPool;
@@ -21,8 +22,8 @@ seastar::future<> test_accumulate(ThreadPool& tp) {
     });
   };
   return seastar::map_reduce(
-    boost::irange(0, N), slow_plus, 0, std::plus{}).then([] (int sum) {
-    auto r = boost::irange(0 + M, N + M);
+    std::views::iota(0, N), slow_plus, 0, std::plus{}).then([] (int sum) {
+    auto r = std::views::iota(0 + M, N + M);
     if (sum != std::accumulate(r.begin(), r.end(), 0)) {
       throw std::runtime_error("test_accumulate failed");
     }
@@ -37,7 +38,7 @@ seastar::future<> test_void_return(ThreadPool& tp) {
 
 int main(int argc, char** argv)
 {
-  seastar::app_template app;
+  seastar::app_template app{get_smp_opts_from_ctest()};
   return app.run(argc, argv, [] {
     std::vector<const char*> args;
     std::string cluster;

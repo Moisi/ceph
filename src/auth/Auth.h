@@ -16,7 +16,17 @@
 #define CEPH_AUTHTYPES_H
 
 #include "Crypto.h"
+#include "common/ceph_json.h"
 #include "common/entity_name.h"
+#include "common/Formatter.h"
+#include "include/buffer.h"
+#include "include/ceph_fs.h" // for CEPH_AUTH_UNKNOWN
+
+#include <cstdint>
+#include <iostream>
+#include <list>
+#include <map>
+#include <string>
 
 // The _MAX values are a bit wonky here because we are overloading the first
 // byte of the auth payload to identify both the type of authentication to be
@@ -59,6 +69,16 @@ struct EntityAuth {
       decode(pending_key, bl);
     }
   }
+  void dump(ceph::Formatter *f) const {
+    f->dump_object("key", key);
+    encode_json("caps", caps, f);
+    f->dump_object("pending_key", pending_key);
+  }
+  static std::list<EntityAuth> generate_test_instances() {
+    std::list<EntityAuth> ls;
+    ls.emplace_back();
+    return ls;
+  }
 };
 WRITE_CLASS_ENCODER(EntityAuth)
 
@@ -95,6 +115,21 @@ struct AuthCapsInfo {
     allow_all = (bool)a;
     decode(caps, bl);
   }
+  void dump(ceph::Formatter *f) const {
+    f->dump_bool("allow_all", allow_all);
+    encode_json("caps", caps, f);
+    f->dump_unsigned("caps_len", caps.length());
+  }
+  static std::list<AuthCapsInfo> generate_test_instances() {
+    std::list<AuthCapsInfo> ls;
+    ls.emplace_back();
+    ls.emplace_back();
+    ls.back().allow_all = true;
+    ls.emplace_back();
+    ls.back().caps.append("foo");
+    ls.back().caps.append("bar");
+    return ls;
+  }
 };
 WRITE_CLASS_ENCODER(AuthCapsInfo)
 
@@ -106,7 +141,7 @@ WRITE_CLASS_ENCODER(AuthCapsInfo)
 struct AuthTicket {
   EntityName name;
   uint64_t global_id; /* global instance id */
-  utime_t created, renew_after, expires;
+  utime_t created, expires;
   AuthCapsInfo caps;
   __u32 flags;
 
@@ -116,8 +151,6 @@ struct AuthTicket {
     created = now;
     expires = now;
     expires += ttl;
-    renew_after = now;
-    renew_after += ttl / 2.0;
   }
 
   void encode(ceph::buffer::list& bl) const {
@@ -146,6 +179,26 @@ struct AuthTicket {
     decode(expires, bl);
     decode(caps, bl);
     decode(flags, bl);
+  }
+  void dump(ceph::Formatter *f) const {
+    f->dump_object("name", name);
+    f->dump_unsigned("global_id", global_id);
+    f->dump_stream("created") << created;
+    f->dump_stream("expires") << expires;
+    f->dump_object("caps", caps);
+    f->dump_unsigned("flags", flags);
+  }
+  static std::list<AuthTicket> generate_test_instances() {
+    std::list<AuthTicket> ls;
+    ls.emplace_back();
+    ls.emplace_back();
+    ls.back().name.set_id("client.123");
+    ls.back().global_id = 123;
+    ls.back().init_timestamps(utime_t(123, 456), 7);
+    ls.back().caps.caps.append("foo");
+    ls.back().caps.caps.append("bar");
+    ls.back().flags = 0x12345678;
+    return ls;
   }
 };
 WRITE_CLASS_ENCODER(AuthTicket)
@@ -231,6 +284,18 @@ struct ExpiringCryptoKey {
     decode(key, bl);
     decode(expiration, bl);
   }
+  void dump(ceph::Formatter *f) const {
+    f->dump_object("key", key);
+    f->dump_stream("expiration") << expiration;
+  }
+  static std::list<ExpiringCryptoKey> generate_test_instances() {
+    std::list<ExpiringCryptoKey> ls;
+    ls.emplace_back();
+    ls.emplace_back();
+    ls.back().key.set_secret(
+      CEPH_CRYPTO_AES, bufferptr("1234567890123456", 16), utime_t(123, 456));
+    return ls;
+  }
 };
 WRITE_CLASS_ENCODER(ExpiringCryptoKey)
 
@@ -295,6 +360,17 @@ struct RotatingSecrets {
   }
 
   void dump();
+  void dump(ceph::Formatter *f) const {
+    encode_json("secrets", secrets, f);
+  }
+  static std::list<RotatingSecrets> generate_test_instances() {
+    std::list<RotatingSecrets> ls;
+    ls.emplace_back();
+    ls.emplace_back();
+    ExpiringCryptoKey eck{};
+    ls.back().add(eck);
+    return ls;
+  }
 };
 WRITE_CLASS_ENCODER(RotatingSecrets)
 

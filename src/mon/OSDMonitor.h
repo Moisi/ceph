@@ -114,7 +114,13 @@ class LastEpochClean {
 public:
   void report(unsigned pg_num, const pg_t& pg, epoch_t last_epoch_clean);
   void remove_pool(uint64_t pool);
-  epoch_t get_lower_bound(const OSDMap& latest) const;
+  /**
+   * get_lower_bound_by_pool
+   *
+   * Returns epoch e such that e <= pg.last_epoch_clean for all pgs in cluster.
+   * May return 0 if any pool does not have comprehensive values for all pgs.
+  */
+  epoch_t get_lower_bound_by_pool(const OSDMap& latest) const;
 
   void dump(Formatter *f) const;
 };
@@ -207,7 +213,7 @@ public:
   OSDMap osdmap;
 
   // config observer
-  const char** get_tracked_conf_keys() const override;
+  std::vector<std::string> get_tracked_keys() const noexcept override;
   void handle_conf_change(const ConfigProxy& conf,
     const std::set<std::string> &changed) override;
   // [leader]
@@ -217,13 +223,11 @@ public:
   std::map<int, failure_info_t> failure_info;
   std::map<int,utime_t>    down_pending_out;  // osd down -> out
   bool priority_convert = false;
-  std::map<int64_t,std::set<snapid_t>> pending_pseudo_purged_snaps;
   std::shared_ptr<PriorityCache::PriCache> rocksdb_binned_kv_cache = nullptr;
   std::shared_ptr<PriorityCache::Manager> pcm = nullptr;
   ceph::mutex balancer_lock = ceph::make_mutex("OSDMonitor::balancer_lock");
 
   std::map<int,double> osd_weight;
-  std::set<int32_t> filestore_osds;
 
   using osdmap_key_t = std::pair<version_t, uint64_t>;
   using osdmap_cache_t = SimpleLRU<osdmap_key_t,
@@ -360,7 +364,7 @@ private:
    * @returns true if the map is passable, false otherwise
    */
   bool validate_crush_against_features(const CrushWrapper *newcrush,
-				       std::stringstream &ss);
+				       std::ostream &ss);
   void check_osdmap_subs();
   void share_map_with_random_osd();
 
@@ -406,6 +410,10 @@ private:
   MOSDMap *build_incremental(epoch_t first, epoch_t last, uint64_t features);
   void send_full(MonOpRequestRef op);
   void send_incremental(MonOpRequestRef op, epoch_t first);
+
+  bool remove_pool_snap(std::string_view snapname,
+                        pg_pool_t &pp, int64_t pool);
+
 public:
   /**
    * Make sure the existing (up) OSDs support the given features
@@ -516,6 +524,7 @@ private:
 				const std::string &erasure_code_profile,
 				unsigned *stripe_width,
 				std::ostream *ss);
+  uint32_t get_osd_num_by_crush(int crush_rule);
   int check_pg_num(int64_t pool, int pg_num, int size, int crush_rule, std::ostream* ss);
   int prepare_new_pool(std::string& name,
 		       int crush_rule,
@@ -530,8 +539,9 @@ private:
                        const unsigned pool_type,
                        const uint64_t expected_num_objects,
                        FastReadType fast_read,
-		       const std::string& pg_autoscale_mode,
+		       std::string pg_autoscale_mode,
 		       bool bulk,
+		       bool crimson,
 		       std::ostream *ss);
   int prepare_new_pool(MonOpRequestRef op);
 
@@ -632,8 +642,6 @@ private:
 public:
   void count_metadata(const std::string& field, std::map<std::string,int> *out);
   void get_versions(std::map<std::string, std::list<std::string>> &versions);
-  void get_filestore_osd_list();
-  void check_for_filestore_osds(health_check_map_t *checks);
 protected:
   int get_osd_objectstore_type(int osd, std::string *type);
   bool is_pool_currently_all_bluestore(int64_t pool_id, const pg_pool_t &pool,
@@ -641,8 +649,18 @@ protected:
 
   // when we last received PG stats from each osd and the osd's osd_beacon_report_interval
   std::map<int, std::pair<utime_t, int>> last_osd_report;
-  // TODO: use last_osd_report to store the osd report epochs, once we don't
-  //       need to upgrade from pre-luminous releases.
+  /**
+    * osd_epochs
+    *
+    * Records the MOSDBeacon::version (the osd epoch at which the OSD sent the
+    * beacon) of the most recent beacon recevied from each currently up OSD.
+    * Used in OSDMonitor::get_min_last_epoch_clean().
+    * Down osds are trimmed upon commit of each map
+    *  (OSDMonitor::update_from_paxos).
+    *
+    * TODO: use last_osd_report to store the osd report epochs, once we don't
+    * need to upgrade from pre-luminous releases.
+    */
   std::map<int,epoch_t> osd_epochs;
   LastEpochClean last_epoch_clean;
   bool preprocess_beacon(MonOpRequestRef op);
@@ -700,8 +718,8 @@ public:
   void do_osd_create(const int32_t id, const uuid_d& uuid,
 		     const std::string& device_class,
 		     int32_t* new_id);
-  int prepare_command_osd_purge(int32_t id, std::stringstream& ss);
-  int prepare_command_osd_destroy(int32_t id, std::stringstream& ss);
+  int prepare_command_osd_purge(MonOpRequestRef op, int32_t id, std::stringstream& ss);
+  int prepare_command_osd_destroy(MonOpRequestRef op, int32_t id, std::stringstream& ss);
   int _prepare_command_osd_crush_remove(
       CrushWrapper &newcrush,
       int32_t id,
@@ -723,6 +741,9 @@ public:
       std::stringstream &ss,
       ceph::Formatter *f);
 
+  int enable_pool_ec_optimizations(pg_pool_t &pool,
+                                   std::stringstream *ss,
+                                   bool enable);
   int prepare_command_pool_set(const cmdmap_t& cmdmap,
                                std::stringstream& ss);
 
@@ -733,6 +754,10 @@ public:
                                           const cmdmap_t& cmdmap,
                                           std::stringstream& ss,
                                           bool *modified);
+  int prepare_command_pool_stretch_set(const cmdmap_t& cmdmap,
+                               std::stringstream& ss);
+  int prepare_command_pool_stretch_unset(const cmdmap_t& cmdmap,
+                                std::stringstream& ss);
   int _command_pool_application(const std::string &prefix,
 				const cmdmap_t& cmdmap,
 				std::stringstream& ss,
@@ -822,6 +847,20 @@ public:
 			       uint32_t bucket_count,
 			       const std::set<pg_pool_t*>& pools,
 			       const std::string& new_crush_rule);
+  /**
+  *
+  * Set all stretch mode values of all pools back to pre-stretch mode values.
+  * Set all stretch mode values of OSDMap back to pre-stretch mode values.
+  * If crush_rule is not empty, set the crush rule to that value, else use
+  * the default replicated crush rule.
+  * @param ss: a stringstream to write errors into
+  * @param errcode: filled with -errno if there's a problem
+  * @param crush_rule: the crush rule that will used after disabling stretch mode
+  */
+  void try_disable_stretch_mode(std::stringstream& ss,
+          bool *okay,
+          int *errcode,
+          const std::string& crush_rule);
   /**
    * Check the input dead_buckets mapping (buckets->dead monitors) to see
    * if the OSDs are also down. If so, fill in really_down_buckets and

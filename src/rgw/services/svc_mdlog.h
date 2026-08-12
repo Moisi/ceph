@@ -20,8 +20,6 @@
 #include "rgw_period_history.h"
 #include "rgw_period_puller.h"
 
-#include "svc_meta_be.h"
-
 
 class RGWMetadataLog;
 class RGWMetadataLogHistory;
@@ -29,7 +27,6 @@ class RGWCoroutine;
 
 class RGWSI_Zone;
 class RGWSI_SysObj;
-class RGWSI_RADOS;
 
 namespace mdlog {
   class ReadHistoryCR;
@@ -53,33 +50,37 @@ class RGWSI_MDLog : public RGWServiceInstance
   std::unique_ptr<RGWPeriodPuller> period_puller;
   // maintains a connected history of periods
   std::unique_ptr<RGWPeriodHistory> period_history;
+  rgw::sal::ConfigStore* cfgstore{nullptr};
 
 public:
-  RGWSI_MDLog(CephContext *cct, bool run_sync);
+  RGWSI_MDLog(CephContext *cct, bool run_sync, rgw::sal::ConfigStore* _cfgstore);
   virtual ~RGWSI_MDLog();
 
+  librados::Rados* rados{nullptr};
+  RGWAsyncRadosProcessor* async_processor{nullptr};
+
   struct Svc {
-    RGWSI_RADOS *rados{nullptr};
     RGWSI_Zone *zone{nullptr};
     RGWSI_SysObj *sysobj{nullptr};
     RGWSI_MDLog *mdlog{nullptr};
     RGWSI_Cls *cls{nullptr};
   } svc;
 
-  int init(RGWSI_RADOS *_rados_svc,
+  int init(librados::Rados* rados_,
            RGWSI_Zone *_zone_svc,
            RGWSI_SysObj *_sysobj_svc,
-           RGWSI_Cls *_cls_svc);
+           RGWSI_Cls *_cls_svc,
+	   RGWAsyncRadosProcessor* async_processor_);
 
   int do_start(optional_yield y, const DoutPrefixProvider *dpp) override;
 
   // traverse all the way back to the beginning of the period history, and
   // return a cursor to the first period in a fully attached history
-  RGWPeriodHistory::Cursor find_oldest_period(const DoutPrefixProvider *dpp, optional_yield y);
+  RGWPeriodHistory::Cursor find_oldest_period(const DoutPrefixProvider *dpp, optional_yield y, rgw::sal::ConfigStore* cfgstore);
 
   /// initialize the oldest log period if it doesn't exist, and attach it to
   /// our current history
-  RGWPeriodHistory::Cursor init_oldest_log_period(optional_yield y, const DoutPrefixProvider *dpp);
+  RGWPeriodHistory::Cursor init_oldest_log_period(optional_yield y, const DoutPrefixProvider *dpp, rgw::sal::ConfigStore* cfgstore);
 
   /// read the oldest log period, and return a cursor to it in our existing
   /// period history
@@ -102,7 +103,12 @@ public:
                     RGWObjVersionTracker *objv_tracker,
 		    optional_yield y, bool exclusive = false);
 
-  int add_entry(const DoutPrefixProvider *dpp, const std::string& hash_key, const std::string& section, const std::string& key, bufferlist& bl);
+  int add_entry(const DoutPrefixProvider *dpp, const std::string& hash_key, const std::string& section, const std::string& key, bufferlist& bl, optional_yield y);
+
+  // encode a RGWMetadataLogData with MDLOG_STATUS_COMPLETE and add it
+  int complete_entry(const DoutPrefixProvider* dpp, optional_yield y,
+                     const std::string& section, const std::string& key,
+                     const RGWObjVersionTracker* objv);
 
   int get_shard_id(const std::string& hash_key, int *shard_id);
 
@@ -110,7 +116,7 @@ public:
     return period_history.get();
   }
 
-  int pull_period(const DoutPrefixProvider *dpp, const std::string& period_id, RGWPeriod& period, optional_yield y);
+  int pull_period(const DoutPrefixProvider *dpp, const std::string& period_id, RGWPeriod& period, optional_yield y, rgw::sal::ConfigStore* cfgstore);
 
   /// find or create the metadata log for the given period
   RGWMetadataLog* get_log(const std::string& period);

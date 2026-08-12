@@ -67,7 +67,7 @@ Where:
 
 :Type: String
 :Required: No.
-:Default: jerasure
+:Default: isa
 
 ``{stripe_unit=stripe_unit}``
 
@@ -80,7 +80,9 @@ Where:
               ``osd_pool_erasure_code_stripe_unit`` when a pool is
               created.  The stripe_width of a pool using this profile
               will be the number of data chunks multiplied by this
-              stripe_unit.
+              stripe_unit. See :ref:`rados_ops_erasure_coding_optimizations`
+              for more information.
+
 
 :Type: String
 :Required: No.
@@ -96,7 +98,9 @@ Where:
 ``--force``
 
 :Description: Override an existing profile by the same name, and allow
-              setting a non-4K-aligned stripe_unit.
+              setting a non-4K-aligned stripe_unit. Overriding an existing
+              profile can be dangerous, and thus ``--yes-i-really-mean-it``
+              must be used as well.
 
 :Type: String
 :Required: No.
@@ -109,6 +113,8 @@ To remove an erasure code profile::
 	ceph osd erasure-code-profile rm {name}
 
 If the profile is referenced by a pool, the deletion will fail.
+
+.. warning:: Removing an erasure code profile using ``osd erasure-code-profile rm`` does not automatically delete the associated CRUSH rule associated with the erasure code profile. It is recommended to manually remove the associated CRUSH rule using ``ceph osd crush rule remove {rule-name}`` to avoid unexpected behavior.
 
 osd erasure-code-profile get
 ============================

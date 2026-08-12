@@ -14,7 +14,9 @@ namespace crimson::osd {
 
 class PG;
 
-class RecoverySubRequest final : public PhasedOperationT<RecoverySubRequest> {
+class RecoverySubRequest final :
+    public PhasedOperationT<RecoverySubRequest>,
+    public RemoteOperation {
 public:
   static constexpr OperationTypeCode type =
     OperationTypeCode::background_recovery_sub;
@@ -22,7 +24,7 @@ public:
   RecoverySubRequest(
     crimson::net::ConnectionRef conn,
     Ref<MOSDFastDispatchOp>&& m)
-    : conn(conn), m(m) {}
+    : RemoteOperation(std::move(conn)), m(m) {}
 
   void print(std::ostream& out) const final
   {
@@ -37,9 +39,15 @@ public:
   spg_t get_pgid() const {
     return m->get_spg();
   }
-  ConnectionPipeline &get_connection_pipeline();
   PipelineHandle &get_handle() { return handle; }
   epoch_t get_epoch() const { return m->get_min_epoch(); }
+  epoch_t get_epoch_sent_at() const {
+    return m->get_map_epoch();
+  }
+
+  ConnectionPipeline &get_connection_pipeline();
+
+  PerShardPipeline &get_pershard_pipeline(ShardServices &);
 
   seastar::future<> with_pg(
     ShardServices &shard_services, Ref<PG> pg);
@@ -48,14 +56,14 @@ public:
     StartEvent,
     ConnectionPipeline::AwaitActive::BlockingEvent,
     ConnectionPipeline::AwaitMap::BlockingEvent,
-    ConnectionPipeline::GetPG::BlockingEvent,
+    ConnectionPipeline::GetPGMapping::BlockingEvent,
+    PerShardPipeline::CreateOrWaitPG::BlockingEvent,
     PGMap::PGCreationBlockingEvent,
     OSD_OSDMapGate::OSDMapBlocker::BlockingEvent,
     CompletionEvent
   > tracking_events;
 
 private:
-  crimson::net::ConnectionFRef conn;
   // must be after `conn` to ensure the ConnectionPipeline's is alive
   PipelineHandle handle;
   Ref<MOSDFastDispatchOp> m;

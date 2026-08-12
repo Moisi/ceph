@@ -11,15 +11,19 @@
 #include <seastar/util/closeable.hh>
 #include <seastar/util/defer.hh>
 #include <seastar/util/std-compat.hh>
+#include <seastar/core/app-template.hh>
 
 #include "common/ceph_argparse.h"
 #include "common/config_tracker.h"
 #include "crimson/common/buffer_io.h"
 #include "crimson/common/config_proxy.h"
 #include "crimson/common/fatal_signal.h"
+#include "crimson/common/perf_counters_collection.h"
 #include "crimson/mon/MonClient.h"
 #include "crimson/net/Messenger.h"
 #include "crimson/osd/main_config_bootstrap_helpers.h"
+
+#include <sys/wait.h> // for waitpid()
 
 using namespace std::literals;
 using crimson::common::local_conf;
@@ -35,7 +39,7 @@ namespace crimson::osd {
 
 void usage(const char* prog)
 {
-  std::cout << "usage: " << prog << std::endl;
+  std::cout << "crimson osd usage: " << prog << " -i <ID> [flags...]" << std::endl;
   generic_server_usage();
 }
 
@@ -55,7 +59,8 @@ seastar::future<> populate_config_from_mon()
     auto auth_handler = std::make_unique<DummyAuthHandler>();
     auto msgr = crimson::net::Messenger::create(entity_name_t::CLIENT(),
                                                 "temp_mon_client",
-                                                get_nonce());
+                                                get_nonce(),
+                                                true);
     crimson::mon::Client monc{*msgr, *auth_handler};
     msgr->set_auth_client(&monc);
     msgr->start({&monc}).get();
@@ -80,6 +85,48 @@ seastar::future<> populate_config_from_mon()
   });
 }
 
+struct SeastarOption {
+  std::string option_name;  // Command-line option name
+  std::string config_key;   // Configuration key
+  Option::type_t value_type ;   // Type of configuration value
+};
+
+// Define a list of Seastar options
+const std::vector<SeastarOption> seastar_options = {
+  {"--task-quota-ms", "crimson_reactor_task_quota_ms", Option::TYPE_FLOAT},
+  {"--io-latency-goal-ms", "crimson_reactor_io_latency_goal_ms", Option::TYPE_FLOAT},
+  {"--idle-poll-time-us", "crimson_reactor_idle_poll_time_us", Option::TYPE_UINT},
+  {"--poll-mode", "crimson_poll_mode", Option::TYPE_BOOL}
+};
+
+// Function to get the option value as a string
+std::optional<std::string> get_option_value(const SeastarOption& option) {
+  switch (option.value_type) {
+    case Option::TYPE_FLOAT: {
+      if (auto value = crimson::common::get_conf<double>(option.config_key)) {
+        return std::to_string(value);
+      }
+      break;
+    }
+    case Option::TYPE_UINT: {
+      if (auto value = crimson::common::get_conf<uint64_t>(option.config_key)) {
+        return std::to_string(value);
+      }
+      break;
+    }
+    case Option::TYPE_BOOL: {
+     if (crimson::common::get_conf<bool>(option.config_key)) {
+        return "true";
+      }
+      break;
+    }
+    default:
+      logger().warn("get_option_value --option_name {} encountered unknown type", option.config_key);
+      return std::nullopt;
+  }
+  return std::nullopt;
+}
+
 static tl::expected<early_config_t, int>
 _get_early_config(int argc, const char *argv[])
 {
@@ -96,11 +143,6 @@ _get_early_config(int argc, const char *argv[])
     CEPH_ENTITY_TYPE_OSD,
     &ret.cluster_name,
     &ret.conf_file_list);
-
-  if (ceph_argparse_need_usage(early_args)) {
-    usage(argv[0]);
-    exit(0);
-  }
 
   seastar::app_template::config app_cfg;
   app_cfg.name = "Crimson-startup";
@@ -144,20 +186,52 @@ _get_early_config(int argc, const char *argv[])
 	  std::begin(early_args),
 	  std::end(early_args));
 
+        for (const auto& option : seastar_options) {
+          auto option_value = get_option_value(option);
+          if (option_value) {
+            logger().info("Configure option_name {} with value : {}", option.config_key, option_value);
+            ret.early_args.emplace_back(option.option_name);
+            if (option.value_type != Option::TYPE_BOOL) {
+              ret.early_args.emplace_back(*option_value);
+            }
+          }
+        }
 	if (auto found = std::find_if(
 	      std::begin(early_args),
 	      std::end(early_args),
-	      [](auto* arg) { return "--smp"sv == arg; });
+	      [](auto* arg) { return "--cpuset"sv == arg; });
 	    found == std::end(early_args)) {
+	  auto cpu_cores = crimson::common::get_conf<std::string>("crimson_cpu_set");
+	  if (!cpu_cores.empty()) {
+	    // Set --cpuset based on crimson_cpu_set config option
+	    // --smp default is one per CPU
+	    ret.early_args.emplace_back("--cpuset");
+	    ret.early_args.emplace_back(cpu_cores);
+	    ret.early_args.emplace_back("--thread-affinity");
+	    ret.early_args.emplace_back("1");
+	    logger().info("get_early_config: set --thread-affinity 1 --cpuset {}",
+	                  cpu_cores);
+	  } else {
+	    auto reactor_num = crimson::common::get_conf<uint64_t>("crimson_cpu_num");
+	    if (!reactor_num) {
+	      // We would like to avoid seastar using all available cores.
+	      logger().error("get_early_config: crimson_cpu_set"
+	                     " or crimson_cpu_num must be set");
+	      ceph_abort();
+	    }
+	    std::string smp = fmt::format("{}", reactor_num);
+	    ret.early_args.emplace_back("--smp");
+	    ret.early_args.emplace_back(smp);
+	    ret.early_args.emplace_back("--thread-affinity");
+	    ret.early_args.emplace_back("0");
+	    logger().info("get_early_config: set --thread-affinity 0 --smp {}",
+	                  smp);
 
-	  // Set --smp based on crimson_seastar_smp config option
-	  ret.early_args.emplace_back("--smp");
-
-	  auto smp_config = local_conf().get_val<uint64_t>(
-	    "crimson_seastar_smp");
-
-	  ret.early_args.emplace_back(fmt::format("{}", smp_config));
-	  logger().info("get_early_config: set --smp {}", smp_config);
+	  }
+	} else {
+	  logger().error("get_early_config: --cpuset can be "
+	                 "set only using crimson_cpu_set");
+	  ceph_abort();
 	}
 	return 0;
       });
@@ -198,6 +272,15 @@ _get_early_config(int argc, const char *argv[])
 tl::expected<early_config_t, int>
 get_early_config(int argc, const char *argv[])
 {
+  auto args = argv_to_vec(argc, argv);
+  if (args.empty()) {
+    std::cerr << argv[0] << ": -h or --help for usage" << std::endl;
+    exit(1);
+  }
+  if (ceph_argparse_need_usage(args)) {
+    usage(argv[0]);
+    exit(0);
+  }
   int pipes[2];
   int r = pipe2(pipes, 0);
   if (r < 0) {
@@ -239,12 +322,20 @@ get_early_config(int argc, const char *argv[])
 
     bufferlist bl;
     early_config_t ret;
-    while ((r = bl.read_fd(pipes[0], 1024)) > 0);
+    bool have_data = false;
+    while ((r = bl.read_fd(pipes[0], 1024)) > 0) {
+      have_data = true;
+    }
     close(pipes[0]);
 
-    // ignore error, we'll propogate error based on read and decode
-    waitpid(worker, nullptr, 0);
+    int status;
+    waitpid(worker, &status, 0);
 
+    // One of the parameters was taged as exit(0) in the child process
+    // so we need to check if we should exit here
+    if (!have_data && WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+      exit(0);
+    }
     if (r < 0) {
       std::cerr << "get_early_config: parent failed to read from pipe: "
 		<< r << std::endl;

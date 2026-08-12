@@ -18,8 +18,9 @@
 #include "global/global_context.h"
 #include "global/global_init.h"
 #include "common/ceph_context.h"
-#include "rgw_obj_manifest.h"
 #include "rgw_multi.h"
+
+#include "driver/rados/rgw_obj_manifest.h" // FIXME: subclass dependency
 
 namespace rgw { namespace store {
 
@@ -34,7 +35,7 @@ struct DBOpUserInfo {
 struct DBOpBucketInfo {
   RGWBucketEnt ent; // maybe not needed. not used in create/get_bucket
   RGWBucketInfo info;
-  RGWUser* owner = nullptr;
+  std::string owner;
   rgw::sal::Attrs bucket_attrs;
   obj_version bucket_version;
   ceph::real_time mtime;
@@ -103,15 +104,15 @@ struct DBOpObjectDataInfo {
 
 struct DBOpLCHeadInfo {
   std::string index;
-  rgw::sal::StoreLifecycle::StoreLCHead head;
+  rgw::sal::LCHead head;
 };
 
 struct DBOpLCEntryInfo {
   std::string index;
-  rgw::sal::StoreLifecycle::StoreLCEntry entry;
+  rgw::sal::LCEntry entry;
   // used for list query
   std::string min_marker;
-  std::list<rgw::sal::StoreLifecycle::StoreLCEntry> list_entries;
+  std::list<rgw::sal::LCEntry> list_entries;
 };
 
 struct DBOpInfo {
@@ -155,7 +156,7 @@ struct DBOpParams {
  * Difference with above structure is that all 
  * the fields are strings here to accommodate any
  * style identifiers used by backend db. By default
- * initialized with sqlitedb style, can be overriden
+ * initialized with sqlitedb style, can be overridden
  * using InitPrepareParams()
  *
  * These identifiers are used in prepare and bind statements
@@ -193,7 +194,6 @@ struct DBOpUserPrepareInfo {
   static constexpr const char* user_quota = ":user_quota";
   static constexpr const char* type = ":type";
   static constexpr const char* mfa_ids = ":mfa_ids";
-  static constexpr const char* assumed_role_arn = ":assumed_role_arn";
   static constexpr const char* user_attrs = ":user_attrs";
   static constexpr const char* user_ver = ":user_vers";
   static constexpr const char* user_ver_tag = ":user_ver_tag";
@@ -482,9 +482,7 @@ class DBOp {
       BucketVersion   INTEGER,    \
       BucketVersionTag TEXT,      \
       Mtime   BLOB,   \
-      PRIMARY KEY (BucketName) \
-      FOREIGN KEY (OwnerID) \
-      REFERENCES '{}' (UserID) ON DELETE CASCADE ON UPDATE CASCADE \n);";
+      PRIMARY KEY (BucketName) \n);";
 
     static constexpr std::string_view CreateObjectTableTriggerQ =
       "CREATE TRIGGER IF NOT EXISTS '{}' \
@@ -519,7 +517,7 @@ class DBOp {
        *
        * - RGWObjState. Below are omitted from that struct
        *    as they seem in-memory variables
-       *    * is_atomic, has_atts, exists, prefetch_data, keep_tail, 
+       *    * is_atomic, has_atts, exists, prefetch_data, 
        * - RGWObjManifest
        *
        * Extra field added "IsMultipart" to flag multipart uploads,
@@ -605,7 +603,7 @@ class DBOp {
       REFERENCES '{}' (BucketName) ON DELETE CASCADE ON UPDATE CASCADE \n);";
 
     static constexpr std::string_view CreateObjectViewQ =
-      /* This query creats temporary view with entries from ObjectData table which have
+      /* This query creates temporary view with entries from ObjectData table which have
        * corresponding head object (i.e, with same ObjName, ObjInstance, ObjNS, ObjID)
        * in the Object table.
        *
@@ -711,8 +709,8 @@ class InsertUserOp : virtual public DBOp {
   private:
     /* For existing entires, -
      * (1) INSERT or REPLACE - it will delete previous entry and then
-     * inserts new one. Since it deletes previos enties, it will
-     * trigger all foriegn key cascade deletes or other triggers.
+     * inserts new one. Since it deletes previous entries, it will
+     * trigger all foreign key cascade deletes or other triggers.
      * (2) INSERT or UPDATE - this will set NULL values to unassigned
      * fields.
      * more info: https://code-examples.net/en/q/377728
@@ -725,10 +723,10 @@ class InsertUserOp : virtual public DBOp {
                            AccessKeysID, AccessKeysSecret, AccessKeys, SwiftKeys,\
                            SubUsers, Suspended, MaxBuckets, OpMask, UserCaps, Admin, \
                            System, PlacementName, PlacementStorageClass, PlacementTags, \
-                           BucketQuota, TempURLKeys, UserQuota, Type, MfaIDs, AssumedRoleARN, \
+                           BucketQuota, TempURLKeys, UserQuota, Type, MfaIDs, \
                            UserAttrs, UserVersion, UserVersionTag) \
                           VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, \
-                              {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {});";
+                              {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {});";
 
   public:
     virtual ~InsertUserOp() {}
@@ -746,8 +744,8 @@ class InsertUserOp : virtual public DBOp {
           params.op.user.placement_tags, params.op.user.bucket_quota,
           params.op.user.temp_url_keys, params.op.user.user_quota,
           params.op.user.type, params.op.user.mfa_ids,
-          params.op.user.assumed_role_arn, params.op.user.user_attrs,
-          params.op.user.user_ver, params.op.user.user_ver_tag);
+          params.op.user.user_attrs, params.op.user.user_ver,
+          params.op.user.user_ver_tag);
     }
 
 };
@@ -870,14 +868,14 @@ class UpdateBucketOp: virtual public DBOp {
       Zonegroup = {}, HasInstanceObj = {}, Quota = {}, RequesterPays = {}, HasWebsite = {}, \
       WebsiteConf = {}, SwiftVersioning = {}, SwiftVerLocation = {}, MdsearchConfig = {}, \
       NewBucketInstanceID = {}, ObjectLock = {}, SyncPolicyInfoGroups = {}, \
-      BucketVersion = {}, Mtime = {} WHERE BucketName = {}";
+      BucketAttrs = {}, BucketVersion = {}, Mtime = {} WHERE BucketName = {}";
     // Updates Attrs, OwnerID, Mtime, Version
     static constexpr std::string_view AttrsQuery =
       "UPDATE '{}' SET OwnerID = {}, BucketAttrs = {}, Mtime = {}, BucketVersion = {} \
       WHERE BucketName = {}";
     // Updates OwnerID, CreationTime, Mtime, Version
     static constexpr std::string_view OwnerQuery =
-      "UPDATE '{}' SET OwnerID = {}, CreationTime = {}, Mtime = {}, BucketVersion = {} WHERE BucketName = {}";
+      "UPDATE '{}' SET OwnerID = {}, CreationTime = {}, BucketAttrs = {}, Mtime = {}, BucketVersion = {} WHERE BucketName = {}";
 
   public:
     virtual ~UpdateBucketOp() {}
@@ -895,6 +893,7 @@ class UpdateBucketOp: virtual public DBOp {
             params.op.bucket.swift_ver_location, params.op.bucket.mdsearch_config,
             params.op.bucket.new_bucket_instance_id, params.op.bucket.obj_lock,
             params.op.bucket.sync_policy_info_groups,
+            params.op.bucket.bucket_attrs,
             params.op.bucket.bucket_ver, params.op.bucket.mtime,
             params.op.bucket.bucket_name);
       }
@@ -907,6 +906,7 @@ class UpdateBucketOp: virtual public DBOp {
       if (params.op.query_str == "owner") {
         return fmt::format(OwnerQuery, params.bucket_table,
             params.op.user.user_id, params.op.bucket.creation_time,
+            params.op.bucket.bucket_attrs,
             params.op.bucket.mtime,
             params.op.bucket.bucket_ver, params.op.bucket.bucket_name);
       }
@@ -931,22 +931,20 @@ class RemoveBucketOp: virtual public DBOp {
 class GetBucketOp: virtual public DBOp {
   private:
     static constexpr std::string_view Query = "SELECT  \
-                          BucketName, BucketTable.Tenant, Marker, BucketID, Size, SizeRounded, CreationTime, \
-                          Count, BucketTable.PlacementName, BucketTable.PlacementStorageClass, OwnerID, Flags, Zonegroup, \
+                          BucketName, Tenant, Marker, BucketID, Size, SizeRounded, CreationTime, \
+                          Count, PlacementName, PlacementStorageClass, OwnerID, Flags, Zonegroup, \
                           HasInstanceObj, Quota, RequesterPays, HasWebsite, WebsiteConf, \
                           SwiftVersioning, SwiftVerLocation, \
                           MdsearchConfig, NewBucketInstanceID, ObjectLock, \
-                          SyncPolicyInfoGroups, BucketAttrs, BucketVersion, BucketVersionTag, Mtime, NS \
-                          from '{}' as BucketTable INNER JOIN '{}' ON OwnerID = UserID where BucketName = {}";
+                          SyncPolicyInfoGroups, BucketAttrs, BucketVersion, BucketVersionTag, Mtime \
+                          from '{}' where BucketName = {}";
 
   public:
     virtual ~GetBucketOp() {}
 
     static std::string Schema(DBOpPrepareParams &params) {
-      //return fmt::format(Query, params.op.bucket.bucket_name,
-      //          params.bucket_table, params.user_table);
       return fmt::format(Query,
-          params.bucket_table, params.user_table,
+          params.bucket_table,
           params.op.bucket.bucket_name);
     }
 };
@@ -1596,26 +1594,22 @@ class DB {
         RGWBucketInfo& info, rgw::sal::Attrs* pattrs, ceph::real_time* pmtime,
         obj_version* pbucket_version);
     int create_bucket(const DoutPrefixProvider *dpp,
-        const RGWUserInfo& owner, rgw_bucket& bucket,
+        const rgw_owner& owner, const rgw_bucket& bucket,
         const std::string& zonegroup_id,
         const rgw_placement_rule& placement_rule,
-        const std::string& swift_ver_location,
-        const RGWQuotaInfo * pquota_info,
-        std::map<std::string, bufferlist>& attrs,
-        RGWBucketInfo& info,
-        obj_version *pobjv,
+        const std::map<std::string, bufferlist>& attrs,
+        const std::optional<std::string>& swift_ver_location,
+        const std::optional<RGWQuotaInfo>& quota,
+        std::optional<ceph::real_time> creation_time,
         obj_version *pep_objv,
-        real_time creation_time,
-        rgw_bucket *pmaster_bucket,
-        uint32_t *pmaster_num_shards,
-        optional_yield y,
-        bool exclusive);
+        RGWBucketInfo& info,
+        optional_yield y);
 
     int next_bucket_id() { return ++max_bucket_id; };
 
     int remove_bucket(const DoutPrefixProvider *dpp, const RGWBucketInfo info);
     int list_buckets(const DoutPrefixProvider *dpp, const std::string& query_str,
-        rgw_user& user,
+        std::string& owner,
         const std::string& marker,
         const std::string& end_marker,
         uint64_t max,
@@ -1624,7 +1618,7 @@ class DB {
         bool *is_truncated);
     int update_bucket(const DoutPrefixProvider *dpp, const std::string& query_str,
         RGWBucketInfo& info, bool exclusive,
-        const rgw_user* powner_id, std::map<std::string, bufferlist>* pattrs,
+        const rgw_owner* powner, std::map<std::string, bufferlist>* pattrs,
         ceph::real_time* pmtime, RGWObjVersionTracker* pobjv);
 
     uint64_t get_max_head_size() { return ObjHeadSize; }
@@ -1775,14 +1769,13 @@ class DB {
           rgw_obj_key end_marker;
           std::string ns;
           bool enforce_ns;
-          RGWAccessListFilter* access_list_filter;
+	  rgw::AccessListFilter access_list_filter;
           RGWBucketListNameFilter force_check_filter;
           bool list_versions;
 	  bool allow_unordered;
 
           Params() :
 	        enforce_ns(true),
-	        access_list_filter(nullptr),
 	        list_versions(false),
 	        allow_unordered(false)
 	        {}
@@ -1836,8 +1829,8 @@ class DB {
           bool high_precision_time;
           uint32_t mod_zone_id;
           uint64_t mod_pg_ver;
-          const char *if_match;
-          const char *if_nomatch;
+          const char *if_match{nullptr};
+          const char *if_nomatch{nullptr};
 
           ConditionParams() :
             mod_ptr(NULL), unmod_ptr(NULL), high_precision_time(false), mod_zone_id(0), mod_pg_ver(0),
@@ -1879,8 +1872,8 @@ class DB {
           rgw_user owner;
           RGWObjCategory category;
           int flags;
-          const char *if_match;
-          const char *if_nomatch;
+          const char *if_match{nullptr};
+          const char *if_nomatch{nullptr};
           std::optional<uint64_t> olh_epoch;
           ceph::real_time delete_at;
           bool canceled;
@@ -1914,7 +1907,6 @@ class DB {
         DB::Object *target;
 
         struct DeleteParams {
-          rgw_user bucket_owner;
           int versioning_status;
           ACLOwner obj_owner; /* needed for creation of deletion marker */
           uint64_t olh_epoch;
@@ -1923,7 +1915,11 @@ class DB {
           std::list<rgw_obj_index_key> *remove_objs;
           ceph::real_time expiration_time;
           ceph::real_time unmod_since;
+          ceph::real_time last_mod_time_match;
           ceph::real_time mtime; /* for setting delete marker mtime */
+          std::optional<uint64_t> size_match;
+          const char *if_match{nullptr};
+          const char *if_nomatch{nullptr};
           bool high_precision_time;
           rgw_zone_set *zones_trace;
           bool abortmp;
@@ -1989,15 +1985,15 @@ class DB {
         RGWObjState *astate, void *arg);
 
     int get_entry(const std::string& oid, const std::string& marker,
-		  std::unique_ptr<rgw::sal::Lifecycle::LCEntry>* entry);
+		  rgw::sal::LCEntry& entry);
     int get_next_entry(const std::string& oid, const std::string& marker,
-		  std::unique_ptr<rgw::sal::Lifecycle::LCEntry>* entry);
-    int set_entry(const std::string& oid, rgw::sal::Lifecycle::LCEntry& entry);
+		  rgw::sal::LCEntry& entry);
+    int set_entry(const std::string& oid, const rgw::sal::LCEntry& entry);
     int list_entries(const std::string& oid, const std::string& marker,
-			   uint32_t max_entries, std::vector<std::unique_ptr<rgw::sal::Lifecycle::LCEntry>>& entries);
-    int rm_entry(const std::string& oid, rgw::sal::Lifecycle::LCEntry& entry);
-    int get_head(const std::string& oid, std::unique_ptr<rgw::sal::Lifecycle::LCHead>* head);
-    int put_head(const std::string& oid, rgw::sal::Lifecycle::LCHead& head);
+			   uint32_t max_entries, std::vector<rgw::sal::LCEntry>& entries);
+    int rm_entry(const std::string& oid, const rgw::sal::LCEntry& entry);
+    int get_head(const std::string& oid, rgw::sal::LCHead& head);
+    int put_head(const std::string& oid, const rgw::sal::LCHead& head);
     int delete_stale_objs(const DoutPrefixProvider *dpp, const std::string& bucket,
                           uint32_t min_wait);
     int createGC(const DoutPrefixProvider *_dpp);

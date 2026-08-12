@@ -33,6 +33,7 @@ DECLARE_DEVICE_OPERATIONS(ggate);
 DECLARE_DEVICE_OPERATIONS(kernel);
 DECLARE_DEVICE_OPERATIONS(nbd);
 DECLARE_DEVICE_OPERATIONS(wnbd);
+DECLARE_DEVICE_OPERATIONS(ubbd);
 
 namespace device {
 
@@ -83,11 +84,20 @@ const DeviceOperations wnbd_operations = {
   wnbd::execute_detach,
 };
 
+const DeviceOperations ubbd_operations = {
+  ubbd::execute_list,
+  ubbd::execute_map,
+  ubbd::execute_unmap,
+  ubbd::execute_attach,
+  ubbd::execute_detach,
+};
+
 enum device_type_t {
   DEVICE_TYPE_GGATE,
   DEVICE_TYPE_KRBD,
   DEVICE_TYPE_NBD,
   DEVICE_TYPE_WNBD,
+  DEVICE_TYPE_UBBD,
 };
 
 struct DeviceType {};
@@ -107,6 +117,8 @@ void validate(boost::any& v, const std::vector<std::string>& values,
     v = boost::any(DEVICE_TYPE_GGATE);
   } else if (s == "krbd") {
     v = boost::any(DEVICE_TYPE_KRBD);
+  } else if (s == "ubbd") {
+    v = boost::any(DEVICE_TYPE_UBBD);
   #endif /* _WIN32 */
   } else {
     throw po::validation_error(po::validation_error::invalid_option_value);
@@ -119,7 +131,7 @@ void add_device_type_option(po::options_description *options) {
 #ifdef _WIN32
      "device type [wnbd]");
 #else
-     "device type [ggate, krbd (default), nbd]");
+     "device type [ggate, krbd (default), nbd, ubbd]");
 #endif
 }
 
@@ -150,6 +162,8 @@ const DeviceOperations *get_device_operations(const po::variables_map &vm) {
     return &nbd_operations;
   case DEVICE_TYPE_WNBD:
     return &wnbd_operations;
+  case DEVICE_TYPE_UBBD:
+    return &ubbd_operations;
   default:
     ceph_abort();
     return nullptr;
@@ -181,7 +195,7 @@ void get_map_arguments(po::options_description *positional,
     ("exclusive", po::bool_switch(), "disable automatic exclusive lock transitions")
     ("quiesce", po::bool_switch(), "use quiesce hooks")
     ("quiesce-hook", po::value<std::string>(), "quiesce hook path");
-  at::add_snap_id_option(options);
+  at::add_snap_id_option(options, at::ARGUMENT_MODIFIER_NONE);
   add_device_specific_options(options);
 }
 
@@ -201,7 +215,7 @@ void get_unmap_arguments(po::options_description *positional,
   at::add_namespace_option(options, at::ARGUMENT_MODIFIER_NONE);
   at::add_image_option(options, at::ARGUMENT_MODIFIER_NONE);
   at::add_snap_option(options, at::ARGUMENT_MODIFIER_NONE);
-  at::add_snap_id_option(options);
+  at::add_snap_id_option(options, at::ARGUMENT_MODIFIER_NONE);
   add_device_specific_options(options);
 }
 
@@ -224,7 +238,7 @@ void get_attach_arguments(po::options_description *positional,
     ("exclusive", po::bool_switch(), "disable automatic exclusive lock transitions")
     ("quiesce", po::bool_switch(), "use quiesce hooks")
     ("quiesce-hook", po::value<std::string>(), "quiesce hook path");
-  at::add_snap_id_option(options);
+  at::add_snap_id_option(options, at::ARGUMENT_MODIFIER_NONE);
   add_device_specific_options(options);
 }
 
@@ -244,7 +258,7 @@ void get_detach_arguments(po::options_description *positional,
   at::add_namespace_option(options, at::ARGUMENT_MODIFIER_NONE);
   at::add_image_option(options, at::ARGUMENT_MODIFIER_NONE);
   at::add_snap_option(options, at::ARGUMENT_MODIFIER_NONE);
-  at::add_snap_id_option(options);
+  at::add_snap_id_option(options, at::ARGUMENT_MODIFIER_NONE);
   add_device_specific_options(options);
 }
 

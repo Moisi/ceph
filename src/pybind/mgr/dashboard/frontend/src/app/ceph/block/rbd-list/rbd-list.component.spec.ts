@@ -92,60 +92,6 @@ describe('RbdListComponent', () => {
     });
   });
 
-  describe('handling of provisioned columns', () => {
-    let rbdServiceListSpy: jasmine.Spy;
-
-    const images = [
-      {
-        name: 'img1',
-        pool_name: 'rbd',
-        features_name: ['layering', 'exclusive-lock'],
-        disk_usage: null,
-        total_disk_usage: null
-      },
-      {
-        name: 'img2',
-        pool_name: 'rbd',
-        features_name: ['layering', 'exclusive-lock', 'object-map', 'fast-diff'],
-        disk_usage: 1024,
-        total_disk_usage: 1024
-      }
-    ];
-
-    beforeEach(() => {
-      component.images = images;
-      refresh({ executing_tasks: [], finished_tasks: [] });
-      rbdServiceListSpy = spyOn(rbdService, 'list');
-    });
-
-    it('should display N/A for Provisioned & Total Provisioned columns if disk usage is null', () => {
-      rbdServiceListSpy.and.callFake(() =>
-        of([{ pool_name: 'rbd', value: images, headers: headers }])
-      );
-      fixture.detectChanges();
-      const spanWithoutFastDiff = fixture.debugElement.nativeElement.querySelectorAll(
-        '.datatable-body-cell-label span'
-      );
-      // check image with disk usage = null & fast-diff disabled
-      expect(spanWithoutFastDiff[6].textContent).toBe('N/A');
-
-      images[0]['features_name'] = ['layering', 'exclusive-lock', 'object-map', 'fast-diff'];
-      component.images = images;
-      refresh({ executing_tasks: [], finished_tasks: [] });
-
-      rbdServiceListSpy.and.callFake(() =>
-        of([{ pool_name: 'rbd', value: images, headers: headers }])
-      );
-      fixture.detectChanges();
-
-      const spanWithFastDiff = fixture.debugElement.nativeElement.querySelectorAll(
-        '.datatable-body-cell-label span'
-      );
-      // check image with disk usage = null & fast-diff changed to enabled
-      expect(spanWithFastDiff[6].textContent).toBe('-');
-    });
-  });
-
   describe('handling of deletion', () => {
     beforeEach(() => {
       fixture.detectChanges();
@@ -182,7 +128,7 @@ describe('RbdListComponent', () => {
         ]
       });
       expect(component.getDeleteDisableDesc(component.selection)).toBe(
-        'This RBD has cloned snapshots. Please delete related RBDs before deleting this RBD.'
+        'This RBD has cloned snapshots. Please delete related RBDs before deleting this RBD'
       );
     });
 
@@ -322,13 +268,18 @@ describe('RbdListComponent', () => {
           'Copy',
           'Flatten',
           'Resync',
-          'Delete',
-          'Move to Trash',
           'Remove Scheduling',
           'Promote',
-          'Demote'
+          'Demote',
+          'Move to Trash',
+          'Delete'
         ],
-        primary: { multiple: 'Create', executing: 'Edit', single: 'Edit', no: 'Create' }
+        primary: {
+          multiple: 'Create',
+          executing: 'Create',
+          single: 'Create',
+          no: 'Create'
+        }
       },
       'create,update': {
         actions: [
@@ -341,40 +292,75 @@ describe('RbdListComponent', () => {
           'Promote',
           'Demote'
         ],
-        primary: { multiple: 'Create', executing: 'Edit', single: 'Edit', no: 'Create' }
+        primary: {
+          multiple: 'Create',
+          executing: 'Create',
+          single: 'Create',
+          no: 'Create'
+        }
       },
       'create,delete': {
-        actions: ['Create', 'Copy', 'Delete', 'Move to Trash'],
-        primary: { multiple: 'Create', executing: 'Copy', single: 'Copy', no: 'Create' }
+        actions: ['Create', 'Copy', 'Move to Trash', 'Delete'],
+        primary: {
+          multiple: 'Create',
+          executing: 'Create',
+          single: 'Create',
+          no: 'Create'
+        }
       },
       create: {
         actions: ['Create', 'Copy'],
-        primary: { multiple: 'Create', executing: 'Copy', single: 'Copy', no: 'Create' }
+        primary: {
+          multiple: 'Create',
+          executing: 'Create',
+          single: 'Create',
+          no: 'Create'
+        }
       },
       'update,delete': {
         actions: [
           'Edit',
           'Flatten',
           'Resync',
-          'Delete',
-          'Move to Trash',
           'Remove Scheduling',
           'Promote',
-          'Demote'
+          'Demote',
+          'Move to Trash',
+          'Delete'
         ],
-        primary: { multiple: 'Edit', executing: 'Edit', single: 'Edit', no: 'Edit' }
+        primary: {
+          multiple: '',
+          executing: '',
+          single: '',
+          no: ''
+        }
       },
       update: {
         actions: ['Edit', 'Flatten', 'Resync', 'Remove Scheduling', 'Promote', 'Demote'],
-        primary: { multiple: 'Edit', executing: 'Edit', single: 'Edit', no: 'Edit' }
+        primary: {
+          multiple: '',
+          executing: '',
+          single: '',
+          no: ''
+        }
       },
       delete: {
-        actions: ['Delete', 'Move to Trash'],
-        primary: { multiple: 'Delete', executing: 'Delete', single: 'Delete', no: 'Delete' }
+        actions: ['Move to Trash', 'Delete'],
+        primary: {
+          multiple: '',
+          executing: '',
+          single: '',
+          no: ''
+        }
       },
       'no-permissions': {
         actions: [],
-        primary: { multiple: '', executing: '', single: '', no: '' }
+        primary: {
+          multiple: '',
+          executing: '',
+          single: '',
+          no: ''
+        }
       }
     });
   });

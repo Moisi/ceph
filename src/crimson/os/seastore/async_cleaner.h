@@ -16,7 +16,9 @@
 #include "crimson/os/seastore/segment_manager_group.h"
 #include "crimson/os/seastore/randomblock_manager_group.h"
 #include "crimson/os/seastore/transaction.h"
+#include "crimson/os/seastore/transaction_interruptor.h"
 #include "crimson/os/seastore/segment_seq_allocator.h"
+#include "crimson/os/seastore/backref_mapping.h"
 
 namespace crimson::os::seastore {
 
@@ -43,6 +45,7 @@ struct segment_info_t {
 
   sea_time_point modify_time = NULL_TIME;
 
+  // Might be unavailable(0), see mount() -> init_modify_time()
   std::size_t num_extents = 0;
 
   segment_off_t written_to = 0;
@@ -74,6 +77,13 @@ struct segment_info_t {
   void set_empty();
 
   void set_closed();
+
+  void init_modify_time(sea_time_point _modify_time) {
+    ceph_assert(modify_time == NULL_TIME);
+    ceph_assert(num_extents == 0);
+    ceph_assert(_modify_time != NULL_TIME);
+    modify_time = _modify_time;
+  }
 
   void update_modify_time(sea_time_point _modify_time, std::size_t _num_extents) {
     ceph_assert(!is_closed());
@@ -226,6 +236,15 @@ public:
 
   void update_written_to(segment_type_t, paddr_t);
 
+  void init_modify_time(
+      segment_id_t id, sea_time_point tp) {
+    if (tp == NULL_TIME) {
+      return;
+    }
+
+    segments[id].init_modify_time(tp);
+  }
+
   void update_modify_time(
       segment_id_t id, sea_time_point tp, std::size_t num) {
     if (num == 0) {
@@ -271,37 +290,38 @@ std::ostream &operator<<(std::ostream &, const segments_info_t &);
  */
 class ExtentCallbackInterface {
 public:
-  using base_ertr = crimson::errorator<
-    crimson::ct_error::input_output_error>;
-  using base_iertr = trans_iertr<base_ertr>;
-
   virtual ~ExtentCallbackInterface() = default;
+
+  virtual shard_stats_t& get_shard_stats() = 0;
 
   /// Creates empty transaction
   /// weak transaction should be type READ
   virtual TransactionRef create_transaction(
-      Transaction::src_t, const char *name, bool is_weak=false) = 0;
+    Transaction::src_t,
+    const char *name,
+    cache_hint_t cache_hint = CACHE_HINT_TOUCH,
+    bool is_weak=false) = 0;
 
   /// Creates empty transaction with interruptible context
   template <typename Func>
   auto with_transaction_intr(
       Transaction::src_t src,
       const char* name,
+      cache_hint_t cache_hint,
       Func &&f) {
     return do_with_transaction_intr<Func, false>(
-        src, name, std::forward<Func>(f));
+        src, name, cache_hint, std::forward<Func>(f));
   }
 
   template <typename Func>
   auto with_transaction_weak(
       const char* name,
+      cache_hint_t cache_hint,
       Func &&f) {
     return do_with_transaction_intr<Func, true>(
-        Transaction::src_t::READ, name, std::forward<Func>(f)
+        Transaction::src_t::READ, name, cache_hint, std::forward<Func>(f)
     ).handle_error(
-      crimson::ct_error::eagain::handle([] {
-        ceph_assert(0 == "eagain impossible");
-      }),
+      crimson::ct_error::eagain::assert_failure{"unexpected eagain"},
       crimson::ct_error::pass_further_all{}
     );
   }
@@ -333,12 +353,12 @@ public:
     sea_time_point modify_time) = 0;
 
   /**
-   * get_extent_if_live
+   * get_extents_if_live
    *
    * Returns extent at specified location if still referenced by
    * lba_manager and not removed by t.
    *
-   * See TransactionManager::get_extent_if_live and
+   * See TransactionManager::get_extents_if_live and
    * LBAManager::get_physical_extent_if_live.
    */
   using get_extents_if_live_iertr = base_iertr;
@@ -368,9 +388,10 @@ private:
   auto do_with_transaction_intr(
       Transaction::src_t src,
       const char* name,
+      cache_hint_t cache_hint,
       Func &&f) {
     return seastar::do_with(
-      create_transaction(src, name, IsWeak),
+      create_transaction(src, name, cache_hint, IsWeak),
       [f=std::forward<Func>(f)](auto &ref_t) mutable {
         return with_trans_intr(
           *ref_t,
@@ -416,6 +437,12 @@ public:
   // set the committed journal head
   virtual void set_journal_head(journal_seq_t) = 0;
 
+  // get the opened journal head sequence
+  virtual segment_seq_t get_journal_head_sequence() const = 0;
+
+  // set the opened journal head sequence
+  virtual void set_journal_head_sequence(segment_seq_t) = 0;
+
   // get the committed journal dirty tail
   virtual journal_seq_t get_dirty_tail() const = 0;
 
@@ -455,7 +482,9 @@ public:
     }
     assert(get_journal_head().segment_seq >=
            get_journal_tail().segment_seq);
-    return get_journal_head().segment_seq + 1 -
+    assert(get_journal_head_sequence() >=
+           get_journal_head().segment_seq);
+    return get_journal_head_sequence() + 1 -
            get_journal_tail().segment_seq;
   }
 };
@@ -470,31 +499,37 @@ using JournalTrimmerImplRef = std::unique_ptr<JournalTrimmerImpl>;
 class JournalTrimmerImpl : public JournalTrimmer {
 public:
   struct config_t {
-    /// Number of minimum bytes to stop trimming dirty.
+    /// Number of minimum bytes to start trimming dirty,
+    //	this must be larger than or equal to min_journal_dirty_bytes,
+    //	otherwise trim_dirty may never happen.
     std::size_t target_journal_dirty_bytes = 0;
     /// Number of minimum bytes to stop trimming allocation
     /// (having the corresponding backrefs unmerged)
     std::size_t target_journal_alloc_bytes = 0;
+    /// Number of minimum dirty bytes of the journal.
+    std::size_t min_journal_dirty_bytes = 0;
     /// Number of maximum bytes to block user transactions.
     std::size_t max_journal_bytes = 0;
     /// Number of bytes to rewrite dirty per cycle
     std::size_t rewrite_dirty_bytes_per_cycle = 0;
-    /// Number of bytes to rewrite backref per cycle
-    std::size_t rewrite_backref_bytes_per_cycle = 0;
+    /// Number of bytes to rewrite dirty per transaction
+    std::size_t rewrite_dirty_bytes_per_trans = 0;
+    /// Maximum number of bytes of new backref extents per cycle
+    std::size_t max_backref_bytes_per_cycle = 0;
 
     void validate() const;
 
     static config_t get_default(
-        std::size_t roll_size, journal_type_t type);
+        std::size_t roll_size, backend_type_t type);
 
     static config_t get_test(
-        std::size_t roll_size, journal_type_t type);
+        std::size_t roll_size, backend_type_t type);
   };
 
   JournalTrimmerImpl(
     BackrefManager &backref_manager,
     config_t config,
-    journal_type_t type,
+    backend_type_t type,
     device_off_t roll_start,
     device_off_t roll_size);
 
@@ -510,6 +545,12 @@ public:
 
   void set_journal_head(journal_seq_t) final;
 
+  segment_seq_t get_journal_head_sequence() const final {
+    return journal_head_seq;
+  }
+
+  void set_journal_head_sequence(segment_seq_t) final;
+
   journal_seq_t get_dirty_tail() const final {
     return journal_dirty_tail;
   }
@@ -522,12 +563,12 @@ public:
       journal_seq_t dirty_tail, journal_seq_t alloc_tail) final;
 
   std::size_t get_trim_size_per_cycle() const final {
-    return config.rewrite_backref_bytes_per_cycle +
-      config.rewrite_dirty_bytes_per_cycle;
+    return config.max_backref_bytes_per_cycle +
+      get_dirty_bytes_to_trim();
   }
 
-  journal_type_t get_journal_type() const {
-    return journal_type;
+  backend_type_t get_backend_type() const {
+    return backend_type;
   }
 
   void set_extent_callback(ExtentCallbackInterface *cb) {
@@ -539,27 +580,20 @@ public:
   }
 
   void reset() {
+    journal_head_seq = NULL_SEG_SEQ;
     journal_head = JOURNAL_SEQ_NULL;
     journal_dirty_tail = JOURNAL_SEQ_NULL;
     journal_alloc_tail = JOURNAL_SEQ_NULL;
   }
 
-  bool should_trim_dirty() const {
-    return get_dirty_tail_target() > journal_dirty_tail;
-  }
-
-  bool should_trim_alloc() const {
-    return get_alloc_tail_target() > journal_alloc_tail;
-  }
-
   bool should_trim() const {
-    return should_trim_alloc() || should_trim_dirty();
+    return should_trim_alloc() || should_start_trim_dirty();
   }
 
   bool should_block_io_on_trim() const {
     return get_tail_limit() >
       get_journal_tail().add_offset(
-        journal_type, reserved_usage, roll_start, roll_size);
+        backend_type, reserved_usage, roll_start, roll_size);
   }
 
   bool try_reserve_inline_usage(std::size_t usage) final {
@@ -582,7 +616,7 @@ public:
   static JournalTrimmerImplRef create(
       BackrefManager &backref_manager,
       config_t config,
-      journal_type_t type,
+      backend_type_t type,
       device_off_t roll_start,
       device_off_t roll_size) {
     return std::make_unique<JournalTrimmerImpl>(
@@ -596,6 +630,18 @@ public:
   friend std::ostream &operator<<(std::ostream &, const stat_printer_t &);
 
 private:
+  bool should_start_trim_dirty() const {
+    return get_dirty_tail_target() > journal_dirty_tail;
+  }
+
+  bool should_stop_trim_dirty(const journal_seq_t &target) const {
+    return target <= journal_dirty_tail;
+  }
+
+  bool should_trim_alloc() const {
+    return get_alloc_tail_target() > journal_alloc_tail;
+  }
+
   using trim_ertr = crimson::errorator<
     crimson::ct_error::input_output_error>;
   trim_ertr::future<> trim_dirty();
@@ -603,10 +649,30 @@ private:
   trim_ertr::future<> trim_alloc();
 
   journal_seq_t get_tail_limit() const;
+  journal_seq_t get_dirty_tail_min_target() const;
   journal_seq_t get_dirty_tail_target() const;
+  journal_seq_t get_dirty_tail_target_per_cycle() const;
   journal_seq_t get_alloc_tail_target() const;
   std::size_t get_dirty_journal_size() const;
   std::size_t get_alloc_journal_size() const;
+  std::size_t get_journal_dirty_bytes() const {
+    return journal_head.relative_to(
+      backend_type,
+      journal_dirty_tail,
+      roll_start,
+      roll_size);
+  }
+  std::size_t get_max_dirty_bytes_to_trim() const {
+    auto journal_dirty_bytes = get_journal_dirty_bytes();
+    if (journal_dirty_bytes <= config.min_journal_dirty_bytes) {
+      return 0;
+    }
+    return journal_dirty_bytes - config.min_journal_dirty_bytes;
+  }
+  std::size_t get_dirty_bytes_to_trim() const {
+    return std::min(get_max_dirty_bytes_to_trim(),
+		    config.rewrite_dirty_bytes_per_cycle);
+  }
   void register_metrics();
 
   ExtentCallbackInterface *extent_callback = nullptr;
@@ -614,10 +680,11 @@ private:
   BackrefManager &backref_manager;
 
   config_t config;
-  journal_type_t journal_type;
+  backend_type_t backend_type;
   device_off_t roll_start;
   device_off_t roll_size;
 
+  segment_seq_t journal_head_seq = NULL_SEG_SEQ;
   journal_seq_t journal_head;
   journal_seq_t journal_dirty_tail;
   journal_seq_t journal_alloc_tail;
@@ -1111,8 +1178,6 @@ using RBMSpaceTrackerRef = std::unique_ptr<RBMSpaceTracker>;
 class AsyncCleaner {
 public:
   using state_t = BackgroundListener::state_t;
-  using base_ertr = crimson::errorator<
-    crimson::ct_error::input_output_error>;
 
   virtual void set_background_callback(BackgroundListener *) = 0;
 
@@ -1144,11 +1209,21 @@ public:
 
   virtual bool should_block_io_on_clean() const = 0;
 
+  virtual bool can_clean_space() const = 0;
+
   virtual bool should_clean_space() const = 0;
 
   using clean_space_ertr = base_ertr;
   using clean_space_ret = clean_space_ertr::future<>;
   virtual clean_space_ret clean_space() = 0;
+
+  virtual const std::set<device_id_t>& get_device_ids() const = 0;
+
+  virtual std::size_t get_reclaim_size_per_cycle() const = 0;
+
+#ifdef UNIT_TESTS_BUILT
+  virtual void prefill_fragmented_devices() {}
+#endif
 
   // test only
   virtual bool check_usage() = 0;
@@ -1210,11 +1285,10 @@ public:
     config_t config,
     SegmentManagerGroupRef&& sm_group,
     BackrefManager &backref_manager,
-    bool detailed);
-
-  SegmentSeqAllocator& get_ool_segment_seq_allocator() {
-    return *ool_segment_seq_allocator;
-  }
+    SegmentSeqAllocator &segment_seq_allocator,
+    rewrite_gen_t max_rewrite_generation,
+    bool detailed,
+    bool is_cold);
 
   void set_journal_trimmer(JournalTrimmer &_trimmer) {
     trimmer = &_trimmer;
@@ -1224,9 +1298,14 @@ public:
       config_t config,
       SegmentManagerGroupRef&& sm_group,
       BackrefManager &backref_manager,
-      bool detailed) {
+      SegmentSeqAllocator &ool_seq_allocator,
+      rewrite_gen_t max_rewrite_generation,
+      bool detailed,
+      bool is_cold = false) {
     return std::make_unique<SegmentCleaner>(
-        config, std::move(sm_group), backref_manager, detailed);
+        config, std::move(sm_group), backref_manager,
+        ool_seq_allocator, max_rewrite_generation,
+	detailed, is_cold);
   }
 
   /*
@@ -1312,6 +1391,11 @@ public:
     return aratio < config.available_ratio_hard_limit;
   }
 
+  bool can_clean_space() const final {
+    assert(background_callback->is_ready());
+    return get_segments_reclaimable() > 0;
+  }
+
   bool should_clean_space() const final {
     assert(background_callback->is_ready());
     if (get_segments_reclaimable() == 0) {
@@ -1327,6 +1411,14 @@ public:
   }
 
   clean_space_ret clean_space() final;
+
+  const std::set<device_id_t>& get_device_ids() const final {
+    return sm_group->get_device_ids();
+  }
+
+  std::size_t get_reclaim_size_per_cycle() const final {
+    return config.reclaim_bytes_per_cycle;
+  }
 
   // Testing interfaces
 
@@ -1378,7 +1470,6 @@ private:
         segment_id_t segment_id,
         rewrite_gen_t generation,
         segment_off_t segment_size) {
-      ceph_assert(is_rewrite_generation(generation));
 
       rewrite_gen_t target_gen;
       if (generation < MIN_REWRITE_GENERATION) {
@@ -1389,7 +1480,6 @@ private:
         target_gen = generation + 1;
       }
 
-      assert(is_target_rewrite_generation(target_gen));
       return {generation,
               target_gen,
               segment_size,
@@ -1423,7 +1513,7 @@ private:
   using do_reclaim_space_ret = do_reclaim_space_ertr::future<>;
   do_reclaim_space_ret do_reclaim_space(
     const std::vector<CachedExtentRef> &backref_extents,
-    const backref_pin_list_t &pin_list,
+    const backref_mapping_list_t &pin_list,
     std::size_t &reclaimed,
     std::size_t &runs);
 
@@ -1517,15 +1607,17 @@ private:
     ceph_assert(s_type == segment_type_t::OOL ||
                 trimmer != nullptr); // segment_type_t::JOURNAL
     auto old_usage = calc_utilization(segment);
+    ceph_assert(is_rewrite_generation(generation, max_rewrite_generation));
     segments.init_closed(segment, seq, s_type, category, generation);
     auto new_usage = calc_utilization(segment);
     adjust_segment_util(old_usage, new_usage);
     if (s_type == segment_type_t::OOL) {
-      ool_segment_seq_allocator->set_next_segment_seq(seq);
+      ool_segment_seq_allocator.set_next_segment_seq(seq);
     }
   }
 
   const bool detailed;
+  const bool is_cold;
   const config_t config;
 
   SegmentManagerGroupRef sm_group;
@@ -1574,7 +1666,15 @@ private:
   BackgroundListener *background_callback = nullptr;
 
   // TODO: drop once paddr->journal_seq_t is introduced
-  SegmentSeqAllocatorRef ool_segment_seq_allocator;
+  SegmentSeqAllocator &ool_segment_seq_allocator;
+  const rewrite_gen_t max_rewrite_generation = NULL_GENERATION;
+
+  enum class gc_formula_t {
+    GREEDY,
+    BENEFIT,
+    COST_BENEFIT,
+  };
+  gc_formula_t gc_formula;
 };
 
 class RBMCleaner;
@@ -1613,7 +1713,10 @@ public:
 
   store_statfs_t get_stat() const final {
     store_statfs_t st;
-    // TODO 
+    st.total = get_total_bytes();
+    st.available = get_total_bytes() - get_journal_bytes() - stats.used_bytes;
+    st.allocated = get_journal_bytes() + stats.used_bytes;
+    st.data_stored = get_journal_bytes() + stats.used_bytes;
     return st;
   }
 
@@ -1635,11 +1738,34 @@ public:
     return false;
   }
 
+  bool can_clean_space() const final {
+    return false;
+  }
+
   bool should_clean_space() const final {
     return false;
   }
 
   clean_space_ret clean_space() final;
+
+  const std::set<device_id_t>& get_device_ids() const final {
+    return rb_group->get_device_ids();
+  }
+
+  std::size_t get_reclaim_size_per_cycle() const final {
+    return 0;
+  }
+
+#ifdef UNIT_TESTS_BUILT
+  void prefill_fragmented_devices() final {
+    LOG_PREFIX(RBMCleaner::prefill_fragmented_devices);
+    SUBDEBUG(seastore_cleaner, "");
+    auto rbs = rb_group->get_rb_managers();
+    for (auto p : rbs) {
+      p->prefill_fragmented_device();
+    }
+  }
+#endif
 
   RandomBlockManager* get_rbm(paddr_t paddr) {
     auto rbs = rb_group->get_rb_managers();
@@ -1654,7 +1780,40 @@ public:
   paddr_t alloc_paddr(extent_len_t length) {
     // TODO: implement allocation strategy (dirty metadata and multiple devices)
     auto rbs = rb_group->get_rb_managers();
-    return rbs[0]->alloc_extent(length);
+    auto paddr = rbs[0]->alloc_extent(length);
+    if (paddr != P_ADDR_NULL) {
+      stats.used_bytes += length;
+    }
+    return paddr;
+  }
+
+  std::list<alloc_paddr_result> alloc_paddrs(extent_len_t length) {
+    // TODO: implement allocation strategy (dirty metadata and multiple devices)
+    auto rbs = rb_group->get_rb_managers();
+    auto ret = rbs[0]->alloc_extents(length);
+    if (!ret.empty()) {
+      stats.used_bytes += length;
+    }
+    return ret;
+  }
+
+  size_t get_total_bytes() const {
+    auto rbs = rb_group->get_rb_managers();
+    size_t total = 0;
+    for (auto p : rbs) {
+      total += p->get_size();
+      total += p->get_journal_size();
+    }
+    return total;
+  }
+
+  size_t get_journal_bytes() const {
+    auto rbs = rb_group->get_rb_managers();
+    size_t total = 0;
+    for (auto p : rbs) {
+      total += p->get_journal_size();
+    }
+    return total;
   }
 
   // Testing interfaces
@@ -1689,6 +1848,8 @@ private:
      */
     uint64_t projected_used_bytes = 0;
   } stats;
+  seastar::metrics::metric_group metrics;
+  void register_metrics();
 
   ExtentCallbackInterface *extent_callback = nullptr;
   BackgroundListener *background_callback = nullptr;

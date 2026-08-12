@@ -20,6 +20,7 @@
 #include "global/global_context.h"
 #include "include/spinlock.h"
 #include "OSDCap.h"
+#include "OpRequest.h"
 #include "Watch.h"
 #include "OSDMap.h"
 #include "PeeringState.h"
@@ -135,10 +136,10 @@ struct Session : public RefCountedObject {
 
   ceph::mutex session_dispatch_lock =
     ceph::make_mutex("Session::session_dispatch_lock");
-  boost::intrusive::list<OpRequest> waiting_on_map;
+  boost::intrusive::list<OpRequest, boost::intrusive::constant_time_size<false>> waiting_on_map;
 
-  ceph::spinlock sent_epoch_lock;
-  epoch_t last_sent_epoch = 0;
+  ceph::spinlock projected_epoch_lock;
+  epoch_t projected_epoch = 0;
 
   /// protects backoffs; orders inside Backoff::lock *and* PG::backoff_lock
   ceph::mutex backoff_lock = ceph::make_mutex("Session::backoff_lock");

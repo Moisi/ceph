@@ -5,7 +5,9 @@
 #define _MSG_ASYNC_PROTOCOL_V1_
 
 #include "Protocol.h"
+#include "AsyncConnection.h"
 
+struct AuthSessionHandler;
 class ProtocolV1;
 using CtPtr = Ct<ProtocolV1>*;
 
@@ -105,8 +107,19 @@ protected:
   enum class WriteStatus { NOWRITE, REPLACING, CANWRITE, CLOSED };
   std::atomic<WriteStatus> can_write;
   std::list<Message *> sent;  // the first ceph::buffer::list need to inject seq
+  //struct for outbound msgs
+  struct out_q_entry_t {
+    ceph::buffer::list bl;
+    Message* m {nullptr};
+    bool is_prepared {false};
+  };
   // priority queue for outbound msgs
-  std::map<int, std::list<std::pair<ceph::buffer::list, Message *>>> out_q;
+
+  /**
+   * A queue for each priority value, highest priority first.
+   */
+  std::map<int, std::list<out_q_entry_t>, std::greater<int>> out_q;
+
   bool keepalive;
   bool write_in_progress = false;
 
@@ -194,7 +207,7 @@ protected:
   void session_reset();
   void randomize_out_seq();
 
-  Message *_get_next_outgoing(ceph::buffer::list *bl);
+  out_q_entry_t _get_next_outgoing();
 
   void prepare_send_message(uint64_t features, Message *m, ceph::buffer::list &bl);
   ssize_t write_message(Message *m, ceph::buffer::list &bl, bool more);
@@ -223,6 +236,8 @@ public:
   virtual void read_event() override;
   virtual void write_event() override;
   virtual bool is_queued() override;
+
+  virtual void dump(Formatter *f) override;
 
   // Client Protocol
 private:

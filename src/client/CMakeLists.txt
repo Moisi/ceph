@@ -10,4 +10,10 @@ set(libclient_srcs
   posix_acl.cc
   Delegation.cc)
 add_library(client STATIC ${libclient_srcs})
-target_link_libraries(client osdc)
+target_link_libraries(client
+  legacy-option-headers
+  osdc
+  Boost::locale
+  ICU::uc
+  ICU::i18n
+  )

@@ -42,6 +42,8 @@
 
 #include <boost/scope_exit.hpp>
 
+#include <shared_mutex> // for std::shared_lock
+
 #define dout_subsys ceph_subsys_rbd
 #undef dout_prefix
 #define dout_prefix *_dout << "librbd::Migration: " << __func__ << ": "
@@ -527,11 +529,13 @@ int Migration<I>::prepare_import(
                  << dest_io_ctx.get_pool_name() << "/"
                  << dest_image_name << ", opts=" << opts << dendl;
 
-  I* src_image_ctx = nullptr;
+  I* src_image_ctx;
+  librados::Rados* src_rados;
   C_SaferCond open_ctx;
   auto req = migration::OpenSourceImageRequest<I>::create(
     dest_io_ctx, nullptr, CEPH_NOSNAP,
-    {-1, "", "", "", source_spec, {}, 0, false}, &src_image_ctx, &open_ctx);
+    {-1, "", "", "", source_spec, {}, 0, false}, &src_image_ctx, &src_rados,
+    &open_ctx);
   req->send();
 
   int r = open_ctx.wait();
@@ -540,9 +544,9 @@ int Migration<I>::prepare_import(
     return r;
   }
 
-  auto asio_engine = src_image_ctx->asio_engine;
-  BOOST_SCOPE_EXIT_TPL(src_image_ctx) {
+  BOOST_SCOPE_EXIT_TPL(src_image_ctx, src_rados) {
     src_image_ctx->state->close();
+    delete src_rados;
   } BOOST_SCOPE_EXIT_END;
 
   uint64_t image_format = 2;
@@ -581,11 +585,6 @@ int Migration<I>::prepare_import(
   Migration migration(src_image_ctx, dst_image_ctx, dst_migration_spec,
                       opts, nullptr);
   return migration.prepare_import();
-  if (r < 0) {
-    return r;
-  }
-
-  return 0;
 }
 
 template <typename I>
@@ -1491,7 +1490,7 @@ int Migration<I>::create_dst_image(I** image_ctx) {
   int r;
   C_SaferCond on_create;
   librados::IoCtx parent_io_ctx;
-  if (parent_spec.pool_id == -1) {
+  if (parent_spec.pool_id == -1 || m_flatten) {
     auto *req = image::CreateRequest<I>::create(
       config, m_dst_io_ctx, m_dst_image_name, m_dst_image_id, size,
       m_image_options, image::CREATE_FLAG_SKIP_MIRROR_ENABLE,
@@ -1758,7 +1757,8 @@ int Migration<I>::enable_mirroring(
     return r;
   }
 
-  if (mirror_mode == cls::rbd::MIRROR_MODE_DISABLED) {
+  if (mirror_mode == cls::rbd::MIRROR_MODE_DISABLED ||
+      mirror_mode == cls::rbd::MIRROR_MODE_INIT_ONLY) {
     ldout(m_cct, 10) << "mirroring is not enabled for destination pool"
                      << dendl;
     return 0;
@@ -1787,7 +1787,7 @@ int Migration<I>::enable_mirroring(
 // When relinking children we should be careful as it my be interrupted
 // at any moment by some reason and we may end up in an inconsistent
 // state, which we have to be able to fix with "migration abort". Below
-// are all possible states during migration (P1 - sourse parent, P2 -
+// are all possible states during migration (P1 - source parent, P2 -
 // destination parent, C - child):
 //
 //   P1  P2    P1  P2    P1  P2    P1  P2

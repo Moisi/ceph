@@ -15,7 +15,6 @@
  */
 
 #include "ceph_ver.h"
-#include "common/debug.h"
 #include "ErasureCodePluginClay.h"
 #include "ErasureCodeClay.h"
 
@@ -31,7 +30,7 @@ int ErasureCodePluginClay::factory(const std::string &directory,
   if (int r = interface->init(profile, ss); r) {
     return r;
   }
-  *erasure_code = ceph::ErasureCodeInterfaceRef(interface.release());
+  erasure_code->reset(interface.release());
   return 0;
 };
 
@@ -40,5 +39,10 @@ const char *__erasure_code_version() { return CEPH_GIT_NICE_VER; }
 int __erasure_code_init(char *plugin_name, char *directory)
 {
   auto& instance = ceph::ErasureCodePluginRegistry::instance();
-  return instance.add(plugin_name, new ErasureCodePluginClay());
+  auto plugin = std::make_unique<ErasureCodePluginClay>();
+  int r = instance.add(plugin_name, plugin.get());
+  if (r == 0) {
+    plugin.release();
+  }
+  return r;
 }

@@ -11,10 +11,10 @@
 #include <sstream>
 #include "stdlib.h"
 #include "global/global_context.h"
+#include "global/global_init.h"
 
 using namespace std;
 
-const string CONTROL_PREFIX = "CONTROL";
 const string PRIMARY_PREFIX = "PREFIX";
 const int NUM_COPIES = 100;
 const int NUM_THREADS = 30;
@@ -87,7 +87,13 @@ int main() {
   }
   string strpath(path);
   std::cerr << "Using path: " << strpath << std::endl;
-  KeyValueDB *store = KeyValueDB::create(g_ceph_context, "leveldb", strpath);
+
+  std::vector<const char*> args;
+  auto cct = global_init(NULL, args, CEPH_ENTITY_TYPE_CLIENT,
+             CODE_ENVIRONMENT_UTILITY, CINIT_FLAG_NO_DEFAULT_CONFIG_FILE);
+  common_init_finish(g_ceph_context);
+
+  KeyValueDB *store = KeyValueDB::create(g_ceph_context, "rocksdb", strpath);
   ceph_assert(!store->create_and_open(std::cerr));
   db.reset(store);
 

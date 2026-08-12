@@ -111,6 +111,8 @@ public:
 
   void encode(ceph::buffer::list& bl) const;
   void decode(ceph::buffer::list::const_iterator& bl);
+  void dump(ceph::Formatter *f) const;
+  static std::list<CryptoKey> generate_test_instances();
 
   void clear() {
     *this = CryptoKey();

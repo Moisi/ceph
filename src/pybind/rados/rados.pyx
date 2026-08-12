@@ -76,6 +76,7 @@ MAX_ERRNO = _MAX_ERRNO
 ANONYMOUS_AUID = 0xffffffffffffffff
 ADMIN_AUID = 0
 
+OMAP_KEY_TYPE = Union[str,bytes]
 
 class Error(Exception):
     """ `Error` class, derived from `Exception` """
@@ -224,6 +225,13 @@ class IsConnected(Error):
                 "RADOS is connected error (%s)" % message, errno)
 
 
+class ConnectionShutdown(OSError):
+    """ `ConnectionShutdown` class, derived from `OSError` """
+    def __init__(self, message, errno=None):
+        super(ConnectionShutdown, self).__init__(
+                "RADOS connection was shutdown (%s)" % message, errno)
+
+
 IF UNAME_SYSNAME == "FreeBSD":
     cdef errno_to_exception = {
         errno.EPERM     : PermissionError,
@@ -240,6 +248,7 @@ IF UNAME_SYSNAME == "FreeBSD":
         errno.EISCONN   : IsConnected,
         errno.EINVAL    : InvalidArgumentError,
         errno.ENOTCONN  : NotConnected,
+        errno.ESHUTDOWN : ConnectionShutdown,
     }
 ELSE:
     cdef errno_to_exception = {
@@ -257,6 +266,7 @@ ELSE:
         errno.EISCONN   : IsConnected,
         errno.EINVAL    : InvalidArgumentError,
         errno.ENOTCONN  : NotConnected,
+        errno.ESHUTDOWN : ConnectionShutdown,
     }
 
 
@@ -1047,10 +1057,10 @@ Rados object in state %s." % self.state)
         # NOTE(sileht): looks weird but test_monmap_dump pass int
             target = str(target)
 
-        target = cstr(target, 'target', opt=True)
+        target_raw = cstr(target, 'target', opt=True)
 
         cdef:
-            char *_target = opt_str(target)
+            char *_target = opt_str(target_raw)
             char **_cmd = to_bytes_array(cmds)
             size_t _cmdlen = len(cmds)
 
@@ -1063,7 +1073,7 @@ Rados object in state %s." % self.state)
             size_t _outs_len
 
         try:
-            if target:
+            if target_raw:
                 with nogil:
                     ret = rados_mon_command_target(self.cluster, _target,
                                                 <const char **>_cmd, _cmdlen,
@@ -1148,10 +1158,10 @@ Rados object in state %s." % self.state)
         self.require_state("connected")
 
         cmds = [cstr(cmd, 'cmd')]
-        target = cstr(target, 'target', opt=True)
+        target_raw = cstr(target, 'target', opt=True)
 
         cdef:
-            char *_target = opt_str(target)
+            char *_target = opt_str(target_raw)
 
             char **_cmd = to_bytes_array(cmds)
             size_t _cmdlen = len(cmds)
@@ -1165,7 +1175,7 @@ Rados object in state %s." % self.state)
             size_t _outs_len
 
         try:
-            if target is not None:
+            if target_raw is not None:
                 with nogil:
                     ret = rados_mgr_command_target(self.cluster,
 		                            <const char*>_target,
@@ -1360,10 +1370,12 @@ cdef class OmapIterator(object):
     """Omap iterator"""
 
     cdef public Ioctx ioctx
+    cdef public object omap_key_type
     cdef rados_omap_iter_t ctx
 
-    def __cinit__(self, Ioctx ioctx):
+    def __cinit__(self, Ioctx ioctx, omap_key_type):
         self.ioctx = ioctx
+        self.omap_key_type = omap_key_type
 
     def __iter__(self):
         return self
@@ -1385,7 +1397,7 @@ cdef class OmapIterator(object):
             raise make_ex(ret, "error iterating over the omap")
         if key_ == NULL:
             raise StopIteration()
-        key = decode_cstr(key_)
+        key = self.omap_key_type(key_)
         val = None
         if val_ != NULL:
             val = val_[:len_]
@@ -1858,7 +1870,7 @@ cdef class WriteOp(object):
             uint64_t _offset = offset
 
         with nogil:
-            rados_write_op_zero(self.write_op, _length, _offset)
+            rados_write_op_zero(self.write_op, _offset, _length)
 
     def truncate(self, offset: int):
         """
@@ -1920,7 +1932,7 @@ cdef class WriteOp(object):
         with nogil:
             rados_write_op_cmpext(self.write_op, _cmp_buf, _cmp_buf_len, _offset, NULL)
 
-    def omap_cmp(self, key: str, val: str, cmp_op: int = LIBRADOS_CMPXATTR_OP_EQ):
+    def omap_cmp(self, key: OMAP_KEY_TYPE, val: OMAP_KEY_TYPE, cmp_op: int = LIBRADOS_CMPXATTR_OP_EQ):
         """
         Ensure that an omap key value satisfies comparison
         :param key: omap key whose associated value is evaluated for comparison
@@ -3596,7 +3608,7 @@ returned %d, but should return zero on success." % (self.name, ret))
         """
         read_op.release()
 
-    def set_omap(self, write_op: WriteOp, keys: Sequence[str], values: Sequence[bytes]):
+    def set_omap(self, write_op: WriteOp, keys: Sequence[OMAP_KEY_TYPE], values: Sequence[bytes]):
         """
         set keys values to write_op
         :para write_op: write_operation object
@@ -3743,9 +3755,10 @@ returned %d, but should return zero on success." % (self.name, ret))
 
     def get_omap_vals(self,
                       read_op: ReadOp,
-                      start_after: str,
-                      filter_prefix: str,
-                      max_return: int) -> Tuple[OmapIterator, int]:
+                      start_after: OMAP_KEY_TYPE,
+                      filter_prefix: OMAP_KEY_TYPE,
+                      max_return: int,
+                      omap_key_type = bytes.decode) -> Tuple[OmapIterator, int]:
         """
         get the omap values
         :para read_op: read operation object
@@ -3767,11 +3780,15 @@ returned %d, but should return zero on success." % (self.name, ret))
         with nogil:
             rados_read_op_omap_get_vals2(_read_op.read_op, _start_after, _filter_prefix,
                                          _max_return, &iter_addr, NULL, NULL)
-        it = OmapIterator(self)
+        it = OmapIterator(self, omap_key_type)
         it.ctx = iter_addr
         return it, 0   # 0 is meaningless; there for backward-compat
 
-    def get_omap_keys(self, read_op: ReadOp, start_after: str, max_return: int) -> Tuple[OmapIterator, int]:
+    def get_omap_keys(self,
+                      read_op: ReadOp,
+                      start_after: OMAP_KEY_TYPE,
+                      max_return: int,
+                      omap_key_type = bytes.decode) -> Tuple[OmapIterator, int]:
         """
         get the omap keys
         :para read_op: read operation object
@@ -3779,9 +3796,9 @@ returned %d, but should return zero on success." % (self.name, ret))
         :para max_return: list no more than max_return key/value pairs
         :returns: an iterator over the requested omap values, return value from this action
         """
-        start_after = cstr(start_after, 'start_after') if start_after else None
+        start_after_raw = cstr(start_after, 'start_after') if start_after else None
         cdef:
-            char *_start_after = opt_str(start_after)
+            char *_start_after = opt_str(start_after_raw)
             ReadOp _read_op = read_op
             rados_omap_iter_t iter_addr = NULL
             int _max_return = max_return
@@ -3789,11 +3806,14 @@ returned %d, but should return zero on success." % (self.name, ret))
         with nogil:
             rados_read_op_omap_get_keys2(_read_op.read_op, _start_after,
                                          _max_return, &iter_addr, NULL, NULL)
-        it = OmapIterator(self)
+        it = OmapIterator(self, omap_key_type)
         it.ctx = iter_addr
         return it, 0   # 0 is meaningless; there for backward-compat
 
-    def get_omap_vals_by_keys(self, read_op: ReadOp, keys: Sequence[str]) -> Tuple[OmapIterator, int]:
+    def get_omap_vals_by_keys(self,
+                              read_op: ReadOp,
+                              keys: Sequence[OMAP_KEY_TYPE],
+                              omap_key_type = bytes.decode) -> Tuple[OmapIterator, int]:
         """
         get the omap values by keys
         :para read_op: read operation object
@@ -3812,13 +3832,13 @@ returned %d, but should return zero on success." % (self.name, ret))
                 rados_read_op_omap_get_vals_by_keys(_read_op.read_op,
                                                     <const char**>_keys,
                                                     key_num, &iter_addr, NULL)
-            it = OmapIterator(self)
+            it = OmapIterator(self, omap_key_type)
             it.ctx = iter_addr
             return it, 0   # 0 is meaningless; there for backward-compat
         finally:
             free(_keys)
 
-    def remove_omap_keys(self, write_op: WriteOp, keys: Sequence[str]):
+    def remove_omap_keys(self, write_op: WriteOp, keys: Sequence[OMAP_KEY_TYPE]):
         """
         remove omap keys specifiled
         :para write_op: write operation object
@@ -3849,7 +3869,7 @@ returned %d, but should return zero on success." % (self.name, ret))
         with nogil:
             rados_write_op_omap_clear(_write_op.write_op)
 
-    def remove_omap_range2(self, write_op: WriteOp, key_begin: str, key_end: str):
+    def remove_omap_range2(self, write_op: WriteOp, key_begin: OMAP_KEY_TYPE, key_end: OMAP_KEY_TYPE):
         """
         Remove key/value pairs from an object whose keys are in the range
         [key_begin, key_end)
@@ -3988,6 +4008,114 @@ returned %d, but should return zero on success." % (self.name, ret))
             ret = rados_unlock(self.io, _key, _name, _cookie)
         if ret < 0:
             raise make_ex(ret, "Ioctx.rados_lock_exclusive(%s): failed to set lock %s on %s" % (self.name, name, key))
+
+    def break_lock(self, key: str, name: str, client: str, cookie: str):
+
+        """
+        Release a shared or exclusive lock on an object, which was taken by the
+        specified client.
+
+        :param key: name of the object
+        :param name: name of the lock
+        :param client: the client currently holding the lock
+        :param cookie: cookie of the lock
+
+        :raises: :class:`TypeError`
+        :raises: :class:`Error`
+        """
+        self.require_ioctx_open()
+
+        key_raw = cstr(key, 'key')
+        name_raw = cstr(name, 'name')
+        client_raw = cstr(client, 'client')
+        cookie_raw = cstr(cookie, 'cookie')
+
+        cdef:
+            char* _key = key_raw
+            char* _name = name_raw
+            char* _client = client_raw
+            char* _cookie = cookie_raw
+
+        with nogil:
+            ret = rados_break_lock(self.io, _key, _name, _client, _cookie)
+        if ret < 0:
+            raise make_ex(ret,
+                          "Ioctx.rados_break_lock(%s): failed to break lock %s "
+                          "on %s for client %s "
+                          "cookie %s" % (self.name, name, key, client, cookie))
+
+    def list_lockers(self, key: str, name: str):
+
+        """
+        List clients that have locked the named object lock and
+        information about the lock.
+
+        :param key: name of the object
+        :param name: name of the lock
+        :returns: dict - contains the following keys:
+                  * ``tag`` - the tag associated with the lock (every
+                    additional locker must use the same tag)
+                  * ``exclusive`` - boolean indicating whether the
+                     lock is exclusive or shared
+                  * ``lockers`` - a list of (client, cookie, address)
+                    tuples
+
+        :raises: :class:`TypeError`
+        :raises: :class:`Error`
+        """
+        self.require_ioctx_open()
+
+        key_raw = cstr(key, 'key')
+        name_raw = cstr(name, 'name')
+
+        cdef:
+            char* _key = key_raw
+            char* _name = name_raw
+            int exclusive = 0
+            char* c_tag = NULL
+            size_t tag_size = 512
+            char* c_clients = NULL
+            size_t clients_size = 512
+            char* c_cookies = NULL
+            size_t cookies_size = 512
+            char* c_addrs = NULL
+            size_t addrs_size = 512
+
+        try:
+            while True:
+                c_tag = <char *>realloc_chk(c_tag, tag_size)
+                c_cookies = <char *>realloc_chk(c_cookies, cookies_size)
+                c_clients = <char *>realloc_chk(c_clients, clients_size)
+                c_addrs = <char *>realloc_chk(c_addrs, addrs_size)
+                with nogil:
+                    ret = rados_list_lockers(self.io, _key, _name, &exclusive,
+                                             c_tag, &tag_size, c_clients, &clients_size,
+                                             c_cookies, &cookies_size, c_addrs, &addrs_size)
+                if ret >= 0:
+                    break
+                elif ret != -errno.ERANGE:
+                    raise make_ex(ret,
+                                  "Ioctx.rados_list_lockers(%s): failed to "
+                                  "list lockers of lock %s on %s" % (self.name, name, key))
+            clients = []
+            cookies = []
+            addrs = []
+
+            if ret > 0:
+                clients = map(decode_cstr, c_clients[:clients_size - 1].split(b'\0'))
+                cookies = map(decode_cstr, c_cookies[:cookies_size - 1].split(b'\0'))
+                addrs = map(decode_cstr, c_addrs[:addrs_size - 1].split(b'\0'))
+
+            return {
+                'tag'       : decode_cstr(c_tag),
+                'exclusive' : exclusive == 1,
+                'lockers'   : list(zip(clients, cookies, addrs)),
+                }
+        finally:
+            free(c_tag)
+            free(c_cookies)
+            free(c_clients)
+            free(c_addrs)
 
     def set_osdmap_full_try(self):
         """

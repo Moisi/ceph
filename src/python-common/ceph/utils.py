@@ -1,8 +1,15 @@
 import datetime
 import re
 import string
+import ssl
 
-from typing import Optional
+from typing import Optional, MutableMapping, Tuple, Any
+from urllib.error import HTTPError, URLError
+from urllib.request import urlopen, Request
+
+import logging
+
+log = logging.getLogger(__name__)
 
 
 def datetime_now() -> datetime.datetime:
@@ -23,7 +30,8 @@ def datetime_to_str(dt: datetime.datetime) -> str:
         ISO 8601 (timezone=UTC).
     """
     return dt.astimezone(tz=datetime.timezone.utc).strftime(
-        '%Y-%m-%dT%H:%M:%S.%fZ')
+        '%Y-%m-%dT%H:%M:%S.%fZ'
+    )
 
 
 def str_to_datetime(string: str) -> datetime.datetime:
@@ -43,7 +51,7 @@ def str_to_datetime(string: str) -> datetime.datetime:
     """
     fmts = [
         '%Y-%m-%dT%H:%M:%S.%f',
-        '%Y-%m-%dT%H:%M:%S.%f%z'
+        '%Y-%m-%dT%H:%M:%S.%f%z',
     ]
 
     # In *all* cases, the 9 digit second precision is too much for
@@ -67,8 +75,11 @@ def str_to_datetime(string: str) -> datetime.datetime:
         except ValueError:
             pass
 
-    raise ValueError("Time data {} does not match one of the formats {}".format(
-        string, str(fmts)))
+    raise ValueError(
+        "Time data {} does not match one of the formats {}".format(
+            string, str(fmts)
+        )
+    )
 
 
 def parse_timedelta(delta: str) -> Optional[datetime.timedelta]:
@@ -94,13 +105,15 @@ def parse_timedelta(delta: str) -> Optional[datetime.timedelta]:
     :return: The `datetime.timedelta` object or `None` in case of
         a parsing error.
     """
-    parts = re.match(r'(?P<seconds>-?\d+)s|'
-                     r'(?P<minutes>-?\d+)m|'
-                     r'(?P<hours>-?\d+)h|'
-                     r'(?P<days>-?\d+)d|'
-                     r'(?P<weeks>-?\d+)w$',
-                     delta,
-                     re.IGNORECASE)
+    parts = re.match(
+        r'(?P<seconds>-?\d+)s|'
+        r'(?P<minutes>-?\d+)m|'
+        r'(?P<hours>-?\d+)h|'
+        r'(?P<days>-?\d+)d|'
+        r'(?P<weeks>-?\d+)w$',
+        delta,
+        re.IGNORECASE,
+    )
     if not parts:
         return None
     parts = parts.groupdict()
@@ -121,3 +134,58 @@ def is_hex(s: str, strict: bool = True) -> bool:
             return False
 
     return True
+
+
+def http_req(
+    hostname: str = '',
+    port: str = '443',
+    method: Optional[str] = None,
+    headers: MutableMapping[str, str] = {},
+    data: Optional[str] = None,
+    endpoint: str = '/',
+    scheme: str = 'https',
+    ssl_verify: bool = False,
+    timeout: Optional[int] = None,
+    ssl_ctx: Optional[Any] = None,
+) -> Tuple[Any, Any, Any]:
+    if not ssl_ctx:
+        ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        if not ssl_verify:
+            ssl_ctx.check_hostname = False
+            ssl_ctx.verify_mode = ssl.CERT_NONE
+        else:
+            ssl_ctx.verify_mode = ssl.CERT_REQUIRED
+
+    url: str = f'{scheme}://{hostname}:{port}{endpoint}'
+    _data = bytes(data, 'ascii') if data else None
+    _headers = headers
+    if data and not method:
+        method = 'POST'
+    if not _headers.get('Content-Type') and method in ['POST', 'PATCH']:
+        _headers['Content-Type'] = 'application/json'
+    try:
+        req = Request(url, _data, _headers, method=method)
+        with urlopen(req, context=ssl_ctx, timeout=timeout) as response:
+            response_str = response.read()
+            response_headers = response.headers
+            response_code = response.code
+        return response_headers, response_str.decode(), response_code
+    except (HTTPError, URLError) as e:
+        log.error(e)
+        # handle error here if needed
+        raise
+
+
+_TRUE_VALS = {'y', 'yes', 't', 'true', 'on', '1'}
+_FALSE_VALS = {'n', 'no', 'f', 'false', 'off', '0'}
+
+
+def strtobool(value: str) -> bool:
+    """Convert a string to a boolean value.
+    Based on a simlilar function once available at distutils.util.strtobool.
+    """
+    if value.lower() in _TRUE_VALS:
+        return True
+    if value.lower() in _FALSE_VALS:
+        return False
+    raise ValueError(f'invalid truth value {value!r}')

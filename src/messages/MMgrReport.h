@@ -74,6 +74,29 @@ public:
     }
     DECODE_FINISH(p);
   }
+
+  void dump(ceph::Formatter *f) const
+  {
+    f->dump_string("path", path);
+    f->dump_string("description", description);
+    f->dump_string("nick", nick);
+    f->dump_int("type", type);
+    f->dump_int("priority", priority);
+    f->dump_int("unit", unit);
+  }
+  static std::list<PerfCounterType> generate_test_instances()
+  {
+    std::list<PerfCounterType> ls;
+    ls.emplace_back();
+    ls.emplace_back();
+    ls.back().path = "mycounter";
+    ls.back().description = "mycounter description";
+    ls.back().nick = "mycounter nick";
+    ls.back().type = PERFCOUNTER_COUNTER;
+    ls.back().priority = PerfCountersBuilder::PRIO_CRITICAL;
+    ls.back().unit = UNIT_BYTES;
+    return ls;
+  }
 };
 WRITE_CLASS_ENCODER(PerfCounterType)
 

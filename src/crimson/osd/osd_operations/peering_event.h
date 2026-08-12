@@ -8,7 +8,6 @@
 
 #include "crimson/osd/osdmap_gate.h"
 #include "crimson/osd/osd_operation.h"
-#include "crimson/osd/osd_operations/background_recovery.h"
 #include "osd/osd_types.h"
 #include "osd/PGPeeringEvent.h"
 #include "osd/PeeringState.h"
@@ -23,20 +22,6 @@ class OSD;
 class ShardServices;
 class PG;
 
-  class PGPeeringPipeline {
-    struct AwaitMap : OrderedExclusivePhaseT<AwaitMap> {
-      static constexpr auto type_name = "PeeringEvent::PGPipeline::await_map";
-    } await_map;
-    struct Process : OrderedExclusivePhaseT<Process> {
-      static constexpr auto type_name = "PeeringEvent::PGPipeline::process";
-    } process;
-    template <class T>
-    friend class PeeringEvent;
-    friend class LocalPeeringEvent;
-    friend class RemotePeeringEvent;
-    friend class PGAdvanceMap;
-  };
-
 template <class T>
 class PeeringEvent : public PhasedOperationT<T> {
   T* that() {
@@ -50,13 +35,17 @@ public:
   static constexpr OperationTypeCode type = OperationTypeCode::peering_event;
 
 protected:
-  PGPeeringPipeline &pp(PG &pg);
+  PGPeeringPipeline &peering_pp(PG &pg);
 
   PeeringCtx ctx;
   pg_shard_t from;
   spg_t pgid;
   float delay = 0;
   PGPeeringEvent evt;
+
+  epoch_t get_epoch_sent_at() const {
+    return evt.get_epoch_sent();
+  }
 
   const pg_shard_t get_from() const {
     return from;
@@ -98,15 +87,20 @@ public:
     evt(std::forward<Args>(args)...)
   {}
 
+  bool requires_pg() const final {
+    return evt.requires_pg;
+  }
+
   void print(std::ostream &) const final;
   void dump_detail(ceph::Formatter* f) const final;
   seastar::future<> with_pg(
     ShardServices &shard_services, Ref<PG> pg);
 };
 
-class RemotePeeringEvent : public PeeringEvent<RemotePeeringEvent> {
+class RemotePeeringEvent :
+    public PeeringEvent<RemotePeeringEvent>,
+    public RemoteOperation {
 protected:
-  crimson::net::ConnectionFRef conn;
   // must be after conn due to ConnectionPipeline's life-time
   PipelineHandle handle;
 
@@ -119,18 +113,10 @@ protected:
   ) override;
 
 public:
-  class OSDPipeline {
-    struct AwaitActive : OrderedExclusivePhaseT<AwaitActive> {
-      static constexpr auto type_name =
-	"PeeringRequest::OSDPipeline::await_active";
-    } await_active;
-    friend class RemotePeeringEvent;
-  };
-
   template <typename... Args>
   RemotePeeringEvent(crimson::net::ConnectionRef conn, Args&&... args) :
     PeeringEvent(std::forward<Args>(args)...),
-    conn(conn)
+    RemoteOperation(std::move(conn))
   {}
 
   std::tuple<
@@ -138,13 +124,12 @@ public:
     ConnectionPipeline::AwaitActive::BlockingEvent,
     ConnectionPipeline::AwaitMap::BlockingEvent,
     OSD_OSDMapGate::OSDMapBlocker::BlockingEvent,
-    ConnectionPipeline::GetPG::BlockingEvent,
+    ConnectionPipeline::GetPGMapping::BlockingEvent,
+    PerShardPipeline::CreateOrWaitPG::BlockingEvent,
     PGMap::PGCreationBlockingEvent,
     PGPeeringPipeline::AwaitMap::BlockingEvent,
     PG_OSDMapGate::OSDMapBlocker::BlockingEvent,
     PGPeeringPipeline::Process::BlockingEvent,
-    BackfillRecovery::BackfillRecoveryPipeline::Process::BlockingEvent,
-    OSDPipeline::AwaitActive::BlockingEvent,
     CompletionEvent
   > tracking_events;
 
@@ -153,9 +138,12 @@ public:
   spg_t get_pgid() const {
     return pgid;
   }
-  ConnectionPipeline &get_connection_pipeline();
   PipelineHandle &get_handle() { return handle; }
   epoch_t get_epoch() const { return evt.get_epoch_sent(); }
+
+  ConnectionPipeline &get_connection_pipeline();
+
+  PerShardPipeline &get_pershard_pipeline(ShardServices &);
 };
 
 class LocalPeeringEvent final : public PeeringEvent<LocalPeeringEvent> {
@@ -180,7 +168,6 @@ public:
     PGPeeringPipeline::AwaitMap::BlockingEvent,
     PG_OSDMapGate::OSDMapBlocker::BlockingEvent,
     PGPeeringPipeline::Process::BlockingEvent,
-    BackfillRecovery::BackfillRecoveryPipeline::Process::BlockingEvent,
     CompletionEvent
   > tracking_events;
 };

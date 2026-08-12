@@ -17,15 +17,16 @@
 // First because it includes Python.h
 #include "PyModule.h"
 
-#include <string>
-#include <map>
-#include <set>
-#include <memory>
-
 #include "common/LogClient.h"
 
 #include "ActivePyModules.h"
 #include "StandbyPyModules.h"
+
+#include <map>
+#include <memory>
+#include <set>
+#include <string>
+#include <vector>
 
 class MgrSession;
 
@@ -55,6 +56,7 @@ private:
   // before ClusterState exists.
   MgrMap mgr_map;
 
+  static std::string get_site_packages();
   /**
    * Discover python modules from local disk
    */
@@ -69,7 +71,7 @@ public:
   void update_kv_data(
     const std::string prefix,
     bool incremental,
-    const map<std::string, std::optional<bufferlist>, std::less<>>& data) {
+    const std::map<std::string, std::optional<bufferlist>, std::less<>>& data) {
     ceph_assert(active_modules);
     active_modules->update_kv_data(prefix, incremental, data);
   }
@@ -113,7 +115,7 @@ public:
                 const std::map<std::string, std::string> &kv_store,
 		bool mon_provides_kv_sub,
                 MonClient &mc, LogChannelRef clog_, LogChannelRef audit_clog_,
-                Objecter &objecter_, Client &client_, Finisher &f,
+                Objecter &objecter_, Finisher &f,
                 DaemonServer &server);
   void standby_start(MonClient &mc, Finisher &f);
 
@@ -121,9 +123,6 @@ public:
   {
     return standby_modules != nullptr;
   }
-
-  void active_shutdown();
-  void shutdown();
 
   std::vector<MonCommand> get_commands() const;
   std::vector<ModuleCommand> get_py_commands() const;
@@ -167,7 +166,7 @@ public:
    */
   void get_health_checks(health_check_map_t *checks);
 
-  void get_progress_events(map<std::string,ProgressEvent> *events) {
+  void get_progress_events(std::map<std::string,ProgressEvent> *events) {
     if (active_modules) {
       active_modules->get_progress_events(events);
     }
@@ -202,12 +201,18 @@ public:
     return active_modules->get_services();
   }
 
-  void register_client(std::string_view name, entity_addrvec_t addrs)
+  void register_client(std::string_view name, entity_addrvec_t addrs, bool replace)
   {
-    clients.emplace(std::string(name), std::move(addrs));
+    std::lock_guard l(lock);
+    auto n = std::string(name);
+    if (replace) {
+      clients.erase(n);
+    }
+    clients.emplace(n, std::move(addrs));
   }
   void unregister_client(std::string_view name, const entity_addrvec_t& addrs)
   {
+    std::lock_guard l(lock);
     auto itp = clients.equal_range(std::string(name));
     for (auto it = itp.first; it != itp.second; ++it) {
       if (it->second == addrs) {
@@ -219,12 +224,18 @@ public:
 
   auto get_clients() const
   {
-    std::scoped_lock l(lock);
-    std::vector<entity_addrvec_t> v;
-    for (const auto& p : clients) {
-      v.push_back(p.second);
-    }
-    return v;
+    std::lock_guard l(lock);
+    return clients;
+  }
+
+  bool is_module_active(const std::string &name) {
+    ceph_assert(active_modules);
+    return active_modules->module_exists(name);
+  }
+
+  auto& get_active_module_finisher(const std::string &name) {
+    ceph_assert(active_modules);
+    return active_modules->get_module_finisher(name);
   }
 
   // <<< (end of ActivePyModules cheeky call-throughs)

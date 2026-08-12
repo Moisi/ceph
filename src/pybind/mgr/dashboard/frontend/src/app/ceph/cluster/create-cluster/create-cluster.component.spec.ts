@@ -10,7 +10,6 @@ import { CoreModule } from '~/app/core/core.module';
 import { HostService } from '~/app/shared/api/host.service';
 import { OsdService } from '~/app/shared/api/osd.service';
 import { ConfirmationModalComponent } from '~/app/shared/components/confirmation-modal/confirmation-modal.component';
-import { LoadingPanelComponent } from '~/app/shared/components/loading-panel/loading-panel.component';
 import { AppConstants } from '~/app/shared/constants/app.constants';
 import { ModalService } from '~/app/shared/services/modal.service';
 import { WizardStepsService } from '~/app/shared/services/wizard-steps.service';
@@ -27,19 +26,16 @@ describe('CreateClusterComponent', () => {
   let modalServiceShowSpy: jasmine.Spy;
   const projectConstants: typeof AppConstants = AppConstants;
 
-  configureTestBed(
-    {
-      imports: [
-        HttpClientTestingModule,
-        RouterTestingModule,
-        ToastrModule.forRoot(),
-        SharedModule,
-        CoreModule,
-        CephModule
-      ]
-    },
-    [LoadingPanelComponent]
-  );
+  configureTestBed({
+    imports: [
+      HttpClientTestingModule,
+      RouterTestingModule,
+      ToastrModule.forRoot(),
+      SharedModule,
+      CoreModule,
+      CephModule
+    ]
+  });
 
   beforeEach(() => {
     fixture = TestBed.createComponent(CreateClusterComponent);
@@ -59,11 +55,15 @@ describe('CreateClusterComponent', () => {
   });
 
   it('should have project name as heading in welcome screen', () => {
+    component.startClusterCreation = true;
+    fixture.detectChanges();
     const heading = fixture.debugElement.query(By.css('h3')).nativeElement;
     expect(heading.innerHTML).toBe(`Welcome to ${projectConstants.projectName}`);
   });
 
-  it('should show confirmation modal when cluster creation is skipped', () => {
+  // @TODO: Opening modals in unit testing is broken since carbon.
+  // Need to fix it properly
+  it.skip('should show confirmation modal when cluster creation is skipped', () => {
     component.skipClusterCreation();
     expect(modalServiceShowSpy.calls.any()).toBeTruthy();
     expect(modalServiceShowSpy.calls.first().args[0]).toBe(ConfirmationModalComponent);
@@ -150,5 +150,29 @@ describe('CreateClusterComponent', () => {
     const hostServiceSpy = spyOn(hostService, 'list').and.callThrough();
     component.onSubmit();
     expect(hostServiceSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('should show skip button in the Create OSDs Steps', () => {
+    component.createCluster();
+    fixture.detectChanges();
+
+    component.onNextStep();
+    fixture.detectChanges();
+    const skipBtn = fixture.debugElement.query(By.css('#skipStepBtn')).nativeElement;
+    expect(skipBtn).not.toBe(null);
+    expect(skipBtn.innerHTML).toBe('Skip');
+  });
+
+  it('should skip the Create OSDs Steps', () => {
+    component.createCluster();
+    fixture.detectChanges();
+
+    component.onNextStep();
+    fixture.detectChanges();
+    const skipBtn = fixture.debugElement.query(By.css('#skipStepBtn')).nativeElement;
+    skipBtn.click();
+    fixture.detectChanges();
+
+    expect(component.stepsToSkip['Create OSDs']).toBe(true);
   });
 });

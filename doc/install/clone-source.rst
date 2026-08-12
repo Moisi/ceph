@@ -98,84 +98,18 @@ repository.
 Updating Submodules
 -------------------
 
-#. Determine whether your submodules are out of date:
+If your submodules are out of date, run the following commands:
 
    .. prompt:: bash $
 
-      git status
-
-   A. If your submodules are up to date 
-         If your submodules are up to date, the following console output will
-         appear: 
-
-         ::
-   
-           On branch main
-           Your branch is up to date with 'origin/main'.
-           
-           nothing to commit, working tree clean
-   
-         If you see this console output, then your submodules are up to date.
-         You do not need this procedure.
-
-
-   B. If your submodules are not up to date 
-         If your submodules are not up to date, you will see a message that
-         includes a list of "untracked files". The example here shows such a
-         list, which was generated from a real situation in which the
-         submodules were no longer current. Your list of files will not be the
-         same as this list of files, but this list is provided as an example.
-         If in your case any untracked files are listed, then you should
-         continue to the next step of this procedure.
-
-         ::
-
-            On branch main
-            Your branch is up to date with 'origin/main'.
-            
-            Untracked files:
-              (use "git add <file>..." to include in what will be committed)
-            src/pybind/cephfs/build/
-            src/pybind/cephfs/cephfs.c
-            src/pybind/cephfs/cephfs.egg-info/
-            src/pybind/rados/build/
-            src/pybind/rados/rados.c
-            src/pybind/rados/rados.egg-info/
-            src/pybind/rbd/build/
-            src/pybind/rbd/rbd.c
-            src/pybind/rbd/rbd.egg-info/
-            src/pybind/rgw/build/
-            src/pybind/rgw/rgw.c
-            src/pybind/rgw/rgw.egg-info/
-            
-            nothing added to commit but untracked files present (use "git add" to track)
-
-#. If your submodules are out of date, run the following commands:
-
-   .. prompt:: bash $
-
-      git submodule update --force --init --recursive
+      git submodule update --force --init --recursive --progress
       git clean -fdx
       git submodule foreach git clean -fdx
 
-   If you still have problems with a submodule directory, use ``rm -rf
-   [directory name]`` to remove the directory. Then run ``git submodule update
-   --init --recursive`` again.
+If you still have problems with a submodule directory, use ``rm -rf [directory
+name]`` to remove the directory. Then run ``git submodule update --init
+--recursive --progress`` again.
 
-#. Run ``git status`` again:
-
-   .. prompt:: bash $
-
-      git status
-   
-   Your submodules are up to date if you see the following message:
-
-   ::
-
-     On branch main
-     Your branch is up to date with 'origin/main'.
-     
-     nothing to commit, working tree clean
 
 Choose a Branch
 ===============
@@ -185,11 +119,9 @@ will be on the ``main`` branch by default, which is the unstable
 development branch. You may choose other branches too.
 
 - ``main``: The unstable development branch.
-- ``stable-release-name``: The name of the stable, `Active Releases`_. e.g. ``Pacific``
+- ``stable-release-name``: The name of the stable, :ref:`active-releases`. e.g. ``Pacific``
 - ``next``: The release candidate branch.
 
 ::
 
 	git checkout main
-
-.. _Active Releases: https://docs.ceph.com/en/latest/releases/#active-releases

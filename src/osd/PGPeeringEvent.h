@@ -3,6 +3,12 @@
 
 #pragma once
 
+#include <iostream>
+#include <memory>
+#include <sstream>
+#include <string>
+
+#include <boost/intrusive_ptr.hpp>
 #include <boost/statechart/event.hpp>
 
 #include "osd/osd_types.h"
@@ -193,6 +199,7 @@ struct RequestRecoveryPrio : boost::statechart::event< RequestRecoveryPrio > {
   };
 
 TrivialEvent(NullEvt)
+TrivialEvent(PgCreateEvt)
 TrivialEvent(RemoteBackfillReserved)
 TrivialEvent(RemoteReservationRejectedTooFull)
 TrivialEvent(RemoteReservationRevokedTooFull)

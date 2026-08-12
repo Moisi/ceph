@@ -13,10 +13,18 @@
  */
 
 #include "Capability.h"
+#include "BatchOp.h"
 #include "CInode.h"
+#include "Mutation.h" // for struct MDLockCache
 #include "SessionMap.h"
 
+#include "common/debug.h"
 #include "common/Formatter.h"
+
+#define dout_context g_ceph_context
+#define dout_subsys ceph_subsys_mds
+#undef dout_prefix
+#define dout_prefix *_dout << "Capability "
 
 
 /*
@@ -66,16 +74,12 @@ void Capability::Export::dump(ceph::Formatter *f) const
   f->dump_stream("last_issue_stamp") << last_issue_stamp;
 }
 
-void Capability::Export::generate_test_instances(std::list<Capability::Export*>& ls)
+std::list<Capability::Export> Capability::Export::generate_test_instances()
 {
-  ls.push_back(new Export);
-  ls.push_back(new Export);
-  ls.back()->wanted = 1;
-  ls.back()->issued = 2;
-  ls.back()->pending = 3;
-  ls.back()->client_follows = 4;
-  ls.back()->mseq = 5;
-  ls.back()->last_issue_stamp = utime_t(6, 7);
+  std::list<Capability::Export> ls;
+  ls.push_back(Export());
+  ls.push_back(Export(1, 2, 3, 4, 5, 6, 7, utime_t(8, 9), 10));
+  return ls;
 }
 
 void Capability::Import::encode(ceph::buffer::list &bl) const
@@ -103,6 +107,13 @@ void Capability::Import::dump(ceph::Formatter *f) const
   f->dump_unsigned("migrate_seq", mseq);
 }
 
+std::list<Capability::Import> Capability::Import::generate_test_instances()
+{
+  std::list<Capability::Import> ls;
+  ls.push_back(Import());
+  ls.push_back(Import(1, 2, 3));
+  return ls;
+}
 /*
  * Capability::revoke_info
  */
@@ -132,13 +143,15 @@ void Capability::revoke_info::dump(ceph::Formatter *f) const
   f->dump_unsigned("last_issue", last_issue);
 }
 
-void Capability::revoke_info::generate_test_instances(std::list<Capability::revoke_info*>& ls)
+std::list<Capability::revoke_info> Capability::revoke_info::generate_test_instances()
 {
-  ls.push_back(new revoke_info);
-  ls.push_back(new revoke_info);
-  ls.back()->before = 1;
-  ls.back()->seq = 2;
-  ls.back()->last_issue = 3;
+  std::list<Capability::revoke_info> ls;
+  ls.emplace_back();
+  ls.emplace_back();
+  ls.back().before = 1;
+  ls.back().seq = 2;
+  ls.back().last_issue = 3;
+  return ls;
 }
 
 
@@ -146,8 +159,7 @@ void Capability::revoke_info::generate_test_instances(std::list<Capability::revo
  * Capability
  */
 Capability::Capability(CInode *i, Session *s, uint64_t id) :
-  item_session_caps(this), item_snaprealm_caps(this),
-  item_revoking_caps(this), item_client_revoking_caps(this),
+  item_session_caps(this),
   lock_caches(member_offset(MDLockCache, item_cap_lock_cache)),
   inode(i), session(s), cap_id(id)
 {
@@ -174,6 +186,46 @@ Capability::Capability(CInode *i, Session *s, uint64_t id) :
 client_t Capability::get_client() const
 {
   return session ? session->get_client() : client_t(-1);
+}
+
+int Capability::confirm_receipt(ceph_seq_t seq, unsigned caps) {
+  int was_revoking = (_issued & ~_pending);
+  if (seq == last_sent) {
+    _revokes.clear();
+    _issued = caps;
+    // don't add bits
+    _pending &= caps;
+
+    // if the revoking is not totally finished just add the
+    // new revoking caps back.
+    if (was_revoking && revoking()) {
+      CInode *in = get_inode();
+      dout(10) << "revocation is not totally finished yet on " << *in
+               << ", the session " << *session << dendl;
+      _revokes.emplace_back(_pending, last_sent, last_issue);
+      if (!is_notable())
+        mark_notable();
+    }
+  } else {
+    // can i forget any revocations?
+    while (!_revokes.empty() && _revokes.front().seq < seq)
+      _revokes.pop_front();
+    if (!_revokes.empty()) {
+      if (_revokes.front().seq == seq)
+        _revokes.begin()->before = caps;
+      calc_issued();
+    } else {
+      // seq < last_sent
+      _issued = caps | _pending;
+    }
+  }
+
+  if (was_revoking && _issued == _pending) {
+    item_revoking_caps.remove_myself();
+    item_client_revoking_caps.remove_myself();
+    maybe_clear_notable();
+  }
+  return was_revoking & ~_issued; // return revoked
 }
 
 bool Capability::is_stale() const
@@ -270,26 +322,28 @@ void Capability::dump(ceph::Formatter *f) const
   f->close_section();
 }
 
-void Capability::generate_test_instances(std::list<Capability*>& ls)
+std::list<Capability> Capability::generate_test_instances()
 {
-  ls.push_back(new Capability);
-  ls.push_back(new Capability);
-  ls.back()->last_sent = 11;
-  ls.back()->last_issue_stamp = utime_t(12, 13);
-  ls.back()->set_wanted(14);
-  ls.back()->_pending = 15;
+  std::list<Capability> ls;
+  ls.emplace_back();
+  ls.emplace_back();
+  ls.back().last_sent = 11;
+  ls.back().last_issue_stamp = utime_t(12, 13);
+  ls.back().set_wanted(14);
+  ls.back()._pending = 15;
   {
-    auto &r = ls.back()->_revokes.emplace_back();
+    auto &r = ls.back()._revokes.emplace_back();
     r.before = 16;
     r.seq = 17;
     r.last_issue = 18;
   }
   {
-    auto &r = ls.back()->_revokes.emplace_back();
+    auto &r = ls.back()._revokes.emplace_back();
     r.before = 19;
     r.seq = 20;
     r.last_issue = 21;
   }
+  return ls;
 }
 
 MEMPOOL_DEFINE_OBJECT_FACTORY(Capability, co_cap, mds_co);

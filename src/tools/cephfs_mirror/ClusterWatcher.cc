@@ -31,16 +31,7 @@ ClusterWatcher::ClusterWatcher(CephContext *cct, MonClient *monc, ServiceDaemon 
 ClusterWatcher::~ClusterWatcher() {
 }
 
-bool ClusterWatcher::ms_can_fast_dispatch2(const cref_t<Message> &m) const {
-  return m->get_type() == CEPH_MSG_FS_MAP;
-}
-
-void ClusterWatcher::ms_fast_dispatch2(const ref_t<Message> &m) {
-  bool handled = ms_dispatch2(m);
-  ceph_assert(handled);
-}
-
-bool ClusterWatcher::ms_dispatch2(const ref_t<Message> &m) {
+Dispatcher::dispatch_result_t ClusterWatcher::ms_dispatch2(const ref_t<Message> &m) {
   if (m->get_type() == CEPH_MSG_FS_MAP) {
     if (m->get_connection()->get_peer_type() == CEPH_ENTITY_TYPE_MON) {
       handle_fsmap(ref_cast<MFSMap>(m));
@@ -76,7 +67,6 @@ void ClusterWatcher::handle_fsmap(const cref_t<MFSMap> &m) {
   dout(20) << dendl;
 
   auto fsmap = m->get_fsmap();
-  auto filesystems = fsmap.get_filesystems();
 
   std::vector<Filesystem> mirroring_enabled;
   std::vector<Filesystem> mirroring_disabled;
@@ -99,11 +89,11 @@ void ClusterWatcher::handle_fsmap(const cref_t<MFSMap> &m) {
       ++it;
     }
 
-    for (auto &filesystem : filesystems) {
-      auto fs = Filesystem{filesystem->fscid,
-                           std::string(filesystem->mds_map.get_fs_name())};
-      auto pool_id = filesystem->mds_map.get_metadata_pool();
-      auto &mirror_info = filesystem->mirror_info;
+    for (auto& [fscid, _fs] : std::as_const(fsmap)) {
+      auto& mds_map = _fs.get_mds_map();
+      auto fs = Filesystem{fscid, std::string(mds_map.get_fs_name())};
+      auto pool_id = mds_map.get_metadata_pool();
+      auto& mirror_info = _fs.get_mirror_info();
 
       if (!mirror_info.is_mirrored()) {
         auto it = m_filesystem_peers.find(fs);

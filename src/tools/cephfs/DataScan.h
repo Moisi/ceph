@@ -16,6 +16,7 @@
 #include "MDSUtility.h"
 #include "include/rados/librados.hpp"
 
+struct inode_backtrace_t;
 class InodeStore;
 class MDSTable;
 
@@ -153,8 +154,9 @@ class MetadataTool
   void build_file_dentry(
     inodeno_t ino, uint64_t file_size, time_t file_mtime,
     const file_layout_t &layout,
-    InodeStore *out,
-    std::string symlink);
+    std::string symlink,
+    inodeno_t remote_inode,
+    InodeStore *out);
 
   /**
    * Construct a synthetic InodeStore for a directory
@@ -252,6 +254,8 @@ class DataScan : public MDSUtility, public MetadataTool
     librados::IoCtx data_io;
     // Remember the data pool ID for use in layouts
     int64_t data_pool_id;
+    // IoCtxs for extra data pools
+    std::vector<librados::IoCtx> extra_data_ios;
 
     uint32_t n;
     uint32_t m;

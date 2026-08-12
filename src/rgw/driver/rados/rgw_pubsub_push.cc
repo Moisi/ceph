@@ -2,13 +2,17 @@
 // vim: ts=8 sw=2 smarttab ft=cpp
 
 #include "rgw_pubsub_push.h"
+#include <shared_mutex> // for std::shared_lock
 #include <string>
 #include <sstream>
 #include <algorithm>
-#include "include/buffer_fwd.h"
+#include <curl/curl.h>
 #include "common/Formatter.h"
 #include "common/iso_8601.h"
 #include "common/async/completion.h"
+#include "common/async/yield_waiter.h"
+#include "common/async/waiter.h"
+#include "rgw_asio_thread.h"
 #include "rgw_common.h"
 #include "rgw_data_sync.h"
 #include "rgw_pubsub.h"
@@ -19,10 +23,12 @@
 #ifdef WITH_RADOSGW_KAFKA_ENDPOINT
 #include "rgw_kafka.h"
 #endif
-#include <boost/asio/yield.hpp>
+//#include <boost/asio/yield.hpp>
 #include <boost/algorithm/string.hpp>
 #include <functional>
 #include "rgw_perf_counters.h"
+
+#define dout_subsys ceph_subsys_rgw_notification
 
 using namespace rgw;
 
@@ -53,8 +59,13 @@ bool get_bool(const RGWHTTPArgs& args, const std::string& name, bool default_val
   return value;
 }
 
+static std::unique_ptr<RGWHTTPManager> s_http_manager;
+static std::shared_mutex s_http_manager_mutex;
+static std::atomic<unsigned> s_http_manager_inflight(0);
+
 class RGWPubSubHTTPEndpoint : public RGWPubSubEndpoint {
 private:
+  CephContext* const cct;
   const std::string endpoint;
   typedef unsigned ack_level_t;
   ack_level_t ack_level; // TODO: not used for now
@@ -64,8 +75,8 @@ private:
   static const ack_level_t ACK_LEVEL_NON_ERROR = 1;
 
 public:
-  RGWPubSubHTTPEndpoint(const std::string& _endpoint, const RGWHTTPArgs& args) : 
-    endpoint(_endpoint), verify_ssl(get_bool(args, "verify-ssl", true)), cloudevents(get_bool(args, "cloudevents", false)) 
+  RGWPubSubHTTPEndpoint(const std::string& _endpoint, const RGWHTTPArgs& args, CephContext* _cct) : 
+    cct(_cct), endpoint(_endpoint), verify_ssl(get_bool(args, "verify-ssl", true)), cloudevents(get_bool(args, "cloudevents", false)) 
   {
     bool exists;
     const auto& str_ack_level = args.get("http-ack-level", &exists);
@@ -82,9 +93,24 @@ public:
     }
   }
 
-  int send_to_completion_async(CephContext* cct, const rgw_pubsub_s3_event& event, optional_yield y) override {
+  int send(const DoutPrefixProvider* dpp, const rgw_pubsub_s3_event& event,
+           optional_yield y) override {
+    std::shared_lock lock(s_http_manager_mutex);
+    if (!s_http_manager) {
+      ldout(cct, 1) << "ERROR: send failed. http endpoint manager not running" << dendl;
+      return -ESRCH;
+    }
+    const auto max_inflight = cct->_conf->rgw_http_notif_max_inflight;
+    if (max_inflight != 0 &&
+        s_http_manager_inflight >= max_inflight) {
+      ldout(cct, 1) << "ERROR: send failed. http endpoint manager busy. in-flight requests: " <<
+        s_http_manager_inflight << " >= " << max_inflight << dendl;
+      return -EBUSY;
+    }
     bufferlist read_bl;
     RGWPostHTTPData request(cct, "POST", endpoint, &read_bl, verify_ssl);
+    request.set_req_connect_timeout(cct->_conf->rgw_http_notif_connection_timeout);
+    request.set_req_timeout(cct->_conf->rgw_http_notif_message_timeout);
     const auto post_data = json_format_pubsub_event(event);
     if (cloudevents) {
       // following: https://github.com/cloudevents/spec/blob/v1.0.1/http-protocol-binding.md
@@ -100,8 +126,13 @@ public:
     request.set_post_data(post_data);
     request.set_send_length(post_data.length());
     request.append_header("Content-Type", "application/json");
+    ++s_http_manager_inflight;
     if (perfcounter) perfcounter->inc(l_rgw_pubsub_push_pending);
-    const auto rc = RGWHTTP::process(&request, y);
+    auto rc = s_http_manager->add_request(&request);
+    if (rc == 0) {
+      rc = request.wait(dpp, y);
+    }
+    --s_http_manager_inflight;
     if (perfcounter) perfcounter->dec(l_rgw_pubsub_push_pending);
     // TODO: use read_bl to process return code and handle according to ack level
     return rc;
@@ -123,12 +154,11 @@ private:
     Broker,
     Routable
   };
-  CephContext* const cct;
   const std::string endpoint;
   const std::string topic;
   const std::string exchange;
   ack_level_t ack_level;
-  amqp::connection_ptr_t conn;
+  amqp::connection_id_t conn_id;
 
   bool get_verify_ssl(const RGWHTTPArgs& args) {
     bool exists;
@@ -175,90 +205,44 @@ private:
 public:
   RGWPubSubAMQPEndpoint(const std::string& _endpoint,
       const std::string& _topic,
-      const RGWHTTPArgs& args,
-      CephContext* _cct) : 
-        cct(_cct),
+      const RGWHTTPArgs& args) : 
         endpoint(_endpoint), 
         topic(_topic),
         exchange(get_exchange(args)),
-        ack_level(get_ack_level(args)),
-        conn(amqp::connect(endpoint, exchange, (ack_level == ack_level_t::Broker), get_verify_ssl(args), args.get_optional("ca-location"))) {
-    if (!conn) { 
+        ack_level(get_ack_level(args)) {
+    if (!amqp::connect(conn_id, endpoint, exchange, (ack_level == ack_level_t::Broker), get_verify_ssl(args), args.get_optional("ca-location"))) {
       throw configuration_error("AMQP: failed to create connection to: " + endpoint);
     }
   }
 
-  // this allows waiting untill "finish()" is called from a different thread
-  // waiting could be blocking the waiting thread or yielding, depending
-  // with compilation flag support and whether the optional_yield is set
-  class Waiter {
-    using Signature = void(boost::system::error_code);
-    using Completion = ceph::async::Completion<Signature>;
-    std::unique_ptr<Completion> completion = nullptr;
-    int ret;
-
-    mutable std::atomic<bool> done = false;
-    mutable std::mutex lock;
-    mutable std::condition_variable cond;
-
-    template <typename ExecutionContext, typename CompletionToken>
-    auto async_wait(ExecutionContext& ctx, CompletionToken&& token) {
-      boost::asio::async_completion<CompletionToken, Signature> init(token);
-      auto& handler = init.completion_handler;
-      {
-        std::unique_lock l{lock};
-        completion = Completion::create(ctx.get_executor(), std::move(handler));
-      }
-      return init.result.get();
-    }
-
-  public:
-    int wait(optional_yield y) {
-      if (done) {
-        return ret;
-      }
-      if (y) {
-	auto& io_ctx = y.get_io_context();
-        auto& yield_ctx = y.get_yield_context();
-        boost::system::error_code ec;
-        async_wait(io_ctx, yield_ctx[ec]);
-        return -ec.value();
-      }
-      std::unique_lock l(lock);
-      cond.wait(l, [this]{return (done==true);});
-      return ret;
-    }
-
-    void finish(int r) {
-      std::unique_lock l{lock};
-      ret = r;
-      done = true;
-      if (completion) {
-        boost::system::error_code ec(-ret, boost::system::system_category());
-        Completion::post(std::move(completion), ec);
-      } else {
-        cond.notify_all();
-      }
-    }
-  };
-
-  int send_to_completion_async(CephContext* cct, const rgw_pubsub_s3_event& event, optional_yield y) override {
-    ceph_assert(conn);
+  int send(const DoutPrefixProvider* dpp, const rgw_pubsub_s3_event& event, optional_yield y) override {
     if (ack_level == ack_level_t::None) {
-      return amqp::publish(conn, topic, json_format_pubsub_event(event));
+      return amqp::publish(conn_id, topic, json_format_pubsub_event(event));
     } else {
       // TODO: currently broker and routable are the same - this will require different flags but the same mechanism
-      // note: dynamic allocation of Waiter is needed when this is invoked from a beast coroutine
-      auto w = std::unique_ptr<Waiter>(new Waiter);
-      const auto rc = amqp::publish_with_confirm(conn, 
-        topic,
-        json_format_pubsub_event(event),
-        std::bind(&Waiter::finish, w.get(), std::placeholders::_1));
+      if (y) {
+        auto& yield = y.get_yield_context();
+        ceph::async::yield_waiter<int> w;
+        boost::asio::defer(yield.get_executor(),[&w, &event, this]() {
+          const auto rc = amqp::publish_with_confirm(
+              conn_id, topic, json_format_pubsub_event(event),
+              [&w](int r) {w.complete(boost::system::error_code{}, r);});
+          if (rc < 0) {
+            // failed to publish, does not wait for reply
+            w.complete(boost::system::error_code{}, rc);
+          }
+        });
+        return w.async_wait(yield);
+      }
+      ceph::async::waiter<int> w;
+      const auto rc = amqp::publish_with_confirm(
+            conn_id, topic, json_format_pubsub_event(event),
+            [&w](int r) {w(r);});
       if (rc < 0) {
         // failed to publish, does not wait for reply
         return rc;
       }
-      return w->wait(y);
+      return w.wait();
     }
   }
 
@@ -283,11 +267,9 @@ private:
     None,
     Broker,
   };
-  CephContext* const cct;
   const std::string topic;
-  kafka::connection_ptr_t conn;
   const ack_level_t ack_level;
-
+  kafka::connection_id_t conn_id;
 
   ack_level_t get_ack_level(const RGWHTTPArgs& args) {
     bool exists;
@@ -305,93 +287,53 @@ private:
 public:
   RGWPubSubKafkaEndpoint(const std::string& _endpoint,
       const std::string& _topic,
-      const RGWHTTPArgs& args,
-      CephContext* _cct) : 
-        cct(_cct),
+      const RGWHTTPArgs& args) : 
         topic(_topic),
-        conn(kafka::connect(_endpoint, get_bool(args, "use-ssl", false), get_bool(args, "verify-ssl", true), args.get_optional("ca-location"))) ,
         ack_level(get_ack_level(args)) {
-    if (!conn) { 
-      throw configuration_error("Kafka: failed to create connection to: " + _endpoint);
-    }
-  }
+   if (!kafka::connect(
+           conn_id, _endpoint, get_bool(args, "use-ssl", false),
+           get_bool(args, "verify-ssl", true), args.get_optional("ca-location"),
+           args.get_optional("mechanism"), args.get_optional("user-name"),
+           args.get_optional("password"), args.get_optional("kafka-brokers"))) {
+     throw configuration_error("Kafka: failed to create connection to: " +
+                               _endpoint);
+   }
+ }
 
-  // this allows waiting untill "finish()" is called from a different thread
-  // waiting could be blocking the waiting thread or yielding, depending
-  // with compilation flag support and whether the optional_yield is set
-  class Waiter {
-    using Signature = void(boost::system::error_code);
-    using Completion = ceph::async::Completion<Signature>;
-    std::unique_ptr<Completion> completion = nullptr;
-    int ret;
-
-    mutable std::atomic<bool> done = false;
-    mutable std::mutex lock;
-    mutable std::condition_variable cond;
-
-    template <typename ExecutionContext, typename CompletionToken>
-    auto async_wait(ExecutionContext& ctx, CompletionToken&& token) {
-      boost::asio::async_completion<CompletionToken, Signature> init(token);
-      auto& handler = init.completion_handler;
-      {
-        std::unique_lock l{lock};
-        completion = Completion::create(ctx.get_executor(), std::move(handler));
-      }
-      return init.result.get();
-    }
-
-  public:
-    int wait(optional_yield y) {
-      if (done) {
-        return ret;
-      }
-      if (y) {
-        auto& io_ctx = y.get_io_context();
-        auto& yield_ctx = y.get_yield_context();
-        boost::system::error_code ec;
-        async_wait(io_ctx, yield_ctx[ec]);
-        return -ec.value();
-      }
-      std::unique_lock l(lock);
-      cond.wait(l, [this]{return (done==true);});
-      return ret;
-    }
-
-    void finish(int r) {
-      std::unique_lock l{lock};
-      ret = r;
-      done = true;
-      if (completion) {
-        boost::system::error_code ec(-ret, boost::system::system_category());
-        Completion::post(std::move(completion), ec);
-      } else {
-        cond.notify_all();
-      }
-    }
-  };
-
-  int send_to_completion_async(CephContext* cct, const rgw_pubsub_s3_event& event, optional_yield y) override {
-    ceph_assert(conn);
+  int send(const DoutPrefixProvider* dpp, const rgw_pubsub_s3_event& event,
+           optional_yield y) override {
     if (ack_level == ack_level_t::None) {
-      return kafka::publish(conn, topic, json_format_pubsub_event(event));
+      return kafka::publish(conn_id, topic, json_format_pubsub_event(event));
     } else {
-      // note: dynamic allocation of Waiter is needed when this is invoked from a beast coroutine
-      auto w = std::unique_ptr<Waiter>(new Waiter);
-      const auto rc = kafka::publish_with_confirm(conn, 
-        topic,
-        json_format_pubsub_event(event),
-        std::bind(&Waiter::finish, w.get(), std::placeholders::_1));
+      if (y) {
+        auto& yield = y.get_yield_context();
+        ceph::async::yield_waiter<int> w;
+        boost::asio::defer(yield.get_executor(),[&w, &event, this]() {
+          const auto rc = kafka::publish_with_confirm(
+              conn_id, topic, json_format_pubsub_event(event),
+              [&w](int r) {w.complete(boost::system::error_code{}, r);});
+          if (rc < 0) {
+            // failed to publish, does not wait for reply
+            w.complete(boost::system::error_code{}, rc);
+          }
+        });
+        return w.async_wait(yield);
+      }
+      ceph::async::waiter<int> w;
+      const auto rc = kafka::publish_with_confirm(
+            conn_id, topic, json_format_pubsub_event(event),
+            [&w](int r) {w(r);});
       if (rc < 0) {
         // failed to publish, does not wait for reply
         return rc;
       }
-      return w->wait(y);
+      return w.wait();
     }
   }
 
   std::string to_str() const override {
     std::string str("Kafka Endpoint");
-    str += kafka::to_string(conn);
+    str += "\nBroker: " + to_string(conn_id);
     str += "\nTopic: " + topic;
     return str;
   }
@@ -433,7 +375,7 @@ RGWPubSubEndpoint::Ptr RGWPubSubEndpoint::create(const std::string& endpoint,
     CephContext* cct) {
   const auto& schema = get_schema(endpoint);
   if (schema == WEBHOOK_SCHEMA) {
-    return Ptr(new RGWPubSubHTTPEndpoint(endpoint, args));
+    return std::make_unique<RGWPubSubHTTPEndpoint>(endpoint, args, cct);
 #ifdef WITH_RADOSGW_AMQP_ENDPOINT
   } else if (schema == AMQP_SCHEMA) {
     bool exists;
@@ -442,7 +384,7 @@ RGWPubSubEndpoint::Ptr RGWPubSubEndpoint::create(const std::string& endpoint,
       version = AMQP_0_9_1;
     }
     if (version == AMQP_0_9_1) {
-      return Ptr(new RGWPubSubAMQPEndpoint(endpoint, topic, args, cct));
+      return std::make_unique<RGWPubSubAMQPEndpoint>(endpoint, topic, args);
     } else if (version == AMQP_1_0) {
       throw configuration_error("AMQP: v1.0 not supported");
       return nullptr;
@@ -453,7 +395,7 @@ RGWPubSubEndpoint::Ptr RGWPubSubEndpoint::create(const std::string& endpoint,
 #endif
 #ifdef WITH_RADOSGW_KAFKA_ENDPOINT
   } else if (schema == KAFKA_SCHEMA) {
-      return Ptr(new RGWPubSubKafkaEndpoint(endpoint, topic, args, cct));
+      return std::make_unique<RGWPubSubKafkaEndpoint>(endpoint, topic, args);
 #endif
   }
 
@@ -461,3 +403,47 @@ RGWPubSubEndpoint::Ptr RGWPubSubEndpoint::create(const std::string& endpoint,
   return nullptr;
 }
 
+bool init_http_manager(CephContext* cct) {
+  std::unique_lock lock(s_http_manager_mutex);
+  if (s_http_manager) return false;
+  s_http_manager = std::make_unique<RGWHTTPManager>(cct);
+  return (s_http_manager->start() == 0);
+}
+
+void shutdown_http_manager() {
+  std::unique_lock lock(s_http_manager_mutex);
+  if (s_http_manager) {
+    s_http_manager->stop();
+    s_http_manager.reset();
+  }
+}
+
+bool RGWPubSubEndpoint::init_all(CephContext* cct) {
+#ifdef WITH_RADOSGW_AMQP_ENDPOINT
+  if (!amqp::init(cct)) {
+    ldout(cct, 1) << "ERROR: failed to init amqp endpoint manager" << dendl;
+    return false;
+  }
+#endif
+#ifdef WITH_RADOSGW_KAFKA_ENDPOINT
+  if (!kafka::init(cct)) {
+    ldout(cct, 1) << "ERROR: failed to init kafka endpoint manager" << dendl;
+    return false;
+  }
+#endif
+  if (!init_http_manager(cct)) {
+    ldout(cct, 1) << "ERROR: failed to init http endpoint manager" << dendl;
+    return false;
+  }
+  return true;
+}
+
+void RGWPubSubEndpoint::shutdown_all() {
+#ifdef WITH_RADOSGW_AMQP_ENDPOINT
+  amqp::shutdown();
+#endif
+#ifdef WITH_RADOSGW_KAFKA_ENDPOINT
+  kafka::shutdown();
+#endif
+  shutdown_http_manager();
+}

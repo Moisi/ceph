@@ -4,20 +4,49 @@
 
 .. glossary::
 
+        Application
+                More properly called a :term:`client`, an application is any program
+                external to Ceph that uses a Ceph Cluster to store and
+                replicate data.
+
 	:ref:`BlueStore<rados_config_storage_devices_bluestore>`
                 OSD BlueStore is a storage back end used by OSD daemons, and
                 was designed specifically for use with Ceph. BlueStore was
-                introduced in the Ceph Kraken release. In the Ceph Luminous
-                release, BlueStore became Ceph's default storage back end,
-                supplanting FileStore. Unlike :term:`filestore`, BlueStore
-                stores objects directly on Ceph block devices without any file
-                system interface. Since Luminous (12.2), BlueStore has been
-                Ceph's default and recommended storage back end.
+                introduced in the Ceph Kraken release. The Luminous release of
+                Ceph promoted BlueStore to the default OSD back end,
+                supplanting FileStore. As of the Reef release, FileStore is no
+                longer available as a storage back end.
+                
+                BlueStore stores objects directly on raw block devices or
+                partitions, and does not interact with mounted file systems.
+                BlueStore uses RocksDB's key/value database to map object names
+                to block locations on disk.
 
+        Bucket
+                In the context of :term:`RGW`, a bucket is a group of objects.
+                In a filesystem-based analogy in which objects are the
+                counterpart of files, buckets are the counterpart of
+                directories. :ref:`Multisite sync
+                policies<radosgw-multisite-sync-policy>` can be set on buckets,
+                to provide fine-grained control of data movement from one zone
+                to another zone. 
+                
+                The concept of the bucket has been taken from AWS S3. See also
+                `the AWS S3 page on creating buckets <https://docs.aws.amazon.com/AmazonS3/latest/userguide/creating-buckets-s3.html>`_
+                and `the AWS S3 'Buckets Overview' page <https://docs.aws.amazon.com/AmazonS3/latest/userguide/UsingBucket.html>`_.
+
+                OpenStack Swift uses the term "containers" for what RGW and AWS call "buckets". 
+                See `the OpenStack Storage API overview page <https://docs.openstack.org/swift/latest/api/object_api_v1_overview.html>`_.
+                
 	Ceph
                 Ceph is a distributed network storage and file system with
                 distributed metadata management and POSIX semantics.
 
+        `ceph-ansible <https://docs.ceph.com/projects/ceph-ansible/en/latest/index.html>`_
+                A GitHub repository, supported from the Jewel release to the
+                Quincy release, that facilitates the installation of a Ceph
+                cluster.
+                
 	Ceph Block Device
                 Also called "RADOS Block Device" and :term:`RBD`. A software
                 instrument that orchestrates the storage of block-based data in
@@ -36,7 +65,7 @@
                 as QEMU or Xen, and (3) a hypervisor abstraction layer such as
                 ``libvirt``.
 
-	Ceph Client
+	:ref:`Ceph Client <architecture_ceph_clients>`
                 Any of the Ceph components that can access a Ceph Storage
                 Cluster. This includes the Ceph Object Gateway, the Ceph Block
                 Device, the Ceph File System, and their corresponding
@@ -65,6 +94,11 @@
                 POSIX-compliant file system built on top of Ceph’s distributed
                 object store, RADOS.  See :ref:`CephFS Architecture
                 <arch-cephfs>` for more details.
+
+        :ref:`ceph-fuse <man-ceph-fuse>`
+                :ref:`ceph-fuse <man-ceph-fuse>` is a FUSE ("**F**\ilesystem in
+                **USE**\rspace") client for CephFS. ceph-fuse mounts a Ceph FS
+                ata  specified mount point. 
 
 	Ceph Interim Release
                 See :term:`Releases`.
@@ -167,9 +201,16 @@
                 Storage Clusters receive data from :term:`Ceph Client`\s.
 
 	CephX
-                The Ceph authentication protocol. CephX operates like Kerberos,
-                but it has no single point of failure. See the :ref:`CephX
-                Configuration Reference<rados-cephx-config-ref>`.
+                The Ceph authentication protocol. CephX authenticates users and
+                daemons. CephX operates like Kerberos, but it has no single
+                point of failure. See the :ref:`High-availability
+                Authentication section<arch_high_availability_authentication>`
+                of the Architecture document and the :ref:`CephX Configuration
+                Reference<rados-cephx-config-ref>`. 
+
+	Client
+                A client is any program external to Ceph that uses a Ceph
+                Cluster to store and replicate data. 
 
 	Cloud Platforms
 	Cloud Stacks
@@ -182,10 +223,24 @@
                 Ceph cluster. See :ref:`the "Cluster Map" section of the
                 Architecture document<architecture_cluster_map>` for details.
 
+        Crimson
+                A next-generation OSD architecture whose aim is the
+                reduction of latency costs incurred due to cross-core
+                communications. A re-design of the OSD reduces lock
+                contention by reducing communication between shards in the data
+                path. Crimson improves upon the performance of classic Ceph
+                OSDs by eliminating reliance on thread pools. See `Crimson:
+                Next-generation Ceph OSD for Multi-core Scalability
+                <https://ceph.io/en/news/blog/2023/crimson-multi-core-scalability/>`_.
+                See the :ref:`Crimson developer
+                documentation<crimson_dev_doc>`.
+
 	CRUSH
                 **C**\ontrolled **R**\eplication **U**\nder **S**\calable
                 **H**\ashing. The algorithm that Ceph uses to compute object
-                storage locations.
+                storage locations. See `CRUSH: Controlled, Scalable,
+                Decentralized Placement of Replicated Data
+                <https://ceph.com/assets/pdfs/weil-crush-sc06.pdf>`_.
 
 	CRUSH rule
                 The CRUSH data placement rule that applies to a particular
@@ -206,9 +261,20 @@
                 Another name for :term:`Dashboard`.
 
 	Dashboard Plugin
-	filestore
-                A back end for OSD daemons, where a Journal is needed and files
-                are written to the filesystem.
+                The dashboard plugin was a Mimic-era web application that
+                visualized information and statistics about the Ceph cluster
+                using a web server hosted by the :ref:`Ceph
+                Manager<ceph-manager-daemon>`.
+
+                See `the Mimic-era Dashboard Plugin documentation
+                <https://docs.ceph.com/en/mimic/mgr/dashboard/>`_.
+
+        DC
+                **D**\ata **C**\enter.
+
+        Flapping OSD
+                An OSD that is repeatedly marked ``up`` and then ``down`` in
+                rapid succession. See :ref:`rados_tshooting_flapping_osd`.
 
         FQDN
                 **F**\ully **Q**\ualified **D**\omain **N**\ame. A domain name
@@ -225,30 +291,79 @@
                 Any single machine or server in a Ceph Cluster. See :term:`Ceph
                 Node`.
 
+        Hybrid OSD  
+                Refers to an OSD that has both HDD and SSD drives.
+
+        librados
+                An API that can be used to create a custom interface to a Ceph
+                storage cluster. ``librados`` makes it possible to interact
+                with Ceph Monitors and with OSDs. See :ref:`Introduction to
+                librados <librados-intro>`. See :ref:`librados (Python)
+                <librados-python>`.
+
 	LVM tags
                 **L**\ogical **V**\olume **M**\anager tags. Extensible metadata
                 for LVM volumes and groups. They are used to store
                 Ceph-specific information about devices and its relationship
                 with OSDs.
 
-	:ref:`MDS<cephfs_add_remote_mds>`
+	MDS
                 The Ceph **M**\eta\ **D**\ata **S**\erver daemon. Also referred
                 to as "ceph-mds". The Ceph metadata server daemon must be
                 running in any Ceph cluster that runs the CephFS file system.
-                The MDS stores all filesystem metadata. 
+                The MDS stores all filesystem metadata. :term:`Client`\s work
+                together with either a single MDS or a group of MDSes to
+                maintain a distributed metadata cache that is required by
+                CephFS.
+
+                See :ref:`Deploying Metadata Servers<cephfs_add_remote_mds>`.
+
+                See the :ref:`ceph-mds man page<ceph_mds_man>`.
 
 	MGR
                 The Ceph manager software, which collects all the state from
                 the whole cluster in one place.
 
-	MON
+	:ref:`MON<arch_monitor>`
 		The Ceph monitor software.
+
+        Monitor Store
+                The persistent storage that is used by the Monitor. This
+                includes the Monitor's RocksDB and all related files in
+                ``/var/lib/ceph``.
 
 	Node
                 See :term:`Ceph Node`.
 
+	Object Storage
+                Object storage is one of three kinds of storage relevant to
+                Ceph. The other two kinds of storage relevant to Ceph are file
+                storage and block storage. Object storage is the category of
+                storage most fundamental to Ceph.
+
 	Object Storage Device
                 See :term:`OSD`.
+
+        omap 
+                "object map". A key-value store (a database) that is used to
+                reduce the time it takes to read data from and to write to the
+                Ceph cluster. RGW bucket indexes are stored as omaps.
+                Erasure-coded pools cannot store RADOS omap data structures.
+               
+                Run the command ``ceph osd df`` to see your omap.
+
+                See Eleanor Cawthon's 2012 paper `A Distributed Key-Value Store
+                using Ceph
+                <https://ceph.io/assets/pdfs/CawthonKeyValueStore.pdf>`_ (17
+                pages).
+
+        OpenStack Swift
+                In the context of Ceph, OpenStack Swift is one of the two APIs
+                supported by the Ceph Object Store. The other API supported by
+                the Ceph Object Store is S3.
+
+                See `the OpenStack Storage API overview page
+                <https://docs.openstack.org/swift/latest/api/object_api_v1_overview.html>`_.
 
 	OSD
                 Probably :term:`Ceph OSD`, but not necessarily. Sometimes
@@ -261,24 +376,75 @@
                 mid-2010s to insist that "OSD" should refer to "Object Storage
                 Device", so it is important to know which meaning is intended. 
 
-	OSD fsid
-                This is a unique identifier used to identify an OSD. It is
-                found in the OSD path in a file called ``osd_fsid``. The
-                term ``fsid`` is used interchangeably with ``uuid``
+        OSD, flapping
+                See :term:`Flapping OSD`.
 
-	OSD id
-                The integer that defines an OSD. It is generated by the
-                monitors during the creation of each OSD.
+	OSD FSID 
+                The OSD fsid is a unique identifier that is used to identify an
+                OSD. It is found in the OSD path in a file called ``osd_fsid``.
+                The term ``FSID`` is used interchangeably with ``UUID``.
 
-	OSD uuid
-                This is the unique identifier of an OSD. This term is used
-                interchangeably with ``fsid``
+	OSD ID 
+                The OSD id an integer unique to each OSD (each OSD has a unique
+                OSD ID). Each OSD id is generated by the monitors during the
+                creation of its associated OSD.
+
+	OSD UUID 
+                The OSD UUID is the unique identifier of an OSD. This term is
+                used interchangeably with ``FSID``.
+
+        Period
+                In the context of :term:`RGW`, a period is the configuration
+                state of the :term:`Realm`. The period stores the configuration
+                state of a multi-site configuration. When the period is updated,
+                the "epoch" is said thereby to have been changed.
+
+        Placement Groups (PGs)
+                Placement groups (PGs) are subsets of each logical Ceph pool.
+                Placement groups perform the function of placing objects (as a
+                group) into OSDs. Ceph manages data internally at
+                placement-group granularity: this scales better than would
+                managing individual (and therefore more numerous) RADOS
+                objects. A cluster that has a larger number of placement groups
+                (for example, 100 per OSD) is better balanced than an otherwise
+                identical cluster with a smaller number of placement groups. 
+                
+                Ceph's internal RADOS objects are each mapped to a specific
+                placement group, and each placement group belongs to exactly
+                one Ceph pool. 
+
+        PLP 
+                **P**\ower **L**\oss **P**\rotection. A technology that
+                protects the data of solid-state drives by using capacitors to
+                extend the amount of time available for transferring data from
+                the DRAM cache to the SSD's permanent memory. Consumer-grade
+                SSDs are rarely equipped with PLP.
 
 	:ref:`Pool<rados_pools>`
+
 		A pool is a logical partition used to store objects.
 
 	Pools
                 See :term:`pool`.
+
+	:ref:`Primary Affinity <rados_ops_primary_affinity>`
+                The characteristic of an OSD that governs the likelihood that
+                a given OSD will be selected as the primary OSD (or "lead
+                OSD") in an acting set. Primary affinity was introduced in
+                Firefly (v. 0.80). See :ref:`Primary Affinity
+                <rados_ops_primary_affinity>`.
+
+        :ref:`Prometheus <mgr-prometheus>`
+                An open-source monitoring and alerting toolkit. Ceph offers a
+                :ref:`"Prometheus module" <mgr-prometheus>`, which provides a
+                Prometheus exporter that passes performance counters from a
+                collection point in ``ceph-mgr`` to Prometheus.
+
+        Quorum	
+                Quorum is the state that exists when a majority of the
+                :ref:`Monitors<arch_monitor>` in the cluster are ``up``. A
+                minimum of three :ref:`Monitors<arch_monitor>` must exist in
+                the cluster in order for Quorum to be possible.
 
 	RADOS
                 **R**\eliable **A**\utonomic **D**\istributed **O**\bject
@@ -303,6 +469,10 @@
 	RBD
                 **R**\ADOS **B**\lock **D**\evice. See :term:`Ceph Block
                 Device`.
+
+        :ref:`Realm<rgw-realms>`
+                In the context of RADOS Gateway (RGW), a realm is a globally
+                unique namespace that consists of one or more zonegroups.
 
         Releases
 
@@ -338,6 +508,36 @@
                 provides a gateway to both the Amazon S3 RESTful API and the
                 OpenStack Swift API. 
 
+        S3
+                In the context of Ceph, S3 is one of the two APIs supported by
+                the Ceph Object Store. The other API supported by the Ceph
+                Object Store is OpenStack Swift.
+
+                See `the Amazon S3 overview page
+                <https://aws.amazon.com/s3/>`_.
+
+        scrubs
+
+                The processes by which Ceph ensures data integrity. During the
+                process of scrubbing, Ceph generates a catalog of all objects
+                in a placement group, then ensures that none of the objects are
+                missing or mismatched by comparing each primary object against
+                its replicas, which are stored across other OSDs. Any PG
+                is determined to have a copy of an object that is different
+                than the other copies or is missing entirely is marked
+                "inconsistent" (that is, the PG is marked "inconsistent"). 
+
+                There are two kinds of scrubbing: light scrubbing and deep
+                scrubbing (also called "shallow scrubbing" and "deep scrubbing",
+                respectively). Light scrubbing is performed daily and does
+                nothing more than confirm that a given object exists and that
+                its metadata is correct. Deep scrubbing is performed weekly and
+                reads the data and uses checksums to ensure data integrity.
+
+                See :ref:`Scrubbing <rados_config_scrubbing>` in the RADOS OSD
+                Configuration Reference Guide and page 141 of *Mastering Ceph,
+                second edition* (Fisk, Nick. 2019).
+
         secrets
                 Secrets are credentials used to perform digital authentication
                 whenever privileged users must access systems that require
@@ -352,8 +552,23 @@
                 which will exit upon completion (it is not intended to
                 daemonize)
 
+        Swift
+                See :term:`OpenStack Swift`.
+
 	Teuthology
 		The collection of software that performs scripted tests on Ceph.
+
+        User
+                An individual or a system actor (for example, an application)
+                that uses Ceph clients to interact with the :term:`Ceph Storage
+                Cluster`. See :ref:`User<rados-ops-user>` and :ref:`User
+                Management<user-management>`.
+
+        Zone
+                In the context of :term:`RGW`, a zone is a logical group that
+                consists of one or more :term:`RGW` instances.  A zone's
+                configuration state is stored in the :term:`period`. See
+                :ref:`Zones<radosgw-zones>`.
 
 .. _https://github.com/ceph: https://github.com/ceph
 .. _Cluster Map: ../architecture#cluster-map   

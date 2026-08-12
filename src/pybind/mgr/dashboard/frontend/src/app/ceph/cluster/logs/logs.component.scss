@@ -6,7 +6,7 @@ p {
 
 .card {
   .btn-group {
-    margin-top: -45px;
+    margin-top: -57px;
     position: absolute;
     right: 0;
   }
@@ -51,4 +51,8 @@ p {
 
 ::ng-deep cd-logs ngb-timepicker input.ngb-tp-input {
   width: 3.5rem !important;
+}
+
+.card-body.overflow-auto {
+  height: 50vh;
 }

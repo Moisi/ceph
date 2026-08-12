@@ -115,10 +115,10 @@ private:
    * LOAD_LOCAL_IMAGE_META <----------------------------\
    *    |                                               |
    *    v (skip if not needed)                          |
-   * REFRESH_LOCAL_IMAGE                                |
+   * REFRESH_REMOTE_IMAGE                               |
    *    |                                               |
    *    v (skip if not needed)                          |
-   * REFRESH_REMOTE_IMAGE                               |
+   * REFRESH_LOCAL_IMAGE                                |
    *    |                                               |
    *    | (unused non-primary snapshot)                 |
    *    |\--------------> PRUNE_NON_PRIMARY_SNAPSHOT---/|
@@ -238,8 +238,11 @@ private:
   DeepCopyHandler* m_deep_copy_handler = nullptr;
 
   TimeRollingMean m_bytes_per_second;
+  uint64_t m_last_snapshot_sync_seconds = 0;
 
   uint64_t m_snapshot_bytes = 0;
+  uint64_t m_last_snapshot_bytes = 0;
+
   boost::accumulators::accumulator_set<
     uint64_t, boost::accumulators::stats<
       boost::accumulators::tag::rolling_mean>> m_bytes_per_snapshot{
@@ -253,6 +256,8 @@ private:
   bool m_sync_in_progress = false;
 
   PerfCounters *m_perf_counters = nullptr;
+
+  bool is_remote_primary();
 
   void load_local_image_meta();
   void handle_load_local_image_meta(int r);

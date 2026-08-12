@@ -11,6 +11,8 @@
 #include "crimson/common/utility.h"
 #include "include/ceph_assert.h"
 
+class transaction_manager_test_t;
+
 namespace crimson::interruptible {
 
 template <typename, typename>
@@ -108,7 +110,7 @@ inline auto repeat(AsyncAction action) {
         f.get_exception()
       );
     } else if (f.available()) {
-      if (auto done = f.get0()) {
+      if (auto done = f.get()) {
         return errorator_t::template make_ready_future<>();
       }
     } else {
@@ -154,12 +156,17 @@ public:
   }
 };
 
+struct no_touch_error_marker {};
+
 // unthrowable_wrapper ensures compilation failure when somebody
 // would like to `throw make_error<...>)()` instead of returning.
 // returning allows for the compile-time verification of future's
 // AllowedErrorsV and also avoid the burden of throwing.
 template <class ErrorT, ErrorT ErrorV>
 struct unthrowable_wrapper : error_t<unthrowable_wrapper<ErrorT, ErrorV>> {
+
+  using error_type_t = ErrorT;
+
   unthrowable_wrapper(const unthrowable_wrapper&) = delete;
   [[nodiscard]] static const auto& make() {
     static constexpr unthrowable_wrapper instance{};
@@ -200,6 +207,21 @@ struct unthrowable_wrapper : error_t<unthrowable_wrapper<ErrorT, ErrorV>> {
     }
   };
 
+  class assert_failure {
+    const char* const msg = nullptr;
+  public:
+    assert_failure(const char* msg)
+      : msg(msg) {
+    }
+    assert_failure() = default;
+
+    no_touch_error_marker operator()(const unthrowable_wrapper& raw_error) {
+      handle([this] (auto&& error_v) {
+        ceph_abort_msgf("%s: %s", msg ? msg : "", error_v.message().c_str());
+      })(raw_error);
+      return no_touch_error_marker{};
+    }
+  };
 
 private:
   // can be used only to initialize the `instance` member
@@ -236,6 +258,9 @@ std::exception_ptr unthrowable_wrapper<ErrorT, ErrorV>::carrier_instance = \
 
 template <class ErrorT>
 struct stateful_error_t : error_t<stateful_error_t<ErrorT>> {
+
+  using error_type_t = ErrorT;
+
   template <class... Args>
   explicit stateful_error_t(Args&&... args)
     : ep(std::make_exception_ptr<ErrorT>(std::forward<Args>(args)...)) {
@@ -260,6 +285,26 @@ struct stateful_error_t : error_t<stateful_error_t<ErrorT>> {
       }
       ceph_abort_msg("exception type mismatch -- impossible!");
     };
+  }
+
+  class assert_failure {
+    const char* const msg = nullptr;
+  public:
+    assert_failure(const char* msg)
+      : msg(msg) {
+    }
+    assert_failure() = default;
+
+    no_touch_error_marker operator()(stateful_error_t<ErrorT>&& raw_error) {
+      handle([this] (auto&& error_v) {
+        ceph_abort_msgf("%s: %s", msg ? msg : "", error_v.message().c_str());
+      })(std::move(raw_error));
+      return no_touch_error_marker{};
+    }
+  };
+
+  auto exception_ptr() {
+    return ep;
   }
 
 private:
@@ -291,6 +336,10 @@ class maybe_handle_error_t {
   ErrorVisitorT errfunc;
 
 public:
+  // NOTE: `__cxa_exception_type()` is an extension of the language.
+  // It should be available both in GCC and Clang but a fallback
+  // (based on `std::rethrow_exception()` and `catch`) can be made
+  // to handle other platforms if necessary.
   maybe_handle_error_t(ErrorVisitorT&& errfunc, std::exception_ptr ep)
     : type_info(*ep.__cxa_exception_type()),
       result(FuturatorT::make_exception_future(std::move(ep))),
@@ -301,50 +350,70 @@ public:
   void handle() {
     static_assert(std::is_invocable<ErrorVisitorT, ErrorT>::value,
                   "provided Error Visitor is not exhaustive");
-    // In C++ throwing an exception isn't the sole way to signal
-    // error with it. This approach nicely fits cold, infrequent cases
-    // but when applied to a hot one, it will likely hurt performance.
-    //
-    // Alternative approach is to create `std::exception_ptr` on our
-    // own and place it in the future via `make_exception_future()`.
-    // When it comes to handling, the pointer can be interrogated for
-    // pointee's type with `__cxa_exception_type()` instead of costly
-    // re-throwing (via `std::rethrow_exception()`) and matching with
-    // `catch`. The limitation here is lack of support for hierarchies
-    // of exceptions. The code below checks for exact match only while
-    // `catch` would allow to match against a base class as well.
-    // However, this shouldn't be a big issue for `errorator` as Error
-    // Visitors are already checked for exhaustiveness at compile-time.
-    //
-    // NOTE: `__cxa_exception_type()` is an extension of the language.
-    // It should be available both in GCC and Clang but a fallback
-    // (based on `std::rethrow_exception()` and `catch`) can be made
-    // to handle other platforms if necessary.
-    if (type_info == ErrorT::error_t::get_exception_ptr_type_info()) {
-      // set `state::invalid` in internals of `seastar::future` to not
-      // call `report_failed_future()` during `operator=()`.
-      [[maybe_unused]] auto&& ep = std::move(result).get_exception();
 
-      using return_t = std::invoke_result_t<ErrorVisitorT, ErrorT>;
+    // Forbid any error handlers that are returning void.
+    // See: https://tracker.ceph.com/issues/69406
+    using return_t = std::invoke_result_t<ErrorVisitorT, ErrorT>;
+    static_assert(!std::is_same_v<return_t, void>,
+                  "error handlers mustn't return void");
+
+    // The code below checks for exact match only while
+    // `catch` would allow to match against a base class as well.
+    // However, this shouldn't be a big issue for `errorator` as
+    // ErrorVisitorT are already checked for exhaustiveness at compile-time.
+    // TODO: why/when is this possible?
+    if (type_info != ErrorT::error_t::get_exception_ptr_type_info()) {
+        return;
+    }
+
+    auto ep = take_exception_from_future();
+
+    // Any assert_* handler we have:
+    // assert_failure, assert_all and assert_all_func_t
+    // are expected to return void since we actually abort in them.
+    // This is why we need a way to diffreciate between them and between
+    // non-aborting error handlers (e.g handle) - for that we use the dedicated
+    // label of: no_touch_error_marker. Otherwise we would fail the above
+    // static assertion.
+    if constexpr (std::is_same_v<return_t, no_touch_error_marker>) {
+      std::ignore = std::invoke(std::forward<ErrorVisitorT>(errfunc),
+                                ErrorT::error_t::from_exception_ptr(std::move(ep)));
+    } else {
+      // In C++ throwing an exception isn't the sole way to signal
+      // error with it. This approach nicely fits cold, infrequent cases
+      // but when applied to a hot one, it will likely hurt performance.
+      //
+      // Alternative approach is to create `std::exception_ptr` on our
+      // own and place it in the future via `make_exception_future()`.
+      // When it comes to handling, the pointer can be interrogated for
+      // pointee's type with `__cxa_exception_type()` instead of costly
+      // re-throwing (via `std::rethrow_exception()`) and matching with
+      // `catch`. The limitation here is lack of support for hierarchies
+      // of exceptions.
+
+       // TODO: add missing explanation
       if constexpr (std::is_assignable_v<decltype(result), return_t>) {
         result = std::invoke(std::forward<ErrorVisitorT>(errfunc),
                              ErrorT::error_t::from_exception_ptr(std::move(ep)));
-      } else if constexpr (std::is_same_v<return_t, void>) {
-        // void denotes explicit discarding
-        // execute for the sake a side effects. Typically this boils down
-        // to throwing an exception by the handler.
-        std::invoke(std::forward<ErrorVisitorT>(errfunc),
-                    ErrorT::error_t::from_exception_ptr(std::move(ep)));
       } else {
-        result = FuturatorT::type::errorator_type::template make_ready_future<return_t>(
-          std::invoke(std::forward<ErrorVisitorT>(errfunc),
-                      ErrorT::error_t::from_exception_ptr(std::move(ep))));
+        result = FuturatorT::invoke(
+          std::forward<ErrorVisitorT>(errfunc),
+          ErrorT::error_t::from_exception_ptr(std::move(ep)));
       }
     }
   }
 
   auto get_result() && {
     return std::move(result);
+  }
+
+  // seastar::future::get_exception()&& calls take_exception() internally.
+  // This will result in the future state to be "state::invalid".
+  // That way when using seastar::future `operator=()`,
+  // report_failed_future() won't be called.
+  std::exception_ptr take_exception_from_future() {
+    auto&& ep = std::move(result).get_exception();
+    return ep;
   }
 };
 
@@ -370,6 +439,7 @@ static constexpr auto composer(FuncHead&& head, FuncTail&&... tail) {
 	std::is_invocable_v<FuncHead, decltype(args)...> ||
 	(sizeof...(FuncTail) > 0),
       "composition is not exhaustive");
+      return no_touch_error_marker{};
     }
   };
 }
@@ -503,8 +573,9 @@ private:
     }
 
   protected:
-    using base_t::get_exception;
+    friend class ::transaction_manager_test_t;
   public:
+    using base_t::get_exception;
     using errorator_type = ::crimson::errorator<AllowedErrors...>;
     using promise_type = seastar::promise<ValueT>;
 
@@ -587,12 +658,18 @@ private:
                     "ErrorT is not enlisted in errorator");
     }
 
+    void set_coroutine(seastar::task& coroutine) noexcept {
+      base_t::set_coroutine(coroutine);
+    }
+
     template <class ValueFuncT, class ErrorVisitorT>
     auto safe_then(ValueFuncT&& valfunc, ErrorVisitorT&& errfunc) {
       static_assert((... && std::is_invocable_v<ErrorVisitorT,
                                                 AllowedErrors>),
                     "provided Error Visitor is not exhaustive");
-
+      static_assert(std::is_void_v<ValueT> ? std::is_invocable_v<ValueFuncT>
+		                           : std::is_invocable_v<ValueFuncT, ValueT>,
+                    "Value Func is not invocable with future's value");
       using value_func_result_t =
         typename std::conditional_t<std::is_void_v<ValueT>,
 				    std::invoke_result<ValueFuncT>,
@@ -679,8 +756,8 @@ private:
     auto &&unsafe_get() {
       return seastar::future<ValueT>::get();
     }
-    auto unsafe_get0() {
-      return seastar::future<ValueT>::get0();
+    void unsafe_wait() {
+      seastar::future<ValueT>::wait();
     }
 
     template <class FuncT>
@@ -829,10 +906,8 @@ private:
     template <typename ErrorT, EnableIf<ErrorT>...>
     decltype(auto) operator()(ErrorT&& e) {
       using decayed_t = std::decay_t<decltype(e)>;
-      auto&& handler =
-        decayed_t::error_t::handle(std::forward<ErrorFunc>(func));
-      static_assert(std::is_invocable_v<decltype(handler), ErrorT>);
-      return std::invoke(std::move(handler), std::forward<ErrorT>(e));
+      return decayed_t::error_t::handle(std::forward<ErrorFunc>(func))
+                                       (std::forward<ErrorT>(e));
     }
   };
 
@@ -858,40 +933,58 @@ public:
     }
   };
 
-  struct discard_all {
-    template <class ErrorT, EnableIf<ErrorT>...>
-    void operator()(ErrorT&&) {
-      static_assert(contains_once_v<std::decay_t<ErrorT>>,
-                    "discarding disallowed ErrorT");
-    }
-  };
-
   template <typename T>
   static future<T> make_errorator_future(seastar::future<T>&& fut) {
     return std::move(fut);
   }
 
-  // assert_all{ "TODO" };
   class assert_all {
     const char* const msg = nullptr;
   public:
-    template <std::size_t N>
-    assert_all(const char (&msg)[N])
+    assert_all(const char* msg)
       : msg(msg) {
     }
     assert_all() = default;
 
     template <class ErrorT, EnableIf<ErrorT>...>
-    void operator()(ErrorT&&) {
-      static_assert(contains_once_v<std::decay_t<ErrorT>>,
+    no_touch_error_marker operator()(ErrorT&& raw_error) {
+      using decayed_t = std::decay_t<ErrorT>;
+      static_assert(contains_once_v<decayed_t>,
                     "discarding disallowed ErrorT");
-      if (msg) {
-        ceph_abort_msg(msg);
-      } else {
-        ceph_abort();
-      }
+      decayed_t::error_t::handle([this] (auto&& error_v) {
+        ceph_abort_msgf("%s: %s", msg ? msg : "", error_v.message().c_str());
+      })(std::forward<ErrorT>(raw_error));
+      return no_touch_error_marker{};
     }
   };
+
+  template <typename Func>
+  class assert_all_func_t {
+  public:
+    assert_all_func_t(Func &&f)
+      : f(std::forward<Func>(f)) {}
+
+    template <class ErrorT, EnableIf<ErrorT>...>
+    no_touch_error_marker operator()(ErrorT&& e) {
+      static_assert(contains_once_v<std::decay_t<ErrorT>>,
+                    "discarding disallowed ErrorT");
+      try {
+        std::rethrow_exception(e.exception_ptr());
+      } catch(const typename std::decay_t<ErrorT>::error_type_t& err) {
+        f(err);
+      }
+      ceph_abort();
+      return no_touch_error_marker{};
+    }
+
+  private:
+    Func f;
+  };
+
+  template <typename Func>
+  static auto assert_all_func(Func &&f) {
+    return assert_all_func_t<Func>{std::forward<Func>(f)};
+  }
 
   template <class ErrorFunc>
   static decltype(auto) all_same_way(ErrorFunc&& error_func) {
@@ -1211,28 +1304,21 @@ namespace ct_error {
     }
   };
 
-  struct discard_all {
-    template <class ErrorT>
-    void operator()(ErrorT&&) {
-    }
-  };
-
   class assert_all {
     const char* const msg = nullptr;
   public:
-    template <std::size_t N>
-    assert_all(const char (&msg)[N])
+    assert_all(const char* msg)
       : msg(msg) {
     }
     assert_all() = default;
 
     template <class ErrorT>
-    void operator()(ErrorT&&) {
-      if (msg) {
-        ceph_abort(msg);
-      } else {
-        ceph_abort();
-      }
+    no_touch_error_marker operator()(ErrorT&& raw_error) {
+      using decayed_t = std::decay_t<ErrorT>;
+      decayed_t::error_t::handle([this] (auto&& error_v) {
+        ceph_abort_msgf("%s: %s", msg ? msg : "", error_v.message().c_str());
+      })(std::forward<ErrorT>(raw_error));
+      return no_touch_error_marker{};
     }
   };
 
@@ -1242,9 +1328,8 @@ namespace ct_error {
       error_func = std::forward<ErrorFunc>(error_func)
     ] (auto&& e) mutable -> decltype(auto) {
       using decayed_t = std::decay_t<decltype(e)>;
-      auto&& handler =
-        decayed_t::error_t::handle(std::forward<ErrorFunc>(error_func));
-      return std::invoke(std::move(handler), std::forward<decltype(e)>(e));
+      return decayed_t::error_t::handle(std::forward<ErrorFunc>(error_func))
+                                       (std::forward<decltype(e)>(e));
     };
   };
 }

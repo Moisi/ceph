@@ -20,16 +20,15 @@
 
 #include "include/ceph_assert.h"
 #include "include/common_fwd.h"
-#if defined(WITH_SEASTAR) && !defined(WITH_ALIEN)
+#ifdef WITH_CRIMSON
 #include <seastar/util/log.hh>
 #include "crimson/common/log.h"
 #include "crimson/common/config_proxy.h"
+#include <sstream>
 #else
 #include "global/global_context.h"
 #include "common/ceph_context.h"
 #include "common/config.h"
-#include "common/likely.h"
-#include "common/Clock.h"
 #include "log/Log.h"
 #endif
 
@@ -44,6 +43,18 @@ inline std::ostream& operator<<(std::ostream& out, _bad_endl_use_dendl_t) {
   return out;
 }
 
+template<typename T>
+concept HasPrint = requires(T t, std::ostream& u) {
+  { t.print(u) } -> std::same_as<void>;
+};
+
+template<typename T> requires HasPrint<T>
+static inline std::ostream& operator<<(std::ostream& out, T&& t)
+{
+  t.print(out);
+  return out;
+}
+
 class DoutPrefixProvider {
 public:
   virtual std::ostream& gen_prefix(std::ostream& out) const = 0;
@@ -51,6 +62,14 @@ public:
   virtual unsigned get_subsys() const = 0;
   virtual ~DoutPrefixProvider() {}
 };
+
+inline std::ostream &operator<<(
+  std::ostream &lhs, const DoutPrefixProvider &dpp) {
+  return dpp.gen_prefix(lhs);
+}
+#if FMT_VERSION >= 90000
+template <> struct fmt::formatter<DoutPrefixProvider> : fmt::ostream_formatter {};
+#endif
 
 // a prefix provider with empty prefix
 class NoDoutPrefix : public DoutPrefixProvider {
@@ -119,7 +138,7 @@ struct is_dynamic<dynamic_marker_t<T>> : public std::true_type {};
 // generic macros
 #define dout_prefix *_dout
 
-#if defined(WITH_SEASTAR) && !defined(WITH_ALIEN)
+#ifdef WITH_CRIMSON
 #define dout_impl(cct, sub, v)                                          \
   do {                                                                  \
     if (crimson::common::local_conf()->subsys.should_gather(sub, v)) {  \
@@ -136,17 +155,27 @@ struct is_dynamic<dynamic_marker_t<T>> : public std::true_type {};
 #else
 #define dout_impl(cct, sub, v)						\
   do {									\
-  const bool should_gather = [&](const auto cctX) {			\
-    if constexpr (ceph::dout::is_dynamic<decltype(sub)>::value ||	\
-		  ceph::dout::is_dynamic<decltype(v)>::value) {		\
+  const bool should_gather = [&](const auto cctX, auto sub_, auto v_) {	\
+    /* The check is performed on `sub_` and `v_` to leverage the C++'s 	\
+     * guarantee on _discarding_ one of blocks of `if constexpr`, which	\
+     * includes also the checks for ill-formed code (`should_gather<>`	\
+     * must not be feed with non-const expresions), BUT ONLY within	\
+     * a template (thus the generic lambda) and under the restriction	\
+     * it's dependant on a parameter of this template).			\
+     * GCC prior to v14 was not enforcing these restrictions. */	\
+    if constexpr (ceph::dout::is_dynamic<decltype(sub_)>::value ||	\
+		  ceph::dout::is_dynamic<decltype(v_)>::value) {	\
       return cctX->_conf->subsys.should_gather(sub, v);			\
     } else {								\
+      constexpr auto sub_helper = static_cast<decltype(sub_)>(sub);	\
+      constexpr auto v_helper = static_cast<decltype(v_)>(v);		\
       /* The parentheses are **essential** because commas in angle	\
        * brackets are NOT ignored on macro expansion! A language's	\
        * limitation, sorry. */						\
-      return (cctX->_conf->subsys.template should_gather<sub, v>());	\
+      return (cctX->_conf->subsys.template should_gather<sub_helper,	\
+							 v_helper>());	\
     }									\
-  }(cct);								\
+  }(cct, sub, v);							\
 									\
   if (should_gather) {							\
     ceph::logging::MutableEntry _dout_e(v, sub);                        \
@@ -160,7 +189,7 @@ struct is_dynamic<dynamic_marker_t<T>> : public std::true_type {};
     _dout_cct->_log->submit_entry(std::move(_dout_e));                  \
   }                                                                     \
   } while (0)
-#endif	// WITH_SEASTAR
+#endif	// WITH_CRIMSON
 
 #define lsubdout(cct, sub, v)  dout_impl(cct, ceph_subsys_##sub, v) dout_prefix
 #define ldout(cct, v)  dout_impl(cct, dout_subsys, v) dout_prefix

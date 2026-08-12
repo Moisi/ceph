@@ -10,6 +10,7 @@
 #include "include/Context.h"
 #include "include/rados/librados.hpp"
 #include "Watcher.h"
+#include "Types.h"
 
 class ContextWQ;
 class Messenger;
@@ -27,11 +28,11 @@ class FSMirror;
 class MirrorWatcher : public Watcher {
 public:
   static MirrorWatcher *create(librados::IoCtx &ioctx, FSMirror *fs_mirror,
-                               ContextWQ *work_queue) {
-    return new MirrorWatcher(ioctx, fs_mirror, work_queue);
+                               ErrorListener &elistener, ContextWQ *work_queue) {
+    return new MirrorWatcher(ioctx, fs_mirror, elistener, work_queue);
   }
 
-  MirrorWatcher(librados::IoCtx &ioctx, FSMirror *fs_mirror,
+  MirrorWatcher(librados::IoCtx &ioctx, FSMirror *fs_mirror, ErrorListener &elistener,
                 ContextWQ *work_queue);
   ~MirrorWatcher();
 
@@ -55,6 +56,7 @@ public:
 private:
   librados::IoCtx &m_ioctx;
   FSMirror *m_fs_mirror;
+  ErrorListener &m_elistener;
   ContextWQ *m_work_queue;
 
   ceph::mutex m_lock;

@@ -69,14 +69,14 @@ void WINAPI ServiceBase::run()
   s_service->set_status(SERVICE_START_PENDING);
 
   // TODO: should we expect exceptions?
-  ldout(s_service->cct, 5) << "Starting service." << dendl;
+  ldout(s_service->cct, 0) << "Starting service." << dendl;
   int err = s_service->run_hook();
   if (err) {
     lderr(s_service->cct) << "Failed to start service. Error code: "
                           << err << dendl;
     s_service->shutdown(true);
   } else {
-    ldout(s_service->cct, 5) << "Successfully started service." << dendl;
+    ldout(s_service->cct, 0) << "Successfully started service." << dendl;
     s_service->set_status(SERVICE_RUNNING);
   }
 }
@@ -85,6 +85,8 @@ void ServiceBase::shutdown(bool ignore_errors)
 {
   DWORD original_state = status.dwCurrentState;
   set_status(SERVICE_STOP_PENDING);
+
+  dout(0) << "Shutdown requested." << dendl;
 
   int err = shutdown_hook();
   if (err) {
@@ -98,7 +100,7 @@ void ServiceBase::shutdown(bool ignore_errors)
       set_status(original_state);
     }
   } else {
-    dout(5) << "Shutdown hook completed." << dendl;
+    dout(0) << "Shutdown hook completed." << dendl;
     set_status(SERVICE_STOPPED);
   }
 }
@@ -108,12 +110,14 @@ void ServiceBase::stop()
   DWORD original_state = status.dwCurrentState;
   set_status(SERVICE_STOP_PENDING);
 
+  dout(0) << "Service stop requested." << dendl;
+
   int err = stop_hook();
   if (err) {
     derr << "Service stop hook failed. Error code: " << err << dendl;
     set_status(original_state);
   } else {
-    dout(5) << "Successfully stopped service." << dendl;
+    dout(0) << "Successfully stopped service." << dendl;
     set_status(SERVICE_STOPPED);
   }
 }

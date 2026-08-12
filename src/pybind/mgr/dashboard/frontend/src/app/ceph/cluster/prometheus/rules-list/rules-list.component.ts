@@ -1,25 +1,27 @@
-import { Component, Inject, OnInit } from '@angular/core';
+import { Component, Inject, OnInit, OnDestroy } from '@angular/core';
 
 import _ from 'lodash';
+import { Subscription } from 'rxjs';
 
 import { PrometheusService } from '~/app/shared/api/prometheus.service';
 import { CellTemplate } from '~/app/shared/enum/cell-template.enum';
+import { PrometheusListHelper } from '~/app/shared/helpers/prometheus-list-helper';
 import { CdTableColumn } from '~/app/shared/models/cd-table-column';
 import { CdTableSelection } from '~/app/shared/models/cd-table-selection';
 import { PrometheusRule } from '~/app/shared/models/prometheus-alerts';
 import { DurationPipe } from '~/app/shared/pipes/duration.pipe';
 import { PrometheusAlertService } from '~/app/shared/services/prometheus-alert.service';
-import { PrometheusListHelper } from '../prometheus-list-helper';
 
 @Component({
   selector: 'cd-rules-list',
   templateUrl: './rules-list.component.html',
   styleUrls: ['./rules-list.component.scss']
 })
-export class RulesListComponent extends PrometheusListHelper implements OnInit {
+export class RulesListComponent extends PrometheusListHelper implements OnInit, OnDestroy {
   columns: CdTableColumn[];
-  expandedRow: PrometheusRule;
+  declare expandedRow: PrometheusRule;
   selection = new CdTableSelection();
+  rules: PrometheusRule[] = [];
 
   /**
    * Hide active alerts in details of alerting rules as they are already shown
@@ -27,6 +29,7 @@ export class RulesListComponent extends PrometheusListHelper implements OnInit {
    * always supposed to be 'alerting'.
    */
   hideKeys = ['alerts', 'type'];
+  rulesSubscription: Subscription;
 
   constructor(
     public prometheusAlertService: PrometheusAlertService,
@@ -37,6 +40,10 @@ export class RulesListComponent extends PrometheusListHelper implements OnInit {
 
   ngOnInit() {
     super.ngOnInit();
+    this.prometheusAlertService.getRules();
+    this.rulesSubscription = this.prometheusAlertService.rules$.subscribe((rules) => {
+      this.rules = rules;
+    });
     this.columns = [
       { prop: 'name', name: $localize`Name`, cellClass: 'fw-bold', flexGrow: 2 },
       {
@@ -65,5 +72,9 @@ export class RulesListComponent extends PrometheusListHelper implements OnInit {
 
   updateSelection(selection: CdTableSelection) {
     this.selection = selection;
+  }
+
+  ngOnDestroy() {
+    this.rulesSubscription.unsubscribe();
   }
 }

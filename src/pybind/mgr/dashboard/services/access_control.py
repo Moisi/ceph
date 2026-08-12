@@ -12,8 +12,9 @@ from datetime import datetime, timedelta
 from string import ascii_lowercase, ascii_uppercase, digits, punctuation
 from typing import List, Optional, Sequence
 
-import bcrypt
+from ceph.cryptotools.select import get_crypto_caller
 from mgr_module import CLICheckNonemptyFileInput, CLIReadCommand, CLIWriteCommand
+from mgr_util import password_hash
 
 from .. import mgr
 from ..exceptions import PasswordPolicyException, PermissionNotValid, \
@@ -25,17 +26,6 @@ from ..settings import Settings
 
 logger = logging.getLogger('access_control')
 DEFAULT_FILE_DESC = 'password/secret'
-
-
-# password hashing algorithm
-def password_hash(password, salt_password=None):
-    if not password:
-        return None
-    if not salt_password:
-        salt_password = bcrypt.gensalt()
-    else:
-        salt_password = salt_password.encode('utf8')
-    return bcrypt.hashpw(password.encode('utf8'), salt_password).decode('utf8')
 
 
 _P = Permission  # short alias
@@ -203,6 +193,15 @@ class Role(object):
         return Role(r_dict['name'], r_dict['description'],
                     r_dict['scopes_permissions'])
 
+    @classmethod
+    def map_to_system_roles(cls, roles: List[str]) -> List['Role']:
+        matches = []
+        for sys_role in ROLE_MAPPER:
+            for role in roles:
+                if role in ROLE_MAPPER[sys_role]:
+                    matches.append(sys_role)
+        return matches
+
 
 # static pre-defined system roles
 # this roles cannot be deleted nor updated
@@ -232,6 +231,8 @@ BLOCK_MGR_ROLE = Role(
         Scope.ISCSI: [_P.READ, _P.CREATE, _P.UPDATE, _P.DELETE],
         Scope.RBD_MIRRORING: [_P.READ, _P.CREATE, _P.UPDATE, _P.DELETE],
         Scope.GRAFANA: [_P.READ],
+        Scope.NVME_OF: [_P.READ, _P.CREATE, _P.UPDATE, _P.DELETE],
+        Scope.PROMETHEUS: [_P.READ]
     })
 
 
@@ -240,6 +241,7 @@ RGW_MGR_ROLE = Role(
     'rgw-manager', 'allows full permissions for the rgw scope', {
         Scope.RGW: [_P.READ, _P.CREATE, _P.UPDATE, _P.DELETE],
         Scope.GRAFANA: [_P.READ],
+        Scope.PROMETHEUS: [_P.READ]
     })
 
 
@@ -255,6 +257,7 @@ CLUSTER_MGR_ROLE = Role(
         Scope.CONFIG_OPT: [_P.READ, _P.CREATE, _P.UPDATE, _P.DELETE],
         Scope.LOG: [_P.READ, _P.CREATE, _P.UPDATE, _P.DELETE],
         Scope.GRAFANA: [_P.READ],
+        Scope.PROMETHEUS: [_P.READ]
     })
 
 
@@ -263,6 +266,7 @@ POOL_MGR_ROLE = Role(
     'pool-manager', 'allows full permissions for the pool scope', {
         Scope.POOL: [_P.READ, _P.CREATE, _P.UPDATE, _P.DELETE],
         Scope.GRAFANA: [_P.READ],
+        Scope.PROMETHEUS: [_P.READ]
     })
 
 # CephFS manager role provides all permissions for CephFS related scopes
@@ -270,6 +274,7 @@ CEPHFS_MGR_ROLE = Role(
     'cephfs-manager', 'allows full permissions for the cephfs scope', {
         Scope.CEPHFS: [_P.READ, _P.CREATE, _P.UPDATE, _P.DELETE],
         Scope.GRAFANA: [_P.READ],
+        Scope.PROMETHEUS: [_P.READ]
     })
 
 GANESHA_MGR_ROLE = Role(
@@ -278,6 +283,18 @@ GANESHA_MGR_ROLE = Role(
         Scope.CEPHFS: [_P.READ, _P.CREATE, _P.UPDATE, _P.DELETE],
         Scope.RGW: [_P.READ, _P.CREATE, _P.UPDATE, _P.DELETE],
         Scope.GRAFANA: [_P.READ],
+        Scope.SMB: [_P.READ],
+        Scope.PROMETHEUS: [_P.READ]
+    })
+
+SMB_MGR_ROLE = Role(
+    'smb-manager', 'allows full permissions for the smb scope', {
+        Scope.SMB: [_P.READ, _P.CREATE, _P.UPDATE, _P.DELETE],
+        Scope.CEPHFS: [_P.READ, _P.CREATE, _P.UPDATE, _P.DELETE],
+        Scope.RGW: [_P.READ, _P.CREATE, _P.UPDATE, _P.DELETE],
+        Scope.GRAFANA: [_P.READ],
+        Scope.NFS_GANESHA: [_P.READ],
+        Scope.PROMETHEUS: [_P.READ]
     })
 
 
@@ -290,6 +307,20 @@ SYSTEM_ROLES = {
     POOL_MGR_ROLE.name: POOL_MGR_ROLE,
     CEPHFS_MGR_ROLE.name: CEPHFS_MGR_ROLE,
     GANESHA_MGR_ROLE.name: GANESHA_MGR_ROLE,
+    SMB_MGR_ROLE.name: SMB_MGR_ROLE,
+}
+
+# static name-like roles list for role mapping
+ROLE_MAPPER = {
+    ADMIN_ROLE: [ADMIN_ROLE.name, 'admin'],
+    READ_ONLY_ROLE: [READ_ONLY_ROLE.name, 'read', 'guest', 'monitor'],
+    BLOCK_MGR_ROLE: [BLOCK_MGR_ROLE.name, 'block', 'rbd'],
+    RGW_MGR_ROLE: [RGW_MGR_ROLE.name, 'object', 'rgw'],
+    CLUSTER_MGR_ROLE: [CLUSTER_MGR_ROLE.name, 'cluster'],
+    POOL_MGR_ROLE: [POOL_MGR_ROLE.name, 'pool'],
+    CEPHFS_MGR_ROLE: [CEPHFS_MGR_ROLE.name, 'cephfs'],
+    GANESHA_MGR_ROLE: [GANESHA_MGR_ROLE.name, 'ganesha', 'nfs'],
+    SMB_MGR_ROLE: [SMB_MGR_ROLE.name, 'smb']
 }
 
 
@@ -569,7 +600,7 @@ class AccessControlDB(object):
 
 
 def load_access_control_db():
-    mgr.ACCESS_CTRL_DB = AccessControlDB.load()
+    mgr.ACCESS_CTRL_DB = AccessControlDB.load()  # type: ignore
 
 
 # CLI dashboard access control scope commands
@@ -898,7 +929,10 @@ def ac_user_set_password_hash(_, username: str, inbuf: str):
     hashed_password = inbuf
     try:
         # make sure the hashed_password is actually a bcrypt hash
-        bcrypt.checkpw(b'', hashed_password.encode('utf-8'))
+        # catch a ValueError if hashed_password is not valid.
+        cc = get_crypto_caller()
+        cc.verify_password('', hashed_password)
+
         user = mgr.ACCESS_CTRL_DB.get_user(username)
         user.set_password_hash(hashed_password)
 

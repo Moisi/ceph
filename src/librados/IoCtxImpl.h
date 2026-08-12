@@ -41,6 +41,7 @@ struct librados::IoCtxImpl {
   uint32_t notify_timeout = 30;
   object_locator_t oloc;
   int extra_op_flags = 0;
+  int objclass_flags_mask = -1;
 
   ceph::mutex aio_write_list_lock =
     ceph::make_mutex("librados::IoCtxImpl::aio_write_list_lock");
@@ -154,11 +155,12 @@ struct librados::IoCtxImpl {
   int getxattrs(const object_t& oid, std::map<std::string, bufferlist>& attrset);
   int rmxattr(const object_t& oid, const char *name);
 
-  int operate(const object_t& oid, ::ObjectOperation *o, ceph::real_time *pmtime, int flags=0);
-  int operate_read(const object_t& oid, ::ObjectOperation *o, bufferlist *pbl, int flags=0);
+  int operate(const object_t& oid, ::ObjectOperation *o, ceph::real_time *pmtime, int flags=0, const jspan_context *otel_trace = nullptr);
+  int operate_read(const object_t& oid, ::ObjectOperation *o, bufferlist *pbl, int flags=0, int flags_mask=-1);
   int aio_operate(const object_t& oid, ::ObjectOperation *o,
 		  AioCompletionImpl *c, const SnapContext& snap_context,
-		  int flags, const blkin_trace_info *trace_info = nullptr);
+		  const ceph::real_time *pmtime, int flags,
+		  const blkin_trace_info *trace_info = nullptr, const jspan_context *otel_trace = nullptr);
   int aio_operate_read(const object_t& oid, ::ObjectOperation *o,
 		       AioCompletionImpl *c, int flags, bufferlist *pbl, const blkin_trace_info *trace_info = nullptr);
 

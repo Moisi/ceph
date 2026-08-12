@@ -6,10 +6,11 @@ from textwrap import dedent
 from ceph_volume.util import system, disk, merge_dict
 from ceph_volume.util.device import Device
 from ceph_volume.util.arg_validators import valid_osd_id
+from ceph_volume.util import encryption as encryption_utils
 from ceph_volume import decorators, terminal, process
 from ceph_volume.api import lvm as api
 from ceph_volume.systemd import systemctl
-
+from ceph_volume.devices.lvm import zap
 
 logger = logging.getLogger(__name__)
 mlogger = terminal.MultiLogger(__name__)
@@ -166,9 +167,14 @@ class VolumeTagTracker(object):
             aux_dev.lv_api.set_tags(tags)
 
     def remove_lvs(self, source_devices, target_type):
-        remaining_devices = [self.data_device, self.db_device, self.wal_device]
+        remaining_devices = [self.data_device]
+        if self.db_device:
+            remaining_devices.append(self.db_device)
+        if self.wal_device:
+            remaining_devices.append(self.wal_device)
 
         outdated_tags = []
+        removed_devices = []
         for device, type in source_devices:
             if type == "block" or type == target_type:
                 continue
@@ -177,10 +183,13 @@ class VolumeTagTracker(object):
                 outdated_tags.append("ceph.{}_uuid".format(type))
                 outdated_tags.append("ceph.{}_device".format(type))
                 device.lv_api.clear_tags()
+                removed_devices.append(device)
+
         if len(outdated_tags) > 0:
             for d in remaining_devices:
                 if d and d.is_lv:
                     d.lv_api.clear_tags(outdated_tags)
+        return removed_devices
 
     def replace_lvs(self, source_devices, target_type):
         remaining_devices = [self.data_device]
@@ -190,6 +199,7 @@ class VolumeTagTracker(object):
             remaining_devices.append(self.wal_device)
 
         outdated_tags = []
+        removed_devices = []
         for device, type in source_devices:
             if type == "block":
                 continue
@@ -198,6 +208,7 @@ class VolumeTagTracker(object):
                 outdated_tags.append("ceph.{}_uuid".format(type))
                 outdated_tags.append("ceph.{}_device".format(type))
                 device.lv_api.clear_tags()
+                removed_devices.append(device)
 
         new_tags = {}
         new_tags["ceph.{}_uuid".format(target_type)] = self.target_lv.lv_uuid
@@ -219,6 +230,7 @@ class VolumeTagTracker(object):
         tags["ceph.{}_uuid".format(target_type)] = self.target_lv.lv_uuid
         tags["ceph.{}_device".format(target_type)] = self.target_lv.lv_path
         self.target_lv.set_tags(tags)
+        return removed_devices
 
     def undo(self):
         mlogger.info(
@@ -300,6 +312,15 @@ class Migrate(object):
                 osd_path, self.get_filename_by_type(type))]
         return ret
 
+    def close_encrypted(self, source_devices):
+        # close source device(-s) if they're encrypted and have been removed
+        for device,type in source_devices:
+            if (type == 'db' or type == 'wal'):
+                logger.info("closing dmcrypt volume {}"
+                   .format(device.lv_api.lv_uuid))
+                encryption_utils.dmcrypt_close(
+                   mapping = device.lv_api.lv_uuid, skip_path_check=True)
+
     @decorators.needs_root
     def migrate_to_new(self, osd_id, osd_fsid, devices, target_lv):
         source_devices = self.get_source_devices(devices)
@@ -312,15 +333,24 @@ class Migrate(object):
                 "Unable to migrate to : {}".format(self.args.target))
 
         target_path = target_lv.lv_path
-
+        tag_tracker = VolumeTagTracker(devices, target_lv)
+        # prepare and encrypt target if data volume is encrypted
+        if tag_tracker.data_device.lv_api.encrypted:
+            secret = encryption_utils.get_dmcrypt_key(osd_id, osd_fsid)
+            mlogger.info(' preparing dmcrypt for {}, uuid {}'.format(target_lv.lv_path, target_lv.lv_uuid))
+            target_path = encryption_utils.prepare_dmcrypt(
+                key=secret,
+                device=target_path,
+                mapping=target_lv.lv_uuid,
+                format_options=self.args.dmcrypt_format_opts,
+                open_options=self.args.dmcrypt_open_opts)
         try:
-            tag_tracker = VolumeTagTracker(devices, target_lv)
             # we need to update lvm tags for all the remaining volumes
             # and clear for ones which to be removed
 
             # ceph-bluestore-tool removes source volume(s) other than block one
             # and attaches target one after successful migration
-            tag_tracker.replace_lvs(source_devices, target_type)
+            removed_devices = tag_tracker.replace_lvs(source_devices, target_type)
 
             osd_path = get_osd_path(osd_id, osd_fsid)
             source_args = self.get_source_args(osd_path, source_devices)
@@ -340,10 +370,16 @@ class Migrate(object):
                     'Failed to migrate device, error code:{}'.format(exit_code))
                 raise SystemExit(
                     'Failed to migrate to : {}'.format(self.args.target))
-            else:
-                system.chown(os.path.join(osd_path, "block.{}".format(
-                    target_type)))
-                terminal.success('Migration successful.')
+
+            system.chown(os.path.join(osd_path, "block.{}".format(
+                target_type)))
+            if tag_tracker.data_device.lv_api.encrypted:
+                self.close_encrypted(source_devices)
+            for d in removed_devices:
+                if d and d.is_lv:
+                  zap.Zap([d.lv_api.lv_path]).main()
+            terminal.success('Migration successful.')
+
         except:
             tag_tracker.undo()
             raise
@@ -373,7 +409,7 @@ class Migrate(object):
         try:
             # ceph-bluestore-tool removes source volume(s) other than
             # block and target ones after successful migration
-            tag_tracker.remove_lvs(source_devices, target_type)
+            removed_devices = tag_tracker.remove_lvs(source_devices, target_type)
             source_args = self.get_source_args(osd_path, source_devices)
             mlogger.info("Migrate to existing, Source: {} Target: {}".format(
                 source_args, target_path))
@@ -391,8 +427,12 @@ class Migrate(object):
                     'Failed to migrate device, error code:{}'.format(exit_code))
                 raise SystemExit(
                     'Failed to migrate to : {}'.format(self.args.target))
-            else:
-                terminal.success('Migration successful.')
+            if tag_tracker.data_device.lv_api.encrypted:
+                self.close_encrypted(source_devices)
+            for d in removed_devices:
+                if d and d.is_lv:
+                  zap.Zap([d.lv_api.lv_path]).main()
+            terminal.success('Migration successful.')
         except:
             tag_tracker.undo()
             raise
@@ -474,6 +514,18 @@ class Migrate(object):
             dest='no_systemd',
             action='store_true',
             help='Skip checking OSD systemd unit',
+        )
+        parser.add_argument(
+            '--dmcrypt-format-opts',
+            type=str,
+            default=None,
+            help="Additional cryptsetup luksFormat options (use the same syntax as the cryptsetup CLI)",
+        )
+        parser.add_argument(
+            '--dmcrypt-open-opts',
+            type=str,
+            default=None,
+            help="Additional cryptsetup luksOpen options (use the same syntax as the cryptsetup CLI)",
         )
         return parser
 
@@ -566,6 +618,18 @@ class NewVolume(object):
             action='store_true',
             help='Skip checking OSD systemd unit',
         )
+        parser.add_argument(
+            '--dmcrypt-format-opts',
+            type=str,
+            default=None,
+            help="Additional cryptsetup luksFormat options (use the same syntax as the cryptsetup CLI)",
+        )
+        parser.add_argument(
+            '--dmcrypt-open-opts',
+            type=str,
+            default=None,
+            help="Additional cryptsetup luksOpen options (use the same syntax as the cryptsetup CLI)",
+        )
         return parser
 
     @decorators.needs_root
@@ -574,7 +638,19 @@ class NewVolume(object):
         mlogger.info(
             'Making new volume at {} for OSD: {} ({})'.format(
                 target_lv.lv_path, osd_id, osd_path))
+        target_path = target_lv.lv_path
         tag_tracker = VolumeTagTracker(devices, target_lv)
+        # prepare and encrypt target if data volume is encrypted
+        if tag_tracker.data_device.lv_api.encrypted:
+            secret = encryption_utils.get_dmcrypt_key(osd_id, osd_fsid)
+            mlogger.info(' preparing dmcrypt for {}, uuid {}'.format(target_lv.lv_path, target_lv.lv_uuid))
+            target_path = encryption_utils.prepare_dmcrypt(
+                key=secret,
+                device=target_path,
+                mapping=target_lv.lv_uuid,
+                format_options=self.args.dmcrypt_format_opts,
+                open_options=self.args.dmcrypt_open_opts
+            )
 
         try:
             tag_tracker.update_tags_when_lv_create(self.create_type)
@@ -584,7 +660,7 @@ class NewVolume(object):
                 '--path',
                 osd_path,
                 '--dev-target',
-                target_lv.lv_path,
+                target_path,
                 '--command',
                 'bluefs-bdev-new-{}'.format(self.create_type)
             ])

@@ -1,5 +1,5 @@
-import pkgutil
-if not pkgutil.find_loader('setuptools'):
+import importlib.util
+if not importlib.util.find_spec('setuptools'):
     from distutils.core import setup
     from distutils.extension import Extension
 else:
@@ -116,10 +116,16 @@ def check_sanity():
             output_dir=tmp_dir,
         )
 
+        ldflags = os.environ.get('LDFLAGS')
+        if ldflags:
+            extra_postargs = ldflags.split()
+        else:
+            extra_postargs = None
         compiler.link_executable(
             objects=link_objects,
             output_progname=os.path.join(tmp_dir, 'rgw_dummy'),
             libraries=['rgw', 'rados'],
+            extra_postargs=extra_postargs,
             output_dir=tmp_dir,
         )
 
@@ -187,7 +193,7 @@ setup(
         "and file operations."
     ),
     url='https://github.com/ceph/ceph/tree/master/src/pybind/rgw',
-    license='LGPLv2+',
+    license='LGPL-2.0-or-later',
     platforms='Linux',
     ext_modules=cythonize(
         [
@@ -204,7 +210,6 @@ setup(
     classifiers=[
         'Intended Audience :: Developers',
         'Intended Audience :: System Administrators',
-        'License :: OSI Approved :: GNU Lesser General Public License v2 or later (LGPLv2+)',
         'Operating System :: POSIX :: Linux',
         'Programming Language :: Cython',
         'Programming Language :: Python :: 3',

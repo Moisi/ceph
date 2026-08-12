@@ -3,15 +3,18 @@ import logging
 import time
 import uuid
 from typing import TYPE_CHECKING, Optional, Dict, List, Tuple, Any, cast
+from cephadm.services.service_registry import service_registry
 
 import orchestrator
 from cephadm.registry import Registry
 from cephadm.serve import CephadmServe
 from cephadm.services.cephadmservice import CephadmDaemonDeploySpec
 from cephadm.utils import ceph_release_to_major, name_to_config_section, CEPH_UPGRADE_ORDER, \
-    MONITORING_STACK_TYPES, CEPH_TYPES, GATEWAY_TYPES
+    CEPH_TYPES, CEPH_IMAGE_TYPES, NON_CEPH_IMAGE_TYPES, MONITORING_STACK_TYPES, GATEWAY_TYPES
 from cephadm.ssh import HostConnectionError
 from orchestrator import OrchestratorError, DaemonDescription, DaemonDescriptionStatus, daemon_type_to_service
+
+from mgr_module import MonCommandFailed
 
 if TYPE_CHECKING:
     from .module import CephadmOrchestrator
@@ -27,17 +30,17 @@ CEPH_MDSMAP_NOT_JOINABLE = (1 << 0)
 def normalize_image_digest(digest: str, default_registry: str) -> str:
     """
     Normal case:
-    >>> normalize_image_digest('ceph/ceph', 'docker.io')
-    'docker.io/ceph/ceph'
+    >>> normalize_image_digest('ceph/ceph', 'quay.io')
+    'quay.io/ceph/ceph'
 
     No change:
-    >>> normalize_image_digest('quay.ceph.io/ceph/ceph', 'docker.io')
+    >>> normalize_image_digest('quay.ceph.io/ceph/ceph', 'quay.io')
     'quay.ceph.io/ceph/ceph'
 
-    >>> normalize_image_digest('docker.io/ubuntu', 'docker.io')
-    'docker.io/ubuntu'
+    >>> normalize_image_digest('quay.io/centos', 'quay.io')
+    'quay.io/centos'
 
-    >>> normalize_image_digest('localhost/ceph', 'docker.io')
+    >>> normalize_image_digest('localhost/ceph', 'quay.io')
     'localhost/ceph'
     """
     known_shortnames = [
@@ -135,6 +138,7 @@ class CephadmUpgrade:
             self.upgrade_state: Optional[UpgradeState] = UpgradeState.from_json(json.loads(t))
         else:
             self.upgrade_state = None
+        self.upgrade_info_str: str = ''
 
     @property
     def target_image(self) -> str:
@@ -266,6 +270,9 @@ class CephadmUpgrade:
         if not image:
             image = self.mgr.container_image_base
         reg_name, bare_image = image.split('/', 1)
+        if ':' in bare_image:
+            # for our purposes, we don't want to use the tag here
+            bare_image = bare_image.split(':')[0]
         reg = Registry(reg_name)
         (current_major, current_minor, _) = self._get_current_version()
         versions = []
@@ -385,15 +392,16 @@ class CephadmUpgrade:
             raise OrchestratorError(
                 'Cannot set values for --daemon-types, --services or --hosts when upgrade already in progress.')
         try:
-            target_id, target_version, target_digests = self.mgr.wait_async(
-                CephadmServe(self.mgr)._get_container_image_info(target_name))
+            with self.mgr.async_timeout_handler('cephadm inspect-image'):
+                target_id, target_version, target_digests = self.mgr.wait_async(
+                    CephadmServe(self.mgr)._get_container_image_info(target_name))
         except OrchestratorError as e:
             raise OrchestratorError(f'Failed to pull {target_name}: {str(e)}')
         # what we need to do here is build a list of daemons that must already be upgraded
         # in order for the user's selection of daemons to upgrade to be valid. for example,
         # if they say --daemon-types 'osd,mds' but mons have not been upgraded, we block.
         daemons = [d for d in self.mgr.cache.get_daemons(
-        ) if d.daemon_type not in MONITORING_STACK_TYPES]
+        ) if d.daemon_type not in NON_CEPH_IMAGE_TYPES]
         err_msg_base = 'Cannot start upgrade. '
         # "dtypes" will later be filled in with the types of daemons that will be upgraded with the given parameters
         dtypes = []
@@ -438,7 +446,7 @@ class CephadmUpgrade:
                 d for d in daemons if d.hostname is not None and d.hostname not in hosts]
             daemons = _get_earlier_daemons([_latest_type(dtypes)], other_hosts_daemons)
             err_msg_base += 'Daemons with types earlier in upgrade order than daemons on given host need upgrading.\n'
-        need_upgrade_self, n1, n2, _ = self._detect_need_upgrade(daemons, target_digests)
+        need_upgrade_self, n1, n2, _ = self._detect_need_upgrade(daemons, target_digests, target_name)
         if need_upgrade_self and ('mgr' not in dtypes or (daemon_types is None and services is None)):
             # also report active mgr as needing to be upgraded. It is not included in the resulting list
             # by default as it is treated special and handled via the need_upgrade_self bool
@@ -487,6 +495,21 @@ class CephadmUpgrade:
         self.mgr.event.set()
         return 'Stopped upgrade to %s' % target_image
 
+    def update_service(self, service_type: str, service_image: str, image: str) -> List[str]:
+        out = []
+        self.mgr.set_module_option(f"container_image_{service_image}", image)
+        # Redeploy all the service daemons of provided service type
+        for service_name, spec in self.mgr.spec_store.get_specs_by_type(service_type).items():
+            out.append(f'Processing "{service_name}" service\n')
+            try:
+                res = self.mgr.perform_service_action('redeploy', service_name)
+            except Exception as exp:
+                self.mgr.log.exception(f"Failed to redeploy service {service_name}")
+                out.append(f'{exp}\n')
+            else:
+                out.extend(res)
+        return out
+
     def continue_upgrade(self) -> bool:
         """
         Returns false, if nothing was done.
@@ -528,7 +551,7 @@ class CephadmUpgrade:
 
             # setting force flag to retain old functionality.
             # note that known is an output argument for ok_to_stop()
-            r = self.mgr.cephadm_services[daemon_type_to_service(s.daemon_type)].ok_to_stop([
+            r = service_registry.get_service(daemon_type_to_service(s.daemon_type)).ok_to_stop([
                 s.daemon_id], known=known, force=True)
 
             if not r.retval:
@@ -730,7 +753,7 @@ class CephadmUpgrade:
 
         return True  # if mds has no fs it should pass ok-to-stop
 
-    def _detect_need_upgrade(self, daemons: List[DaemonDescription], target_digests: Optional[List[str]] = None) -> Tuple[bool, List[Tuple[DaemonDescription, bool]], List[Tuple[DaemonDescription, bool]], int]:
+    def _detect_need_upgrade(self, daemons: List[DaemonDescription], target_digests: Optional[List[str]] = None, target_name: Optional[str] = None) -> Tuple[bool, List[Tuple[DaemonDescription, bool]], List[Tuple[DaemonDescription, bool]], int]:
         # this function takes a list of daemons and container digests. The purpose
         # is to go through each daemon and check if the current container digests
         # for that daemon match the target digests. The purpose being that we determine
@@ -743,18 +766,33 @@ class CephadmUpgrade:
         done = 0
         if target_digests is None:
             target_digests = []
+        if target_name is None:
+            target_name = ''
         for d in daemons:
             assert d.daemon_type is not None
             assert d.daemon_id is not None
             assert d.hostname is not None
             if self.mgr.use_agent and not self.mgr.cache.host_metadata_up_to_date(d.hostname):
                 continue
-            correct_digest = False
-            if (any(d in target_digests for d in (d.container_image_digests or []))
-                    or d.daemon_type in MONITORING_STACK_TYPES):
-                logger.debug('daemon %s.%s container digest correct' % (
+            correct_image = False
+            # check if the container digest for the digest we're upgrading to matches
+            # the container digest for the daemon if "use_repo_digest" setting is true
+            # or that the image name matches the daemon's image name if "use_repo_digest"
+            # is false. The idea is to generally check if the daemon is already using
+            # the image we're upgrading to or not. Additionally, since monitoring stack
+            # daemons are included in the upgrade process but don't use the ceph images
+            # we are assuming any monitoring stack daemon is on the "correct" image already
+            if (
+                (self.mgr.use_repo_digest and d.matches_digests(target_digests))
+                or (not self.mgr.use_repo_digest and d.matches_image_name(target_name))
+                or (d.daemon_type in NON_CEPH_IMAGE_TYPES)
+            ):
+                logger.debug('daemon %s.%s on correct image' % (
                     d.daemon_type, d.daemon_id))
-                correct_digest = True
+                correct_image = True
+                # do deployed_by check using digest no matter what. We don't care
+                # what repo the image used to deploy the daemon was as long
+                # as the image content is correct
                 if any(d in target_digests for d in (d.deployed_by or [])):
                     logger.debug('daemon %s.%s deployed by correct version' % (
                         d.daemon_type, d.daemon_id))
@@ -767,7 +805,7 @@ class CephadmUpgrade:
                 need_upgrade_self = True
                 continue
 
-            if correct_digest:
+            if correct_image:
                 logger.debug('daemon %s.%s not deployed by correct version' % (
                     d.daemon_type, d.daemon_id))
                 need_upgrade_deployer.append((d, True))
@@ -845,17 +883,19 @@ class CephadmUpgrade:
             assert d.hostname is not None
 
             # make sure host has latest container image
-            out, errs, code = self.mgr.wait_async(CephadmServe(self.mgr)._run_cephadm(
-                d.hostname, '', 'inspect-image', [],
-                image=target_image, no_fsid=True, error_ok=True))
+            with self.mgr.async_timeout_handler(d.hostname, 'cephadm inspect-image'):
+                out, errs, code = self.mgr.wait_async(CephadmServe(self.mgr)._run_cephadm(
+                    d.hostname, '', 'inspect-image', [],
+                    image=target_image, no_fsid=True, error_ok=True))
             if code or not any(d in target_digests for d in json.loads(''.join(out)).get('repo_digests', [])):
                 logger.info('Upgrade: Pulling %s on %s' % (target_image,
                                                            d.hostname))
                 self.upgrade_info_str = 'Pulling %s image on host %s' % (
                     target_image, d.hostname)
-                out, errs, code = self.mgr.wait_async(CephadmServe(self.mgr)._run_cephadm(
-                    d.hostname, '', 'pull', [],
-                    image=target_image, no_fsid=True, error_ok=True))
+                with self.mgr.async_timeout_handler(d.hostname, 'cephadm pull'):
+                    out, errs, code = self.mgr.wait_async(CephadmServe(self.mgr)._run_cephadm(
+                        d.hostname, '', 'pull', [],
+                        image=target_image, no_fsid=True, error_ok=True))
                 if code:
                     self._fail_upgrade('UPGRADE_FAILED_PULL', {
                         'severity': 'warning',
@@ -958,10 +998,32 @@ class CephadmUpgrade:
         if osd_min < int(target_major):
             logger.info(
                 f'Upgrade: Setting require_osd_release to {target_major} {target_major_name}')
-            ret, _, err = self.mgr.check_mon_command({
-                'prefix': 'osd require-osd-release',
-                'release': target_major_name,
-            })
+            try:
+                ret, out, err = self.mgr.check_mon_command({
+                    'prefix': 'osd require-osd-release',
+                    'release': target_major_name,
+                })
+            except MonCommandFailed as e:
+                # recently it was changed so that `ceph osd require-osd-release`
+                # will fail if run on a cluster with no OSDs unless --yes-i-really-mean-it
+                # is passed. If we get that specific failure and we actually have no OSD
+                # daemons, we should just try to pass the flag
+                if "no OSDs are up" in str(e):
+                    if not self.mgr.cache.get_daemons_by_type('osd'):
+                        # this is the case where we actually have no OSDs in the cluster
+                        ret, _, err = self.mgr.check_mon_command({
+                            'prefix': 'osd require-osd-release',
+                            'release': target_major_name,
+                            'yes_i_really_mean_it': True
+                        })
+                    else:
+                        # this is the case where we do have OSDs listed, but none of them are up
+                        raise OrchestratorError(
+                            'All OSDs down, causing a failure setting the minimum required OSD release. '
+                            'If you are sure you\'d like to move forward, please run '
+                            '"ceph osd require-osd-release --yes-i-really-mean-it" then resume the upgrade')
+                else:
+                    raise
 
     def _complete_mds_upgrade(self) -> None:
         assert self.upgrade_state is not None
@@ -1060,8 +1122,9 @@ class CephadmUpgrade:
             logger.info('Upgrade: First pull of %s' % target_image)
             self.upgrade_info_str = 'Doing first pull of %s image' % (target_image)
             try:
-                target_id, target_version, target_digests = self.mgr.wait_async(CephadmServe(self.mgr)._get_container_image_info(
-                    target_image))
+                with self.mgr.async_timeout_handler(f'cephadm inspect-image (image {target_image})'):
+                    target_id, target_version, target_digests = self.mgr.wait_async(
+                        CephadmServe(self.mgr)._get_container_image_info(target_image))
             except OrchestratorError as e:
                 self._fail_upgrade('UPGRADE_FAILED_PULL', {
                     'severity': 'warning',
@@ -1113,18 +1176,6 @@ class CephadmUpgrade:
 
         image_settings = self.get_distinct_container_image_settings()
 
-        # Older monitors (pre-v16.2.5) asserted that FSMap::compat ==
-        # MDSMap::compat for all fs. This is no longer the case beginning in
-        # v16.2.5. We must disable the sanity checks during upgrade.
-        # N.B.: we don't bother confirming the operator has not already
-        # disabled this or saving the config value.
-        self.mgr.check_mon_command({
-            'prefix': 'config set',
-            'name': 'mon_mds_skip_sanity',
-            'value': '1',
-            'who': 'mon',
-        })
-
         if self.upgrade_state.daemon_types is not None:
             logger.debug(
                 f'Filtering daemons to upgrade by daemon types: {self.upgrade_state.daemon_types}')
@@ -1151,7 +1202,7 @@ class CephadmUpgrade:
                 # and monitoring stack daemons. Additionally, this case is only valid if
                 # the active mgr is already upgraded.
                 if any(d in target_digests for d in self.mgr.get_active_mgr_digests()):
-                    if daemon_type not in MONITORING_STACK_TYPES and daemon_type != 'mgr':
+                    if daemon_type not in NON_CEPH_IMAGE_TYPES and daemon_type != 'mgr':
                         continue
                 else:
                     self._mark_upgrade_complete()
@@ -1160,18 +1211,20 @@ class CephadmUpgrade:
             daemons_of_type = [d for d in daemons if d.daemon_type == daemon_type]
 
             need_upgrade_self, need_upgrade, need_upgrade_deployer, done = self._detect_need_upgrade(
-                daemons_of_type, target_digests)
+                daemons_of_type, target_digests, target_image)
             upgraded_daemon_count += done
             self._update_upgrade_progress(upgraded_daemon_count / len(daemons))
 
             # make sure mgr and monitoring stack daemons are properly redeployed in staggered upgrade scenarios
+            # The idea here is to upgrade the mointoring daemons after the mgr is done upgrading as
+            # that means cephadm and the dashboard modules themselves have been upgraded
             if daemon_type == 'mgr' or daemon_type in MONITORING_STACK_TYPES:
                 if any(d in target_digests for d in self.mgr.get_active_mgr_digests()):
                     need_upgrade_names = [d[0].name() for d in need_upgrade] + \
                         [d[0].name() for d in need_upgrade_deployer]
                     dds = [d for d in self.mgr.cache.get_daemons_by_type(
                         daemon_type) if d.name() not in need_upgrade_names]
-                    need_upgrade_active, n1, n2, __ = self._detect_need_upgrade(dds, target_digests)
+                    need_upgrade_active, n1, n2, __ = self._detect_need_upgrade(dds, target_digests, target_image)
                     if not n1:
                         if not need_upgrade_self and need_upgrade_active:
                             need_upgrade_self = True
@@ -1179,6 +1232,20 @@ class CephadmUpgrade:
                 else:
                     # no point in trying to redeploy with new version if active mgr is not on the new version
                     need_upgrade_deployer = []
+            elif daemon_type in NON_CEPH_IMAGE_TYPES:
+                # Also handle daemons that are not on the ceph image but aren't monitoring daemons.
+                # This needs to be handled differently than the monitoring daemons as the nvmeof daemon,
+                # which falls in this category, relies on the mons being upgraded as well. This block
+                # sets these daemon types to be upgraded only when all ceph image daemons have been upgraded
+                if any(d in target_digests for d in self.mgr.get_active_mgr_digests()):
+                    ceph_daemons = [d for d in self.mgr.cache.get_daemons() if d.daemon_type in CEPH_IMAGE_TYPES]
+                    _, n1, n2, __ = self._detect_need_upgrade(ceph_daemons, target_digests, target_image)
+                    if not n1 and not n2:
+                        # no ceph daemons need upgrade
+                        dds = [d for d in self.mgr.cache.get_daemons_by_type(
+                            daemon_type) if d.name() not in need_upgrade_names]
+                        _, ___, n2, ____ = self._detect_need_upgrade(dds, target_digests, target_image)
+                        need_upgrade_deployer += n2
 
             if any(d in target_digests for d in self.mgr.get_active_mgr_digests()):
                 # only after the mgr itself is upgraded can we expect daemons to have
@@ -1209,7 +1276,7 @@ class CephadmUpgrade:
             # types. If we haven't actually finished upgrading all the daemons
             # of this type, we should exit the loop here
             _, n1, n2, _ = self._detect_need_upgrade(
-                self.mgr.cache.get_daemons_by_type(daemon_type), target_digests)
+                self.mgr.cache.get_daemons_by_type(daemon_type), target_digests, target_image)
             if n1 or n2:
                 continue
 
@@ -1260,12 +1327,6 @@ class CephadmUpgrade:
                 'name': 'container_image',
                 'who': name_to_config_section(daemon_type),
             })
-
-        self.mgr.check_mon_command({
-            'prefix': 'config rm',
-            'name': 'mon_mds_skip_sanity',
-            'who': 'mon',
-        })
 
         self._mark_upgrade_complete()
         return

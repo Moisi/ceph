@@ -5,10 +5,12 @@
 
 #include <fmt/ranges.h>
 
+#include "scrubber_test_datasets.h"
+
 using namespace ScrubGenerator;
 
 // ref: PGLogTestRebuildMissing()
-bufferptr create_object_info(const ScrubGenerator::RealObj& objver)
+bufferlist create_object_info(const ScrubGenerator::RealObj& objver)
 {
   object_info_t oi{};
   oi.soid = objver.ghobj.hobj;
@@ -18,40 +20,79 @@ bufferptr create_object_info(const ScrubGenerator::RealObj& objver)
   bufferlist bl;
   oi.encode(bl,
 	    0 /*get_osdmap()->get_features(CEPH_ENTITY_TYPE_OSD, nullptr)*/);
-  bufferptr bp(bl.c_str(), bl.length());
-  return bp;
+  return bl;
 }
 
-std::pair<bufferptr, std::vector<snapid_t>> create_object_snapset(
+std::pair<bufferlist, std::vector<snapid_t>> create_object_snapset(
   const ScrubGenerator::RealObj& robj,
   const SnapsetMockData* snapset_mock_data)
 {
   if (!snapset_mock_data) {
-    return {bufferptr(), {}};
+    return {bufferlist(), {}};
   }
   /// \todo fill in missing version/osd details from the robj
   auto sns = snapset_mock_data->make_snapset();
   bufferlist bl;
   encode(sns, bl);
-  bufferptr bp = bufferptr(bl.c_str(), bl.length());
 
   // extract the set of object snaps
-  return {bp, sns.snaps};
+  return {bl, sns.clones};
+}
+
+RealObjsConf ScrubGenerator::make_erasure_code_configuration(int8_t k,
+                                                             int8_t m) {
+  RealObjsConf erasure_code_configuration;
+  for (shard_id_t i{0}; i < k + m; ++i) {
+    RealObj erasure_code_obj = ScrubDatasets::erasure_code_obj;
+    erasure_code_obj.ghobj.shard_id = i;
+    erasure_code_configuration.objs.push_back(erasure_code_obj);
+  }
+
+  return erasure_code_configuration;
+}
+
+CorruptFuncList ScrubGenerator::make_erasure_code_hash_corruption_functions(
+    int num_osds) {
+  CorruptFuncList ret_list = {};
+  for (int i = 0; i < num_osds; ++i) {
+    ret_list.insert({i, &crpt_object_hash});
+  }
+
+  return ret_list;
 }
 
 RealObjsConfList ScrubGenerator::make_real_objs_conf(
   int64_t pool_id,
   const RealObjsConf& blueprint,
-  std::vector<int32_t> active_osds)
+  std::vector<int32_t> active_osds,
+  std::set<pg_shard_t> acting_shards,
+  bool erasure_coded_pool)
 {
   RealObjsConfList all_osds;
 
   for (auto osd : active_osds) {
+    shard_id_t shard = std::find_if(acting_shards.begin(), acting_shards.end(),
+                                    [&osd](pg_shard_t pg_shard) {
+                                      return osd == pg_shard.osd;
+                                    })
+                           ->shard;
+
     RealObjsConfRef this_osd_fakes = std::make_unique<RealObjsConf>(blueprint);
     // now - fix & corrupt every "object" in the blueprint
     for (RealObj& robj : this_osd_fakes->objs) {
+      if (!erasure_coded_pool || robj.ghobj.shard_id == shard) {
+        robj.ghobj.hobj.pool = pool_id;
+      }
+    }
 
-      robj.ghobj.hobj.pool = pool_id;
+    if (erasure_coded_pool) {
+      this_osd_fakes->objs.erase(std::remove_if(this_osd_fakes->objs.begin(),
+                                                this_osd_fakes->objs.end(),
+                                                [pool_id](RealObj& robj) {
+                                                  return robj.ghobj.hobj.pool !=
+                                                         pool_id;
+                                                }),
+                                 this_osd_fakes->objs.end());
     }
 
     all_osds[osd] = std::move(this_osd_fakes);
@@ -70,9 +111,9 @@ ScrubGenerator::SmapEntry ScrubGenerator::make_smobject(
   ret.ghobj = blueprint.ghobj;
   ret.smobj.attrs[OI_ATTR] = create_object_info(blueprint);
   if (blueprint.snapset_mock_data) {
-    auto [bp, snaps] =
+    auto [bl, snaps] =
       create_object_snapset(blueprint, blueprint.snapset_mock_data);
-    ret.smobj.attrs[SS_ATTR] = bp;
+    ret.smobj.attrs[SS_ATTR] = bl;
     std::cout << fmt::format("{}: ({}) osd:{} snaps:{}",
 			     __func__,
 			     ret.ghobj.hobj,
@@ -82,18 +123,19 @@ ScrubGenerator::SmapEntry ScrubGenerator::make_smobject(
   }
 
   for (const auto& [at_k, at_v] : blueprint.data.attrs) {
-    ret.smobj.attrs[at_k] = ceph::buffer::copy(at_v.c_str(), at_v.size());
+    // deep copy assignment
+    ret.smobj.attrs[at_k].clear();
+    ret.smobj.attrs[at_k].append(at_v.c_str(), at_v.size());
     {
       // verifying (to be removed after dev phase)
-      auto bk = ret.smobj.attrs[at_k].begin_deep().get_ptr(
-	ret.smobj.attrs[at_k].length());
-      std::string bkstr{bk.raw_c_str(), bk.raw_length()};
+      std::string bkstr = ret.smobj.attrs[at_k].to_str();
       std::cout << fmt::format("{}: verification: {}", __func__, bkstr)
 		<< std::endl;
     }
   }
   ret.smobj.size = blueprint.data.size;
   ret.smobj.digest = blueprint.data.hash;
+  ret.smobj.digest_present = true;
   /// \todo handle the 'present' etc'
 
   ret.smobj.object_omap_keys = blueprint.data.omap.size();

@@ -4,8 +4,10 @@
 #pragma once
 
 #include <string>
+#include "include/encoding.h"
 #include "common/ceph_time.h"
 #include "common/iso_8601.h"
+#include "common/ceph_json.h"
 #include "rgw_xml.h"
 
 class DefaultRetention
@@ -46,6 +48,8 @@ public:
     DECODE_FINISH(bl);
   }
 
+  void decode_json(JSONObj *obj);
+  void dump(Formatter *f) const;
   void decode_xml(XMLObj *obj);
   void dump_xml(Formatter *f) const;
 };
@@ -80,8 +84,11 @@ public:
     DECODE_FINISH(bl);
   }
 
+  void decode_json(JSONObj *obj);
   void decode_xml(XMLObj *obj);
   void dump_xml(Formatter *f) const;
+  void dump(Formatter *f) const;
+  static std::list<ObjectLockRule> generate_test_instances();
 };
 WRITE_CLASS_ENCODER(ObjectLockRule)
 
@@ -138,9 +145,12 @@ public:
     DECODE_FINISH(bl);
   }
 
+  void decode_json(JSONObj *obj);
   void decode_xml(XMLObj *obj);
   void dump_xml(Formatter *f) const;
   ceph::real_time get_lock_until_date(const ceph::real_time& mtime) const;
+  void dump(Formatter *f) const;
+  static std::list<RGWObjectLock> generate_test_instances();
 };
 WRITE_CLASS_ENCODER(RGWObjectLock)
 
@@ -170,16 +180,20 @@ public:
   }
 
   void encode(bufferlist& bl) const {
-    ENCODE_START(1, 1, bl);
+    ENCODE_START(2, 1, bl);
     encode(mode, bl);
     encode(retain_until_date, bl);
+    ceph::round_trip_encode(retain_until_date, bl);
     ENCODE_FINISH(bl);
   }
 
   void decode(bufferlist::const_iterator& bl) {
-    DECODE_START(1, bl);
+    DECODE_START(2, bl);
     decode(mode, bl);
     decode(retain_until_date, bl);
+    if (struct_v >= 2) {
+      ceph::round_trip_decode(retain_until_date, bl);
+    }
     DECODE_FINISH(bl);
   }
 

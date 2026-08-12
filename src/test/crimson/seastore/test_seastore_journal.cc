@@ -32,7 +32,7 @@ struct record_validator_t {
     for (auto &&block : record.extents) {
       auto test = manager.read(
 	record_final_offset.add_relative(addr),
-	block.bl.length()).unsafe_get0();
+	block.bl.length()).unsafe_get();
       addr = addr.add_offset(block.bl.length());
       bufferlist bl;
       bl.push_back(test);
@@ -94,6 +94,12 @@ struct journal_test_t : seastar_test_suite_t, SegmentProvider, JournalTrimmer {
 
   void set_journal_head(journal_seq_t) final {}
 
+  segment_seq_t get_journal_head_sequence() const final {
+    return NULL_SEG_SEQ;
+  }
+
+  void set_journal_head_sequence(segment_seq_t) final {}
+
   journal_seq_t get_dirty_tail() const final { return dummy_tail; }
 
   journal_seq_t get_alloc_tail() const final { return dummy_tail; }
@@ -146,7 +152,7 @@ struct journal_test_t : seastar_test_suite_t, SegmentProvider, JournalTrimmer {
     return segment_manager->init(
     ).safe_then([this] {
       return segment_manager->mkfs(
-        segment_manager::get_ephemeral_device_config(0, 1));
+        segment_manager::get_ephemeral_device_config(0, 1, 0));
     }).safe_then([this] {
       block_size = segment_manager->get_block_size();
       sms.reset(new SegmentManagerGroup());
@@ -158,9 +164,7 @@ struct journal_test_t : seastar_test_suite_t, SegmentProvider, JournalTrimmer {
     }).safe_then([this](auto) {
       dummy_tail = journal_seq_t{0,
         paddr_t::make_seg_paddr(segment_id_t(segment_manager->get_device_id(), 0), 0)};
-    }, crimson::ct_error::all_same_way([] {
-      ASSERT_FALSE("Unable to mount");
-    }));
+    }, crimson::ct_error::assert_all{"Unable to mount"});
   }
 
   seastar::future<> tear_down_fut() final {
@@ -170,9 +174,7 @@ struct journal_test_t : seastar_test_suite_t, SegmentProvider, JournalTrimmer {
       sms.reset();
       journal.reset();
     }).handle_error(
-      crimson::ct_error::all_same_way([](auto e) {
-        ASSERT_FALSE("Unable to close");
-      })
+      crimson::ct_error::assert_all{"Unable to close"}
     );
   }
 
@@ -218,8 +220,9 @@ struct journal_test_t : seastar_test_suite_t, SegmentProvider, JournalTrimmer {
 	  delta_checker = std::nullopt;
 	  advance();
 	}
-	return Journal::replay_ertr::make_ready_future<bool>(true);
-      }).unsafe_get0();
+	return Journal::replay_ertr::make_ready_future<
+	  std::pair<bool, CachedExtentRef>>(true, nullptr);
+      }).unsafe_get();
     ASSERT_EQ(record_iter, records.end());
     for (auto &i : records) {
       i.validate(*segment_manager);
@@ -230,12 +233,17 @@ struct journal_test_t : seastar_test_suite_t, SegmentProvider, JournalTrimmer {
   auto submit_record(T&&... _record) {
     auto record{std::forward<T>(_record)...};
     records.push_back(record);
+    record_validator_t& back = records.back();
     OrderingHandle handle = get_dummy_ordering_handle();
-    auto [addr, _] = journal->submit_record(
+    journal->submit_record(
       std::move(record),
-      handle).unsafe_get0();
-    records.back().record_final_offset = addr;
-    return addr;
+      handle,
+      transaction_type_t::MUTATE,
+      [&back](auto locator) {
+        back.record_final_offset = locator.record_block_base;
+      }
+    ).unsafe_get();
+    return back.record_final_offset;
   }
 
   extent_t generate_extent(size_t blocks) {

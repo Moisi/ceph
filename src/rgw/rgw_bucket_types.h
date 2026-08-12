@@ -61,6 +61,9 @@ struct rgw_bucket {
 	     const std::string& _bucket_id) : tenant(_tenant),
                                               name(_name),
                                               bucket_id(_bucket_id) {}
+  rgw_bucket(const std::string& _tenant,
+	     const std::string& _name)
+      : tenant(_tenant), name(_name) {}
   rgw_bucket(const rgw_bucket_key& bk) : tenant(bk.tenant),
                                          name(bk.name),
                                          bucket_id(bk.bucket_id) {}
@@ -136,6 +139,13 @@ struct rgw_bucket {
     DECODE_FINISH(bl);
   }
 
+  std::string get_namespaced_name() const {
+    if (tenant.empty()) {
+      return name;
+    }
+    return tenant + std::string("/") + name;
+  }
+
   void update_bucket_id(const std::string& new_bucket_id) {
     bucket_id = new_bucket_id;
   }
@@ -151,7 +161,7 @@ struct rgw_bucket {
 
   void dump(ceph::Formatter *f) const;
   void decode_json(JSONObj *obj);
-  static void generate_test_instances(std::list<rgw_bucket*>& o);
+  static std::list<rgw_bucket> generate_test_instances();
 
   rgw_bucket& operator=(const rgw_bucket&) = default;
 
@@ -181,6 +191,18 @@ struct rgw_bucket {
   }
 };
 WRITE_CLASS_ENCODER(rgw_bucket)
+
+namespace std {
+template<>
+struct hash<rgw_bucket>
+{
+  std::size_t operator ()(const rgw_bucket& b) const noexcept {
+    return ((std::hash<decltype(b.tenant)>{}(b.tenant) << 2) ^
+	    (std::hash<decltype(b.name)>{}(b.name) << 1) ^
+	    std::hash<decltype(b.bucket_id)>{}(b.bucket_id));
+  }
+};
+}
 
 inline std::ostream& operator<<(std::ostream& out, const rgw_bucket &b) {
   out << b.tenant << ":" << b.name << "[" << b.bucket_id << "])";
@@ -220,6 +242,17 @@ struct rgw_bucket_shard {
             shard_id == b.shard_id);
   }
 }; /* rgw_bucket_shard */
+
+namespace std {
+template<>
+struct hash<rgw_bucket_shard>
+{
+  std::size_t operator ()(const rgw_bucket_shard& bs) const noexcept {
+    return ((std::hash<decltype(bs.bucket)>{}(bs.bucket) << 1) ^
+	    std::hash<decltype(bs.shard_id)>{}(bs.shard_id));
+  }
+};
+}
 
 void encode(const rgw_bucket_shard& b, bufferlist& bl, uint64_t f=0);
 void decode(rgw_bucket_shard& b, bufferlist::const_iterator& bl);

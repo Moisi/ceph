@@ -18,6 +18,7 @@
 #include <unistd.h>
 #include <sys/time.h>
 #include <sys/types.h>
+#include <iomanip>
 #include <iostream>
 #include <vector>
 #include <boost/algorithm/string.hpp>
@@ -604,7 +605,7 @@ int execute_iostat(const po::variables_map &vm,
 
   auto f = formatter.get();
   if (iterations > 1 && f != nullptr) {
-    std::cerr << "rbd: specifing iterations is not valid with formatted output"
+    std::cerr << "rbd: specifying iterations is not valid with formatted output"
               << std::endl;
     return -EINVAL;
   }

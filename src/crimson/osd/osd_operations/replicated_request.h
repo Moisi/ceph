@@ -7,6 +7,7 @@
 #include "crimson/osd/osdmap_gate.h"
 #include "crimson/osd/osd_operation.h"
 #include "crimson/osd/pg_map.h"
+#include "crimson/osd/osd_operations/client_request.h"
 #include "crimson/common/type_helpers.h"
 #include "messages/MOSDRepOp.h"
 
@@ -21,17 +22,10 @@ class ShardServices;
 class OSD;
 class PG;
 
-class RepRequest final : public PhasedOperationT<RepRequest> {
+class RepRequest final :
+    public PhasedOperationT<RepRequest>,
+    public RemoteOperation {
 public:
-  class PGPipeline {
-    struct AwaitMap : OrderedExclusivePhaseT<AwaitMap> {
-      static constexpr auto type_name = "RepRequest::PGPipeline::await_map";
-    } await_map;
-    struct Process : OrderedExclusivePhaseT<Process> {
-      static constexpr auto type_name = "RepRequest::PGPipeline::process";
-    } process;
-    friend RepRequest;
-  };
   static constexpr OperationTypeCode type = OperationTypeCode::replicated_request;
   RepRequest(crimson::net::ConnectionRef&&, Ref<MOSDRepOp>&&);
 
@@ -42,25 +36,39 @@ public:
   spg_t get_pgid() const {
     return req->get_spg();
   }
-  ConnectionPipeline &get_connection_pipeline();
   PipelineHandle &get_handle() { return handle; }
   epoch_t get_epoch() const { return req->get_min_epoch(); }
+  epoch_t get_epoch_sent_at() const {
+    return req->get_map_epoch();
+  }
+
+  ConnectionPipeline &get_connection_pipeline();
+
+  PerShardPipeline &get_pershard_pipeline(ShardServices &);
+
+  interruptible_future<> with_pg_interruptible(
+    Ref<PG> pg);
 
   seastar::future<> with_pg(
     ShardServices &shard_services, Ref<PG> pg);
 
   std::tuple<
+    StartEvent,
     ConnectionPipeline::AwaitActive::BlockingEvent,
     ConnectionPipeline::AwaitMap::BlockingEvent,
-    ConnectionPipeline::GetPG::BlockingEvent,
+    ConnectionPipeline::GetPGMapping::BlockingEvent,
+    PerShardPipeline::CreateOrWaitPG::BlockingEvent,
+    PGRepopPipeline::Process::BlockingEvent,
+    PGRepopPipeline::WaitCommit::BlockingEvent,
+    PGRepopPipeline::SendReply::BlockingEvent,
+    PG_OSDMapGate::OSDMapBlocker::BlockingEvent,
     PGMap::PGCreationBlockingEvent,
     OSD_OSDMapGate::OSDMapBlocker::BlockingEvent
   > tracking_events;
 
 private:
-  PGPipeline &pp(PG &pg);
+  PGRepopPipeline &repop_pipeline(PG &pg);
 
-  crimson::net::ConnectionFRef conn;
   PipelineHandle handle;
   Ref<MOSDRepOp> req;
 };

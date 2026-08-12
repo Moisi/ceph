@@ -15,6 +15,7 @@
 
 #include "common/ceph_json.h"
 #include "common/strtol.h"
+#include "rgw/async_utils.h"
 #include "rgw_rest.h"
 #include "rgw_op.h"
 #include "rgw_rest_s3.h"
@@ -91,7 +92,7 @@ void RGWOp_MDLog_List::execute(optional_yield y) {
   meta_log.init_list_entries(shard_id, {}, {}, marker, &handle);
 
   op_ret = meta_log.list_entries(this, handle, max_entries, entries,
-                                   &last_marker, &truncated);
+				 &last_marker, &truncated, y);
 
   meta_log.complete_list_entries(handle);
 }
@@ -109,9 +110,9 @@ void RGWOp_MDLog_List::send_response() {
   s->formatter->dump_bool("truncated", truncated);
   {
     s->formatter->open_array_section("entries");
-    for (list<cls_log_entry>::iterator iter = entries.begin();
+    for (auto iter = entries.begin();
 	 iter != entries.end(); ++iter) {
-      cls_log_entry& entry = *iter;
+      auto& entry = *iter;
       static_cast<rgw::sal::RadosStore*>(driver)->ctl()->meta.mgr->dump_log_entry(entry, s->formatter);
       flusher.flush();
     }
@@ -166,7 +167,7 @@ void RGWOp_MDLog_ShardInfo::execute(optional_yield y) {
   }
   RGWMetadataLog meta_log{s->cct, static_cast<rgw::sal::RadosStore*>(driver)->svc()->zone, static_cast<rgw::sal::RadosStore*>(driver)->svc()->cls, period};
 
-  op_ret = meta_log.get_info(this, shard_id, &info);
+  op_ret = meta_log.get_info(this, shard_id, &info, y);
 }
 
 void RGWOp_MDLog_ShardInfo::send_response() {
@@ -232,7 +233,7 @@ void RGWOp_MDLog_Delete::execute(optional_yield y) {
   }
   RGWMetadataLog meta_log{s->cct, static_cast<rgw::sal::RadosStore*>(driver)->svc()->zone, static_cast<rgw::sal::RadosStore*>(driver)->svc()->cls, period};
 
-  op_ret = meta_log.trim(this, shard_id, {}, {}, {}, marker);
+  op_ret = meta_log.trim(this, shard_id, {}, {}, {}, marker, y);
 }
 
 void RGWOp_MDLog_Lock::execute(optional_yield y) {
@@ -414,7 +415,7 @@ void RGWOp_BILog_List::execute(optional_yield y) {
     b.name = bn;
     b.bucket_id = bucket_instance;
   }
-  op_ret = driver->get_bucket(s, nullptr, b, &bucket, y);
+  op_ret = driver->load_bucket(s, b, &bucket, y);
   if (op_ret < 0) {
     ldpp_dout(this, 5) << "could not get bucket info for bucket=" << bucket_name << dendl;
     return;
@@ -451,7 +452,7 @@ void RGWOp_BILog_List::execute(optional_yield y) {
   send_response();
   do {
     list<rgw_bi_log_entry> entries;
-    int ret = static_cast<rgw::sal::RadosStore*>(driver)->svc()->bilog_rados->log_list(s, bucket->get_info(), log_layout, shard_id,
+    int ret = static_cast<rgw::sal::RadosStore*>(driver)->svc()->bilog_rados->log_list(s, y, bucket->get_info(), log_layout, shard_id,
                                                marker, max_entries - count,
                                                entries, &truncated);
     if (ret < 0) {
@@ -507,7 +508,7 @@ void RGWOp_BILog_List::send_response_end() {
     if (next_log_layout) {
       s->formatter->open_object_section("next_log");
       encode_json("generation", next_log_layout->gen, s->formatter);
-      encode_json("num_shards", next_log_layout->layout.in_index.layout.num_shards, s->formatter);
+      encode_json("num_shards", rgw::num_shards(next_log_layout->layout.in_index.layout), s->formatter);
       s->formatter->close_section(); // next_log
     }
 
@@ -541,7 +542,7 @@ void RGWOp_BILog_Info::execute(optional_yield y) {
     b.name = bn;
     b.bucket_id = bucket_instance;
   }
-  op_ret = driver->get_bucket(s, nullptr, b, &bucket, y);
+  op_ret = driver->load_bucket(s, b, &bucket, y);
   if (op_ret < 0) {
     ldpp_dout(this, 5) << "could not get bucket info for bucket=" << bucket_name << dendl;
     return;
@@ -557,7 +558,7 @@ void RGWOp_BILog_Info::execute(optional_yield y) {
   map<RGWObjCategory, RGWStorageStats> stats;
   const auto& index = log_to_index_layout(logs.back());
 
-  int ret =  bucket->read_stats(s, index, shard_id, &bucket_ver, &master_ver, stats, &max_marker, &syncstopped);
+  int ret =  bucket->read_stats(s, y, index, shard_id, &bucket_ver, &master_ver, stats, &max_marker, &syncstopped);
   if (ret < 0 && ret != -ENOENT) {
     op_ret = ret;
     return;
@@ -567,7 +568,7 @@ void RGWOp_BILog_Info::execute(optional_yield y) {
   latest_gen = logs.back().gen;
 
   for (auto& log : logs) {
-      uint32_t num_shards = log.layout.in_index.layout.num_shards;
+      uint32_t num_shards = rgw::num_shards(log.layout.in_index.layout);
       generations.push_back({log.gen, num_shards});
   }
 }
@@ -635,13 +636,13 @@ void RGWOp_BILog_Delete::execute(optional_yield y) {
     b.name = bn;
     b.bucket_id = bucket_instance;
   }
-  op_ret = driver->get_bucket(s, nullptr, b, &bucket, y);
+  op_ret = driver->load_bucket(s, b, &bucket, y);
   if (op_ret < 0) {
     ldpp_dout(this, 5) << "could not get bucket info for bucket=" << bucket_name << dendl;
     return;
   }
 
-  op_ret = bilog_trim(this, static_cast<rgw::sal::RadosStore*>(driver),
+  op_ret = bilog_trim(this, y, static_cast<rgw::sal::RadosStore*>(driver),
 		      bucket->get_info(), gen, shard_id,
 		      start_marker, end_marker);
   if (op_ret < 0) {
@@ -688,10 +689,24 @@ void RGWOp_DATALog_List::execute(optional_yield y) {
 
   // Note that last_marker is updated to be the marker of the last
   // entry listed
-  op_ret = static_cast<rgw::sal::RadosStore*>(driver)->svc()->datalog_rados->list_entries(this, shard_id,
-						     max_entries, entries,
-						     marker, &last_marker,
-						     &truncated);
+  auto store = static_cast<rgw::sal::RadosStore*>(driver);
+  op_ret = rgw::run_coro(
+    this,
+    store->get_io_context(),
+    store->svc()->datalog_rados->list_entries(this, shard_id,
+					      max_entries, marker),
+    std::tie(entries, last_marker, truncated),
+    "RGWDataChangesLog::list_entries", y);
+
+
+  RGWDataChangesLogInfo info;
+  op_ret = rgw::run_coro(
+    this,
+    store->get_io_context(),
+    store->svc()->datalog_rados->get_info(this, shard_id),
+    info, "RGWDataChangesLog::get_info", y);
+
+  last_update = info.last_update;
 }
 
 void RGWOp_DATALog_List::send_response() {
@@ -704,6 +719,8 @@ void RGWOp_DATALog_List::send_response() {
 
   s->formatter->open_object_section("log_entries");
   s->formatter->dump_string("marker", last_marker);
+  utime_t lu(last_update);
+  encode_json("last_update", lu, s->formatter);
   s->formatter->dump_bool("truncated", truncated);
   {
     s->formatter->open_array_section("entries");
@@ -749,7 +766,10 @@ void RGWOp_DATALog_ShardInfo::execute(optional_yield y) {
     return;
   }
 
-  op_ret = static_cast<rgw::sal::RadosStore*>(driver)->svc()->datalog_rados->get_info(this, shard_id, &info);
+  auto store = static_cast<rgw::sal::RadosStore*>(driver);
+  op_ret = rgw::run_coro(this, store->get_io_context(),
+			 store->svc()->datalog_rados->get_info(this, shard_id),
+			 info, "RGWDataChangesLog::get_info", y);
 }
 
 void RGWOp_DATALog_ShardInfo::send_response() {
@@ -898,7 +918,11 @@ void RGWOp_DATALog_Delete::execute(optional_yield y) {
     return;
   }
 
-  op_ret = static_cast<rgw::sal::RadosStore*>(driver)->svc()->datalog_rados->trim_entries(this, shard_id, marker);
+  auto store = static_cast<rgw::sal::RadosStore*>(driver);
+  op_ret = rgw::run_coro(
+    this, store->get_io_context(),
+    store->svc()->datalog_rados->trim_entries(this, shard_id, marker),
+    "RGWDataChangesLog::trim_entries", y);
 }
 
 // not in header to avoid pulling in rgw_sync.h
@@ -984,7 +1008,7 @@ void RGWOp_BILog_Status::execute(optional_yield y)
 
   // read the bucket instance info for num_shards
   std::unique_ptr<rgw::sal::Bucket> bucket;
-  op_ret = driver->get_bucket(s, nullptr, b, &bucket, y);
+  op_ret = driver->load_bucket(s, b, &bucket, y);
   if (op_ret < 0) {
     ldpp_dout(this, 4) << "failed to read bucket info: " << cpp_strerror(op_ret) << dendl;
     return;
@@ -1060,7 +1084,7 @@ void RGWOp_BILog_Status::execute(optional_yield y)
 
     if (!pipe.dest.bucket) {
       /* Uh oh, something went wrong */
-      ldpp_dout(this, 20) << "ERROR: RGWOp_BILog_Status::execute(optional_yield y): BUG: pipe.dest.bucket was not initialized" << pipe << dendl;
+      ldpp_dout(this, 0) << "ERROR: RGWOp_BILog_Status::execute(optional_yield y): BUG: pipe.dest.bucket was not initialized" << pipe << dendl;
       op_ret = -EIO;
       return;
     }
@@ -1068,7 +1092,7 @@ void RGWOp_BILog_Status::execute(optional_yield y)
     if (*pipe.dest.bucket != pinfo->bucket) {
       opt_dest_info.emplace();
       std::unique_ptr<rgw::sal::Bucket> dest_bucket;
-      op_ret = driver->get_bucket(s, nullptr, *pipe.dest.bucket, &dest_bucket, y);
+      op_ret = driver->load_bucket(s, *pipe.dest.bucket, &dest_bucket, y);
       if (op_ret < 0) {
         ldpp_dout(this, 4) << "failed to read target bucket info (bucket=: " << cpp_strerror(op_ret) << dendl;
         return;
@@ -1100,7 +1124,7 @@ void RGWOp_BILog_Status::execute(optional_yield y)
     }
 
     if (status.inc_status.empty()) {
-      status.inc_status = std::move(current_status);
+      std::swap(status.inc_status, current_status);
     } else {
       if (current_status.size() != status.inc_status.size()) {
         op_ret = -EINVAL;

@@ -2,6 +2,7 @@
 # pylint: disable=unused-argument
 import errno
 import json
+import math
 from enum import IntEnum
 
 import cherrypy
@@ -10,12 +11,12 @@ import rbd
 
 from .. import mgr
 from ..exceptions import DashboardException
-from ..plugins.ttl_cache import ttl_cache
+from ..plugins.ttl_cache import ttl_cache, ttl_cache_invalidator
 from ._paginate import ListPaginator
 from .ceph_service import CephService
 
 try:
-    from typing import List, Optional
+    from typing import Dict, List, Optional
 except ImportError:
     pass  # For typing only
 
@@ -31,6 +32,10 @@ RBD_FEATURES_NAME_MAPPING = {
     rbd.RBD_FEATURE_DATA_POOL: "data-pool",
     rbd.RBD_FEATURE_OPERATIONS: "operations",
 }
+
+RBD_IMAGE_REFS_CACHE_REFERENCE = 'rbd_image_refs'
+GET_IOCTX_CACHE = 'get_ioctx'
+POOL_NAMESPACES_CACHE = 'pool_namespaces'
 
 
 class MIRROR_IMAGE_MODE(IntEnum):
@@ -84,6 +89,25 @@ def format_features(features):
         if value in features:
             res = key | res
     return res
+
+
+def _sort_features(features, enable=True):
+    """
+    Sorts image features according to feature dependencies:
+
+    object-map depends on exclusive-lock
+    journaling depends on exclusive-lock
+    fast-diff depends on object-map
+    """
+    ORDER = ['exclusive-lock', 'journaling', 'object-map', 'fast-diff']  # noqa: N806
+
+    def key_func(feat):
+        try:
+            return ORDER.index(feat)
+        except ValueError:
+            return id(feat)
+
+    features.sort(key=key_func, reverse=not enable)
 
 
 def get_image_spec(pool_name, namespace, rbd_name):
@@ -244,6 +268,13 @@ class RbdConfiguration(object):
 class RbdService(object):
     _rbd_inst = rbd.RBD()
 
+    # set of image features that can be enable on existing images
+    ALLOW_ENABLE_FEATURES = {"exclusive-lock", "object-map", "fast-diff", "journaling"}
+
+    # set of image features that can be disabled on existing images
+    ALLOW_DISABLE_FEATURES = {"exclusive-lock", "object-map", "fast-diff", "deep-flatten",
+                              "journaling"}
+
     @classmethod
     def _rbd_disk_usage(cls, image, snaps, whole_object=True):
         class DUCallback(object):
@@ -258,7 +289,10 @@ class RbdService(object):
         prev_snap = None
         total_used_size = 0
         for _, size, name in snaps:
-            image.set_snap(name)
+            try:
+                image.set_snap(name)
+            except rbd.ImageNotFound:
+                continue
             du_callb = DUCallback()
             image.diff_iterate(0, size, prev_snap, du_callb,
                                whole_object=whole_object)
@@ -269,22 +303,26 @@ class RbdService(object):
         return total_used_size, snap_map
 
     @classmethod
-    def _rbd_image(cls, ioctx, pool_name, namespace, image_name):  # pylint: disable=R0912
+    def _rbd_image(cls, ioctx, pool_name, namespace, image_name,  # pylint: disable=R0912
+                   omit_usage=False):
         with rbd.Image(ioctx, image_name) as img:
             stat = img.stat()
             mirror_info = img.mirror_image_get_info()
-            mirror_mode = img.mirror_image_get_mode()
-            if mirror_mode == rbd.RBD_MIRROR_IMAGE_MODE_JOURNAL and mirror_info['state'] != rbd.RBD_MIRROR_IMAGE_DISABLED:  # noqa E501 #pylint: disable=line-too-long
+            mirror_mode = None
+            if mirror_info['state'] != rbd.RBD_MIRROR_IMAGE_DISABLED:
+                mirror_mode = img.mirror_image_get_mode()
+            else:
+                stat['mirror_mode'] = 'Disabled'
+
+            if mirror_mode == rbd.RBD_MIRROR_IMAGE_MODE_JOURNAL:
                 stat['mirror_mode'] = 'journal'
             elif mirror_mode == rbd.RBD_MIRROR_IMAGE_MODE_SNAPSHOT:
                 stat['mirror_mode'] = 'snapshot'
-                schedule_status = json.loads(_rbd_support_remote(
-                    'mirror_snapshot_schedule_status')[1])
-                for scheduled_image in schedule_status['scheduled_images']:
-                    if scheduled_image['image'] == get_image_spec(pool_name, namespace, image_name):
-                        stat['schedule_info'] = scheduled_image
-            else:
-                stat['mirror_mode'] = 'Disabled'
+                schedule_info = RbdMirroringService.get_snapshot_schedule_info(
+                    get_image_spec(pool_name, namespace, image_name)
+                )
+                if schedule_info:
+                    stat['schedule_info'] = schedule_info[0]
 
             stat['name'] = image_name
 
@@ -328,16 +366,18 @@ class RbdService(object):
             # snapshots
             stat['snapshots'] = []
             for snap in img.list_snaps():
-                try:
-                    snap['mirror_mode'] = MIRROR_IMAGE_MODE(img.mirror_image_get_mode()).name
-                except ValueError as ex:
-                    raise DashboardException(f'Unknown RBD Mirror mode: {ex}')
+                # Skip trash snapshots (cloned-and-then-deleted format v2 snapshots)
+                if snap['namespace'] == rbd.RBD_SNAP_NAMESPACE_TYPE_TRASH:
+                    continue
+
+                if mirror_mode:
+                    snap['mirror_mode'] = mirror_mode
 
                 snap['timestamp'] = "{}Z".format(
                     img.get_snap_timestamp(snap['id']).isoformat())
 
                 snap['is_protected'] = None
-                if mirror_mode != rbd.RBD_MIRROR_IMAGE_MODE_SNAPSHOT:
+                if snap['namespace'] == rbd.RBD_SNAP_NAMESPACE_TYPE_USER:
                     snap['is_protected'] = img.is_protected_snap(snap['name'])
                 snap['used_bytes'] = None
                 snap['children'] = []
@@ -352,10 +392,7 @@ class RbdService(object):
                 stat['snapshots'].append(snap)
 
             # disk usage
-            img_flags = img.flags()
-            if 'fast-diff' in stat['features_name'] and \
-                    not rbd.RBD_FLAG_FAST_DIFF_INVALID & img_flags and \
-                    mirror_mode != rbd.RBD_MIRROR_IMAGE_MODE_SNAPSHOT:
+            if not omit_usage and 'fast-diff' in stat['features_name']:
                 snaps = [(s['id'], s['size'], s['name'])
                          for s in stat['snapshots']]
                 snaps.sort(key=lambda s: s[0])
@@ -393,14 +430,14 @@ class RbdService(object):
         return stat_parent
 
     @classmethod
-    @ttl_cache(10)
+    @ttl_cache(10, label=GET_IOCTX_CACHE)
     def get_ioctx(cls, pool_name, namespace=''):
         ioctx = mgr.rados.open_ioctx(pool_name)
         ioctx.set_namespace(namespace)
         return ioctx
 
     @classmethod
-    @ttl_cache(30)
+    @ttl_cache(30, label=RBD_IMAGE_REFS_CACHE_REFERENCE)
     def _rbd_image_refs(cls, pool_name, namespace=''):
         # We add and set the namespace here so that we cache by ioctx and namespace.
         images = []
@@ -409,7 +446,7 @@ class RbdService(object):
         return images
 
     @classmethod
-    @ttl_cache(30)
+    @ttl_cache(30, label=POOL_NAMESPACES_CACHE)
     def _pool_namespaces(cls, pool_name, namespace=None):
         namespaces = []
         if namespace:
@@ -481,15 +518,183 @@ class RbdService(object):
         return result, paginator.get_count()
 
     @classmethod
-    def get_image(cls, image_spec):
+    def get_image(cls, image_spec, omit_usage=False):
         pool_name, namespace, image_name = parse_image_spec(image_spec)
         ioctx = mgr.rados.open_ioctx(pool_name)
         if namespace:
             ioctx.set_namespace(namespace)
         try:
-            return cls._rbd_image(ioctx, pool_name, namespace, image_name)
+            return cls._rbd_image(ioctx, pool_name, namespace, image_name, omit_usage)
         except rbd.ImageNotFound:
             raise cherrypy.HTTPError(404, 'Image not found')
+
+    @classmethod
+    @ttl_cache_invalidator(RBD_IMAGE_REFS_CACHE_REFERENCE)
+    def create(cls, name, pool_name, size, namespace=None,
+               obj_size=None, features=None, stripe_unit=None, stripe_count=None,
+               data_pool=None, configuration=None, metadata=None):
+        size = int(size)
+
+        def _create(ioctx):
+            rbd_inst = cls._rbd_inst
+
+            # Set order
+            l_order = None
+            if obj_size and obj_size > 0:
+                l_order = int(round(math.log(float(obj_size), 2)))
+
+            # Set features
+            feature_bitmask = format_features(features)
+
+            rbd_inst.create(ioctx, name, size, order=l_order, old_format=False,
+                            features=feature_bitmask, stripe_unit=stripe_unit,
+                            stripe_count=stripe_count, data_pool=data_pool)
+            RbdConfiguration(pool_ioctx=ioctx, namespace=namespace,
+                             image_name=name).set_configuration(configuration)
+            if metadata:
+                with rbd.Image(ioctx, name) as image:
+                    RbdImageMetadataService(image).set_metadata(metadata)
+        rbd_call(pool_name, namespace, _create)
+
+    @classmethod
+    @ttl_cache_invalidator(RBD_IMAGE_REFS_CACHE_REFERENCE)
+    def set(cls, image_spec, name=None, size=None, features=None,
+            configuration=None, metadata=None, enable_mirror=None, primary=None,
+            force=False, resync=False, mirror_mode=None, image_mirror_mode=None,
+            schedule_interval='', remove_scheduling=False):
+        # pylint: disable=too-many-branches
+        pool_name, namespace, image_name = parse_image_spec(image_spec)
+
+        def _edit(ioctx, image):
+            rbd_inst = cls._rbd_inst
+            # check rename image
+            if name and name != image_name:
+                rbd_inst.rename(ioctx, image_name, name)
+
+            # check resize
+            if size and size != image.size():
+                image.resize(size)
+
+            if image_mirror_mode is not None and mirror_mode is not None:
+                if image_mirror_mode != mirror_mode:
+                    RbdMirroringService.disable_image(image_name, pool_name, namespace)
+
+            mirror_image_info = image.mirror_image_get_info()
+            if (enable_mirror is True
+                    and mirror_image_info['state'] == rbd.RBD_MIRROR_IMAGE_DISABLED):
+                RbdMirroringService.enable_image(
+                    image_name, pool_name, namespace,
+                    MIRROR_IMAGE_MODE[mirror_mode]
+                )
+            elif (enable_mirror is False
+                    and mirror_image_info['state'] == rbd.RBD_MIRROR_IMAGE_ENABLED):
+                RbdMirroringService.disable_image(
+                    image_name, pool_name, namespace
+                )
+
+            # check enable/disable features
+            if features is not None:
+                curr_features = format_bitmask(image.features())
+                # check disabled features
+                _sort_features(curr_features, enable=False)
+                for feature in curr_features:
+                    if (feature not in features
+                       and feature in cls.ALLOW_DISABLE_FEATURES
+                       and feature in format_bitmask(image.features())):
+                        f_bitmask = format_features([feature])
+                        image.update_features(f_bitmask, False)
+                # check enabled features
+                _sort_features(features)
+                for feature in features:
+                    if (feature not in curr_features
+                       and feature in cls.ALLOW_ENABLE_FEATURES
+                       and feature not in format_bitmask(image.features())):
+                        f_bitmask = format_features([feature])
+                        image.update_features(f_bitmask, True)
+
+            RbdConfiguration(pool_ioctx=ioctx, image_name=image_name).set_configuration(
+                configuration)
+            if metadata:
+                RbdImageMetadataService(image).set_metadata(metadata)
+
+            if primary and not mirror_image_info['primary']:
+                RbdMirroringService.promote_image(
+                    image_name, pool_name, namespace, force)
+            elif primary is False and mirror_image_info['primary']:
+                RbdMirroringService.demote_image(
+                    image_name, pool_name, namespace)
+
+            if resync:
+                RbdMirroringService.resync_image(image_name, pool_name, namespace)
+
+            if schedule_interval:
+                RbdMirroringService.snapshot_schedule_add(image_spec, schedule_interval)
+
+            if remove_scheduling:
+                RbdMirroringService.snapshot_schedule_remove(image_spec)
+
+        return rbd_image_call(pool_name, namespace, image_name, _edit)
+
+    @classmethod
+    @ttl_cache_invalidator(RBD_IMAGE_REFS_CACHE_REFERENCE)
+    def delete(cls, image_spec):
+        pool_name, namespace, image_name = parse_image_spec(image_spec)
+
+        image = RbdService.get_image(image_spec)
+        snapshots = image['snapshots']
+        for snap in snapshots:
+            RbdSnapshotService.remove_snapshot(image_spec, snap['name'], snap['is_protected'])
+
+        rbd_inst = rbd.RBD()
+        return rbd_call(pool_name, namespace, rbd_inst.remove, image_name)
+
+    @classmethod
+    @ttl_cache_invalidator(RBD_IMAGE_REFS_CACHE_REFERENCE)
+    def copy(cls, image_spec, dest_pool_name, dest_namespace, dest_image_name,
+             snapshot_name=None, obj_size=None, features=None,
+             stripe_unit=None, stripe_count=None, data_pool=None,
+             configuration=None, metadata=None):
+        pool_name, namespace, image_name = parse_image_spec(image_spec)
+
+        def _src_copy(s_ioctx, s_img):
+            def _copy(d_ioctx):
+                # Set order
+                l_order = None
+                if obj_size and obj_size > 0:
+                    l_order = int(round(math.log(float(obj_size), 2)))
+
+                # Set features
+                feature_bitmask = format_features(features)
+
+                if snapshot_name:
+                    s_img.set_snap(snapshot_name)
+
+                s_img.copy(d_ioctx, dest_image_name, feature_bitmask, l_order,
+                           stripe_unit, stripe_count, data_pool)
+                RbdConfiguration(pool_ioctx=d_ioctx, image_name=dest_image_name).set_configuration(
+                    configuration)
+                if metadata:
+                    with rbd.Image(d_ioctx, dest_image_name) as image:
+                        RbdImageMetadataService(image).set_metadata(metadata)
+
+            return rbd_call(dest_pool_name, dest_namespace, _copy)
+
+        return rbd_image_call(pool_name, namespace, image_name, _src_copy)
+
+    @classmethod
+    @ttl_cache_invalidator(RBD_IMAGE_REFS_CACHE_REFERENCE)
+    def flatten(cls, image_spec):
+        def _flatten(ioctx, image):
+            image.flatten()
+
+        pool_name, namespace, image_name = parse_image_spec(image_spec)
+        return rbd_image_call(pool_name, namespace, image_name, _flatten)
+
+    @classmethod
+    def move_image_to_trash(cls, image_spec, delay):
+        pool_name, namespace, image_name = parse_image_spec(image_spec)
+        rbd_inst = cls._rbd_inst
+        return rbd_call(pool_name, namespace, rbd_inst.trash_move, image_name, delay)
 
 
 class RbdSnapshotService(object):
@@ -552,6 +757,74 @@ class RbdMirroringService:
     @classmethod
     def snapshot_schedule_remove(cls, image_spec: str):
         _rbd_support_remote('mirror_snapshot_schedule_remove', image_spec)
+
+    @classmethod
+    def snapshot_schedule_list(cls, image_spec: str = ''):
+        return _rbd_support_remote('mirror_snapshot_schedule_list', image_spec)
+
+    @classmethod
+    def snapshot_schedule_status(cls, image_spec: str = ''):
+        return _rbd_support_remote('mirror_snapshot_schedule_status', image_spec)
+
+    @classmethod
+    def get_snapshot_schedule_info(cls, image_spec: str = ''):
+        """
+        Retrieve snapshot schedule information by merging schedule list and status.
+
+        Args:
+            image_spec (str, optional): Specification of an RBD image. If empty,
+                retrieves all schedule information.
+                Format: "<pool_name>/<namespace_name>/<image_name>".
+
+        Returns:
+            Optional[List[Dict[str, Any]]]: A list of merged schedule information
+            dictionaries if found, otherwise None.
+        """
+        schedule_info: List[Dict] = []
+
+        # schedule list and status provide the schedule interval
+        # and schedule timestamp respectively.
+        schedule_list_raw = cls.snapshot_schedule_list(image_spec)
+        schedule_status_raw = cls.snapshot_schedule_status(image_spec)
+
+        try:
+            schedule_list = json.loads(
+                schedule_list_raw[1]) if schedule_list_raw and schedule_list_raw[1] else {}
+            schedule_status = json.loads(
+                schedule_status_raw[1]) if schedule_status_raw and schedule_status_raw[1] else {}
+        except (json.JSONDecodeError, TypeError):
+            return None
+
+        if not schedule_list or not schedule_status:
+            return None
+
+        scheduled_images = schedule_status.get("scheduled_images", [])
+
+        for _, schedule in schedule_list.items():
+            name = schedule.get("name")
+            if not name:
+                continue
+
+            # find status entry for this schedule
+            # by matching with the image name
+            image = next((
+                sched_image for sched_image in scheduled_images
+                if sched_image.get("image") == name), None)
+            if not image:
+                continue
+
+            # eventually we are merging both the list and status entries
+            # all the needed info are fetched above and here we are just mapping
+            # it to the dictionary so that in one function we get
+            # the schedule related information.
+            merged = {
+                "name": name,
+                "schedule_interval": schedule.get("schedule", []),
+                "schedule_time": image.get("schedule_time")
+            }
+            schedule_info.append(merged)
+
+        return schedule_info if schedule_info else None
 
 
 class RbdImageMetadataService(object):

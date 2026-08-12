@@ -15,6 +15,10 @@ There are important considerations when planning these pools:
 - We recommend the fastest feasible low-latency storage devices (NVMe, Optane,
   or at the very least SAS/SATA SSD) for the metadata pool, as this will
   directly affect the latency of client file system operations.
+- We strongly suggest that the CephFS metadata pool be provisioned on dedicated
+  SSD / NVMe OSDs. This ensures that high client workload does not adversely
+  impact metadata operations. See :ref:`device_classes` to configure pools this
+  way.
 - The data pool used to create the file system is the "default" data pool and
   the location for storing all inode backtrace information, which is used for hard link
   management and disaster recovery. For this reason, all CephFS inodes
@@ -48,12 +52,15 @@ Once the pools are created, you may enable the file system using the ``fs new`` 
 
 .. code:: bash
 
-    $ ceph fs new <fs_name> <metadata> <data> [--force] [--allow-dangerous-metadata-overlay] [<fscid:int>] [--recover]
+    $ ceph fs new <fs_name> <metadata> <data> [--force] [--allow-dangerous-metadata-overlay] [<fscid:int>] [--recover] [--yes-i-really-really-mean-it] [<set>...]
 
 This command creates a new file system with specified metadata and data pool.
 The specified data pool is the default data pool and cannot be changed once set.
 Each file system has its own set of MDS daemons assigned to ranks so ensure that
 you have sufficient standby daemons available to accommodate the new file system.
+
+.. note::
+   ``--yes-i-really-really-mean-it`` may be used for some ``fs set`` commands
 
 The ``--force`` option is used to achieve any of the following:
 
@@ -78,11 +85,14 @@ failed. So when a MDS daemon eventually picks up rank 0, the daemon reads the
 existing in-RADOS metadata and doesn't overwrite it. The flag also prevents the
 standby MDS daemons to join the file system.
 
+The ``set`` option allows to set multiple options supported by ``fs set``
+atomically with the creation of the file system.
+
 For example:
 
 .. code:: bash
 
-    $ ceph fs new cephfs cephfs_metadata cephfs_data
+    $ ceph fs new cephfs cephfs_metadata cephfs_data set max_mds 2 allow_standby_replay true
     $ ceph fs ls
     name: cephfs, metadata pool: cephfs_metadata, data pools: [cephfs_data ]
 
@@ -126,6 +136,12 @@ You may use Erasure Coded pools as CephFS data pools as long as they have overwr
     ceph osd pool set my_ec_pool allow_ec_overwrites true
     
 Note that EC overwrites are only supported when using OSDs with the BlueStore backend.
+
+If you are storing lots of small files or are frequently modifying files you can improve performance by enabling EC optimizations, which is done as follows:
+
+.. code:: bash
+
+    ceph osd pool set my_ec_pool allow_ec_optimizations true
 
 You may not use Erasure Coded pools as CephFS metadata pools, because CephFS metadata is stored using RADOS *OMAP* data structures, which EC pools cannot store.
 

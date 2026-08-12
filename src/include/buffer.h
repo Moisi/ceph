@@ -39,7 +39,6 @@
 #endif
 
 #include <iosfwd>
-#include <iomanip>
 #include <list>
 #include <memory>
 #include <vector>
@@ -66,14 +65,14 @@
 
 #define CEPH_BUFFER_API
 
-#ifdef HAVE_SEASTAR
+#ifdef WITH_CRIMSON
 namespace seastar {
 template <typename T> class temporary_buffer;
 namespace net {
 class packet;
 }
 }
-#endif // HAVE_SEASTAR
+#endif // WITH_CRIMSON
 class deleter;
 
 template<typename T> class DencDumper;
@@ -130,6 +129,7 @@ struct error_code;
   class raw_claimed_char;
   class raw_unshareable; // diagnostic, unshareable char buffer
   class raw_combined;
+  class raw_zeros;
   class raw_claim_buffer;
 
 
@@ -150,7 +150,7 @@ struct error_code;
   ceph::unique_leakable_ptr<raw> create_small_page_aligned(unsigned len);
   ceph::unique_leakable_ptr<raw> claim_buffer(unsigned len, char *buf, deleter del);
 
-#ifdef HAVE_SEASTAR
+#ifdef WITH_CRIMSON
   /// create a raw buffer to wrap seastar cpu-local memory, using foreign_ptr to
   /// make it safe to share between cpus
   ceph::unique_leakable_ptr<buffer::raw> create(seastar::temporary_buffer<char>&& buf);
@@ -304,6 +304,9 @@ struct error_code;
     unsigned wasted() const;
 
     int cmp(const ptr& o) const;
+    /// is_zero_fast() is a variant aware about deduplicated zeros.
+    /// In Tentacle it shall NOT be used by anybody except ECBackend.
+    bool is_zero_fast() const;
     bool is_zero() const;
 
     // modifiers
@@ -336,12 +339,12 @@ struct error_code;
     void zero(unsigned o, unsigned l, bool crc_reset = true);
     unsigned append_zeros(unsigned l);
 
-#ifdef HAVE_SEASTAR
+#ifdef WITH_CRIMSON
     /// create a temporary_buffer, copying the ptr as its deleter
     operator seastar::temporary_buffer<char>() &;
     /// convert to temporary_buffer, stealing the ptr as its deleter
     operator seastar::temporary_buffer<char>() &&;
-#endif // HAVE_SEASTAR
+#endif // WITH_CRIMSON
 
   };
 
@@ -700,6 +703,12 @@ struct error_code;
       void copy_shallow(unsigned len, ptr &dest);
       void copy(unsigned len, list &dest);
       void copy(unsigned len, std::string &dest);
+      template<typename A>
+      void copy(unsigned len, std::vector<uint8_t,A>& u8v) {
+        u8v.resize(len);
+        copy(len, (char*)u8v.data());
+      }
+
       void copy_all(list &dest);
 
       // get a pointer to the currenet iterator position, return the
@@ -829,6 +838,7 @@ struct error_code;
       contiguous_filler(char* const pos) : pos(pos) {}
 
     public:
+      contiguous_filler() : pos(nullptr) {}
       void advance(const unsigned len) {
 	pos += len;
       }
@@ -923,6 +933,8 @@ struct error_code;
     ptr& get_append_buffer() {
       return *_carriage;
     }
+
+    ptr always_zeroed_bptr();
 
   public:
     // cons/des
@@ -1100,7 +1112,7 @@ struct error_code;
       }
     }
 
-#ifdef HAVE_SEASTAR
+#ifdef WITH_CRIMSON
     /// convert the bufferlist into a network packet
     operator seastar::net::packet() &&;
 #endif
@@ -1140,6 +1152,10 @@ struct error_code;
     void append(std::string_view s) {
       append(s.data(), s.length());
     }
+    template<typename A>
+    void append(const std::vector<uint8_t,A>& u8v) {
+      append((const char *)u8v.data(), u8v.size());
+    }
 #endif // __cplusplus >= 201703L
     void append(const ptr& bp);
     void append(ptr&& bp);
@@ -1153,6 +1169,11 @@ struct error_code;
     void append(std::istream& in);
     contiguous_filler append_hole(unsigned len);
     void append_zero(unsigned len);
+    /// append_zero2() is a temporary, short-living variant that deduplicates zeros.
+    /// In Tentacle it shall NOT be used by anybody except ECBackend.
+    /// In future release it will likely replace the append_zero() variant but
+    /// other changes at the interface are needed to make the transition safe.
+    void append_zero2(unsigned len);
     void prepend_zero(unsigned len);
 
     reserve_t obtain_contiguous_space(const unsigned len);
@@ -1284,6 +1305,23 @@ std::ostream& operator<<(std::ostream& out, const buffer::list& bl);
 inline bufferhash& operator<<(bufferhash& l, const bufferlist &r) {
   l.update(r);
   return l;
+}
+
+static inline
+void copy_bufferlist_to_iovec(const struct iovec *iov, unsigned iovcnt,
+                              bufferlist *bl, int64_t r)
+{
+  auto iter = bl->cbegin();
+  for (unsigned j = 0, resid = r; j < iovcnt && resid > 0; j++) {
+         /*
+          * This piece of code aims to handle the case that bufferlist
+          * does not have enough data to fill in the iov
+          */
+         const auto round_size = std::min<unsigned>(resid, iov[j].iov_len);
+         iter.copy(round_size, reinterpret_cast<char*>(iov[j].iov_base));
+         resid -= round_size;
+         /* iter is self-updating */
+  }
 }
 
 } // namespace buffer

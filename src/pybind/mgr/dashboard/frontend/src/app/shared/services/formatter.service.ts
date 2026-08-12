@@ -1,6 +1,7 @@
 import { Injectable } from '@angular/core';
-
+import { AbstractControl, ValidationErrors } from '@angular/forms';
 import _ from 'lodash';
+import { isEmptyInputValue } from '../forms/cd-validators';
 
 @Injectable({
   providedIn: 'root'
@@ -12,6 +13,9 @@ export class FormatterService {
     }
     if (!_.isNumber(n)) {
       return '-';
+    }
+    if (_.isNaN(n)) {
+      return 'N/A';
     }
     let unit = n < 1 ? 0 : Math.floor(Math.log(n) / Math.log(divisor));
     unit = unit >= units.length ? units.length - 1 : unit;
@@ -26,6 +30,52 @@ export class FormatterService {
   }
 
   /**
+   * Converts a value from one set of units to another using a conversion factor
+   * @param n The value to be converted
+   * @param units The data units of the value
+   * @param targetedUnits The wanted data units to convert to
+   * @param conversionFactor The factor of convesion
+   * @param unitsArray An ordered array containing the data units
+   * @param decimals The number of decimals on the returned value
+   * @returns Returns a string of the given value formated to the targeted data units.
+   */
+  formatNumberFromTo(
+    n: any,
+    units: string = '',
+    targetedUnits: string = '',
+    conversionFactor: number,
+    unitsArray: string[],
+    decimals: number = 1
+  ): string {
+    if (_.isString(n)) {
+      n = Number(n);
+    }
+    if (!_.isNumber(n)) {
+      return '-';
+    }
+    if (!unitsArray) {
+      return '-';
+    }
+    const unitsArrayLowerCase = unitsArray.map((str) => str.toLowerCase());
+    if (
+      !unitsArrayLowerCase.includes(units.toLowerCase()) ||
+      !unitsArrayLowerCase.includes(targetedUnits.toLowerCase())
+    ) {
+      return `${n} ${units}`;
+    }
+    const index =
+      unitsArrayLowerCase.indexOf(units.toLowerCase()) -
+      unitsArrayLowerCase.indexOf(targetedUnits.toLocaleLowerCase());
+    const convertedN =
+      index > 0
+        ? n * Math.pow(conversionFactor, index)
+        : n / Math.pow(conversionFactor, Math.abs(index));
+    let result = _.round(convertedN, decimals).toString();
+    result = `${result} ${targetedUnits}`;
+    return result;
+  }
+
+  /**
    * Convert the given value into bytes.
    * @param {string} value The value to be converted, e.g. 1024B, 10M, 300KiB or 1ZB.
    * @param error_value The value returned in case the regular expression did not match. Defaults to
@@ -36,13 +86,16 @@ export class FormatterService {
   toBytes(value: string, error_value: number = null): number | null {
     const base = 1024;
     const units = ['b', 'k', 'm', 'g', 't', 'p', 'e', 'z', 'y'];
-    const m = RegExp('^(\\d+(.\\d+)?) ?([' + units.join('') + ']?(b|ib|B/s)?)?$', 'i').exec(value);
-    if (m === null) {
+    const bytesRegexMatch = RegExp(
+      '^(\\d+(.\\d+)?) ?([' + units.join('') + ']?(b|ib|B/s|B/m|iB/m)?)?$',
+      'i'
+    ).exec(value);
+    if (bytesRegexMatch === null) {
       return error_value;
     }
-    let bytes = parseFloat(m[1]);
-    if (_.isString(m[3])) {
-      bytes = bytes * Math.pow(base, units.indexOf(m[3].toLowerCase()[0]));
+    let bytes = parseFloat(bytesRegexMatch[1]);
+    if (_.isString(bytesRegexMatch[3])) {
+      bytes = bytes * Math.pow(base, units.indexOf(bytesRegexMatch[3].toLowerCase()[0]));
     }
     return Math.round(bytes);
   }
@@ -73,5 +126,57 @@ export class FormatterService {
     }
 
     return 0;
+  }
+
+  toOctalPermission(modes: any) {
+    const scopes = ['owner', 'group', 'others'];
+    let octalMode = '';
+    for (const scope of scopes) {
+      let scopeValue = 0;
+      const mode = modes[scope];
+
+      if (mode) {
+        if (mode.includes('read')) scopeValue += 4;
+        if (mode.includes('write')) scopeValue += 2;
+        if (mode.includes('execute')) scopeValue += 1;
+      }
+
+      octalMode += scopeValue.toString();
+    }
+    return octalMode;
+  }
+  /**
+   * Validate the input maximum size as per regrex passed.
+   */
+  performValidation(
+    control: AbstractControl,
+    regex: string,
+    errorObject: object,
+    type?: string
+  ): ValidationErrors | null {
+    if (isEmptyInputValue(control.value)) {
+      return null;
+    }
+    const matchResult = RegExp(regex, 'i').exec(control.value);
+    if (matchResult === null) {
+      return errorObject;
+    }
+    if (type == 'quota') {
+      const bytes = new FormatterService().toBytes(control.value);
+      return bytes < 1024 ? errorObject : null;
+    }
+    return null;
+  }
+
+  iopmMaxSizeValidator(control: AbstractControl): ValidationErrors | null {
+    const pattern = /^\s*(\d+)$/i;
+    const testResult = pattern.exec(control.value);
+    if (isEmptyInputValue(control.value)) {
+      return null;
+    }
+    if (testResult == null) {
+      return { rateOpsMaxSize: true };
+    }
+    return control.value.toString()?.length > 18 ? { rateOpsMaxSize: true } : null;
   }
 }

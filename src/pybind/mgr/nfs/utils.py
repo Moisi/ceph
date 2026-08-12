@@ -1,7 +1,16 @@
+import functools
+import logging
+import stat
 from typing import List, Tuple, TYPE_CHECKING
 
 from object_format import ErrorResponseBase
 import orchestrator
+from orchestrator import NoOrchestrator
+import cephfs
+from mgr_util import CephfsClient, open_filesystem
+from mgr_module import NFS_POOL_NAME as POOL_NAME
+
+from rados import Rados, LIBRADOS_ALL_NSPACES, ObjectNotFound
 
 if TYPE_CHECKING:
     from nfs.module import Module
@@ -9,6 +18,8 @@ if TYPE_CHECKING:
 EXPORT_PREFIX: str = "export-"
 CONF_PREFIX: str = "conf-nfs."
 USER_CONF_PREFIX: str = "userconf-nfs."
+
+log = logging.getLogger(__name__)
 
 
 class NonFatalError(ErrorResponseBase):
@@ -59,12 +70,34 @@ def available_clusters(mgr: 'Module') -> List[str]:
     <ServiceDescription of <NFSServiceSpec for service_name=nfs.vstart>>
     return value: ['vstart']
     '''
-    # TODO check cephadm cluster list with rados pool conf objects
-    completion = mgr.describe_service(service_type='nfs')
+    try:
+        completion = mgr.describe_service(service_type='nfs')
+    except NoOrchestrator:
+        log.debug("No orchestrator configured")
+        return nfs_rados_configs(mgr.rados)
     orchestrator.raise_if_exception(completion)
     assert completion.result is not None
     return [cluster.spec.service_id for cluster in completion.result
             if cluster.spec.service_id]
+
+
+def nfs_rados_configs(rados: 'Rados', nfs_pool: str = POOL_NAME) -> List[str]:
+    """Return a list of all the namespaces in the nfs_pool where nfs
+    configuration objects are found. The namespaces also correspond
+    to the cluster ids.
+    """
+    ns: List[str] = []
+    prefixes = (EXPORT_PREFIX, CONF_PREFIX, USER_CONF_PREFIX)
+    try:
+        with rados.open_ioctx(nfs_pool) as ioctx:
+            ioctx.set_namespace(LIBRADOS_ALL_NSPACES)
+            for obj in ioctx.list_objects():
+                if obj.key.startswith(prefixes):
+                    ns.append(obj.nspace)
+    except ObjectNotFound:
+        log.debug("Failed to open pool %s", nfs_pool)
+    finally:
+        return ns
 
 
 def restart_nfs_service(mgr: 'Module', cluster_id: str) -> None:
@@ -82,3 +115,16 @@ def check_fs(mgr: 'Module', fs_name: str) -> bool:
     '''
     fs_map = mgr.get('fs_map')
     return fs_name in [fs['mdsmap']['fs_name'] for fs in fs_map['filesystems']]
+
+
+def cephfs_path_is_dir(mgr: 'Module', fs: str, path: str) -> None:
+    @functools.lru_cache(maxsize=1)
+    def _get_cephfs_client() -> CephfsClient:
+        return CephfsClient(mgr)
+    cephfs_client = _get_cephfs_client()
+
+    with open_filesystem(cephfs_client, fs) as fs_handle:
+        stx = fs_handle.statx(path.encode('utf-8'), cephfs.CEPH_STATX_MODE,
+                              cephfs.AT_SYMLINK_NOFOLLOW)
+        if not stat.S_ISDIR(stx.get('mode')):
+            raise NotADirectoryError()

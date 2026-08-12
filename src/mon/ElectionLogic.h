@@ -17,6 +17,7 @@
 #define CEPH_ELECTIONLOGIC_H
 
 #include <map>
+#include <memory>
 #include <set>
 #include "include/types.h"
 #include "ConnectionTracker.h"
@@ -82,6 +83,18 @@ public:
    * @returns true if we have participated, false otherwise
    */
   virtual bool ever_participated() const = 0;
+  /**
+   * Check if the monitor is the tiebreaker in a stretch cluster.
+   *
+   * @returns true if the Monitor is the tiebreaker, false otherwise.
+   */
+  virtual bool is_tiebreaker(int rank) const = 0;
+  /**
+   * Check if the Monitor is marked down in a stretch cluster.
+   *
+   * @returns true if the Monitor in a stretch cluster is marked down, false otherwise.
+   */
+  virtual bool is_stretch_marked_down_mons(int rank) const = 0;
   /**
    * Ask the ElectionOwner for the size of the Paxos set. This includes
    * those monitors which may not be in the current quorum!

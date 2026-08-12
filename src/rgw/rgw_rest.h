@@ -8,6 +8,7 @@
 #include <string_view>
 #include <boost/container/flat_set.hpp>
 #include "common/sstring.hh"
+#include "common/strtol.h"
 #include "common/ceph_json.h"
 #include "include/ceph_assert.h" /* needed because of common/ceph_json.h */
 #include "rgw_op.h"
@@ -317,6 +318,12 @@ public:
   ~RGWPutMetadataObject_ObjStore() override {}
 };
 
+class RGWRestoreObj_ObjStore : public RGWRestoreObj {
+public:
+  RGWRestoreObj_ObjStore() {}
+  ~RGWRestoreObj_ObjStore() override {}
+};
+
 class RGWDeleteObj_ObjStore : public RGWDeleteObj {
 public:
   RGWDeleteObj_ObjStore() {}
@@ -351,8 +358,18 @@ class RGWPutACLs_ObjStore : public RGWPutACLs {
 public:
   RGWPutACLs_ObjStore() {}
   ~RGWPutACLs_ObjStore() override {}
-
   int get_params(optional_yield y) override;
+};
+
+class RGWGetObjAttrs_ObjStore : public RGWGetObjAttrs {
+public:
+  RGWGetObjAttrs_ObjStore() {}
+  ~RGWGetObjAttrs_ObjStore() override {}
+
+  int get_params(optional_yield y) = 0;
+  /* not actually used */
+  int send_response_data_error(optional_yield y) override { return 0; };
+  int send_response_data(bufferlist& bl, off_t ofs, off_t len) override { return 0; };
 };
 
 class RGWGetLC_ObjStore : public RGWGetLC {
@@ -373,7 +390,6 @@ class RGWDeleteLC_ObjStore : public RGWDeleteLC {
 public:
   RGWDeleteLC_ObjStore() {}
   ~RGWDeleteLC_ObjStore() override {}
-
 };
 
 class RGWGetCORS_ObjStore : public RGWGetCORS {
@@ -418,6 +434,12 @@ public:
   ~RGWDeleteBucketEncryption_ObjStore() override {}
 };
 
+class RGWGetBucketOwnershipControls_ObjStore : public RGWGetBucketOwnershipControls {};
+
+class RGWPutBucketOwnershipControls_ObjStore : public RGWPutBucketOwnershipControls {};
+
+class RGWDeleteBucketOwnershipControls_ObjStore : public RGWDeleteBucketOwnershipControls {};
+
 class RGWInitMultipart_ObjStore : public RGWInitMultipart {
 public:
   RGWInitMultipart_ObjStore() {}
@@ -428,7 +450,6 @@ class RGWCompleteMultipart_ObjStore : public RGWCompleteMultipart {
 public:
   RGWCompleteMultipart_ObjStore() {}
   ~RGWCompleteMultipart_ObjStore() override {}
-
   int get_params(optional_yield y) override;
 };
 
@@ -442,7 +463,6 @@ class RGWListMultipart_ObjStore : public RGWListMultipart {
 public:
   RGWListMultipart_ObjStore() {}
   ~RGWListMultipart_ObjStore() override {}
-
   int get_params(optional_yield y) override;
 };
 
@@ -450,7 +470,6 @@ class RGWListBucketMultiparts_ObjStore : public RGWListBucketMultiparts {
 public:
   RGWListBucketMultiparts_ObjStore() {}
   ~RGWListBucketMultiparts_ObjStore() override {}
-
   int get_params(optional_yield y) override;
 };
 
@@ -704,8 +723,20 @@ extern void end_header(req_state *s,
 		       bool force_no_error = false);
 extern void dump_start(req_state *s);
 extern void list_all_buckets_start(req_state *s);
-extern void dump_owner(req_state *s, const rgw_user& id,
+extern void dump_owner(req_state *s, const std::string& id,
                        const std::string& name, const char *section = NULL);
+extern void dump_owner(req_state *s, const rgw_owner& id,
+                       const std::string& name, const char *section = NULL);
+inline void dump_urlsafe(req_state *s, bool encode_key, const char* key, const std::string& val, bool encode_slash = true) {
+  if (encode_key) {
+    std::string _val;
+    url_encode(val, _val, encode_slash);
+    s->formatter->dump_string(key, _val);
+  }
+  else {
+    s->formatter->dump_string(key, val);
+  }
+}
 extern void dump_header(req_state* s,
                         const std::string_view& name,
                         const std::string_view& val);
@@ -772,12 +803,28 @@ inline void dump_header_if_nonempty(req_state* s,
   }
 }
 
+static inline int64_t parse_content_length(const char *content_length)
+{
+  int64_t len = -1;
+
+  if (*content_length == '\0') {
+    len = 0;
+  } else {
+    std::string err;
+    len = strict_strtoll(content_length, 10, &err);
+    if (!err.empty()) {
+      len = -1;
+    }
+  }
+
+  return len;
+} /* parse_content_length */
+
 inline std::string compute_domain_uri(const req_state *s) {
   std::string uri = (!s->info.domain.empty()) ? s->info.domain :
     [&s]() -> std::string {
     RGWEnv const &env(*(s->info.env));
-    std::string uri =
-    env.get("SERVER_PORT_SECURE") ? "https://" : "http://";
+    std::string uri = rgw_transport_is_secure(s->cct, env) ? "https://" : "http://";
     if (env.exists("SERVER_NAME")) {
       uri.append(env.get("SERVER_NAME", "<SERVER_NAME>"));
     } else {
@@ -789,7 +836,6 @@ inline std::string compute_domain_uri(const req_state *s) {
 }
 
 extern void dump_content_length(req_state *s, uint64_t len);
-extern int64_t parse_content_length(const char *content_length);
 extern void dump_etag(req_state *s,
                       const std::string_view& etag,
                       bool quoted = false);
@@ -803,6 +849,7 @@ extern void dump_range(req_state* s, uint64_t ofs, uint64_t end,
 extern void dump_continue(req_state *s);
 extern void list_all_buckets_end(req_state *s);
 extern void dump_time(req_state *s, const char *name, real_time t);
+extern void dump_time_exact_seconds(req_state *s, const char *name, real_time t);
 extern std::string dump_time_to_str(const real_time& t);
 extern void dump_bucket_from_state(req_state *s);
 extern void dump_redirect(req_state *s, const std::string& redirect);

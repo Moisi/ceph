@@ -5,17 +5,18 @@ import { BrowserAnimationsModule } from '@angular/platform-browser/animations';
 import { NgbNavModule } from '@ng-bootstrap/ng-bootstrap';
 
 import { SharedModule } from '~/app/shared/shared.module';
-import { configureTestBed, TabHelper } from '~/testing/unit-test-helper';
-import { RgwUserS3Key } from '../models/rgw-user-s3-key';
+import { configureTestBed } from '~/testing/unit-test-helper';
 import { RgwUserDetailsComponent } from './rgw-user-details.component';
+import { ModalService } from 'carbon-components-angular';
 
 describe('RgwUserDetailsComponent', () => {
   let component: RgwUserDetailsComponent;
   let fixture: ComponentFixture<RgwUserDetailsComponent>;
-
+  let modalRef: any;
   configureTestBed({
     declarations: [RgwUserDetailsComponent],
-    imports: [BrowserAnimationsModule, HttpClientTestingModule, SharedModule, NgbNavModule]
+    imports: [BrowserAnimationsModule, HttpClientTestingModule, SharedModule, NgbNavModule],
+    provider: [ModalService]
   });
 
   beforeEach(() => {
@@ -27,45 +28,21 @@ describe('RgwUserDetailsComponent', () => {
 
   it('should create', () => {
     expect(component).toBeTruthy();
-
-    const tabs = TabHelper.getTextContents(fixture);
-    expect(tabs).toContain('Details');
-    expect(tabs).not.toContain('Keys');
-  });
-
-  it('should show "Details" tab', () => {
-    component.selection = { uid: 'myUsername' };
-    fixture.detectChanges();
-
-    const tabs = TabHelper.getTextContents(fixture);
-    expect(tabs).toContain('Details');
-    expect(tabs).not.toContain('Keys');
-  });
-
-  it('should show "Keys" tab', () => {
-    const s3Key = new RgwUserS3Key();
-    component.selection = { keys: [s3Key] };
-    component.ngOnChanges();
-    fixture.detectChanges();
-
-    const tabs = TabHelper.getTextContents(fixture);
-    expect(tabs).toContain('Details');
-    expect(tabs).toContain('Keys');
   });
 
   it('should show correct "System" info', () => {
-    component.selection = { uid: '', email: '', system: 'true', keys: [], swift_keys: [] };
+    component.selection = { uid: '', email: '', system: true, keys: [], swift_keys: [] };
 
     component.ngOnChanges();
     fixture.detectChanges();
 
     const detailsTab = fixture.debugElement.nativeElement.querySelectorAll(
-      '.table.table-striped.table-bordered tr td'
+      '.cds--data-table--sort.cds--data-table--no-border tr td'
     );
-    expect(detailsTab[10].textContent).toEqual('System');
+    expect(detailsTab[10].textContent).toEqual('System user');
     expect(detailsTab[11].textContent).toEqual('Yes');
 
-    component.selection.system = 'false';
+    component.selection.system = false;
     component.ngOnChanges();
     fixture.detectChanges();
 
@@ -79,16 +56,58 @@ describe('RgwUserDetailsComponent', () => {
       system: 'true',
       keys: [],
       swift_keys: [],
-      mfa_ids: ['testMFA1', 'testMFA2']
+      mfa_ids: ['testMFA1', 'testMFA2'],
+      type: 'rgw',
+      account: { id: 'RGW12345678901234567' }
     };
 
     component.ngOnChanges();
     fixture.detectChanges();
 
     const detailsTab = fixture.debugElement.nativeElement.querySelectorAll(
-      '.table.table-striped.table-bordered tr td'
+      '.cds--data-table--sort.cds--data-table--no-border tr td'
     );
-    expect(detailsTab[14].textContent).toEqual('MFAs(Id)');
-    expect(detailsTab[15].textContent).toEqual('testMFA1, testMFA2');
+    expect(detailsTab[16].textContent).toEqual('MFAs(Id)');
+    expect(detailsTab[17].textContent).toEqual('testMFA1, testMFA2');
+  });
+  it('should test updateKeysSelection', () => {
+    component.selection = {
+      hasMultiSelection: false,
+      hasSelection: false,
+      hasSingleSelection: false,
+      _selected: []
+    };
+    component.updateKeysSelection(component.selection);
+    expect(component.keysSelection).toEqual(component.selection);
+  });
+  it('should call showKeyModal when key selection is of type S3', () => {
+    component.keysSelection.first = () => {
+      return { type: 'S3', ref: { user: '', access_key: '', secret_key: '' } };
+    };
+    const modalShowSpy = spyOn(component['cdsModalService'], 'show').and.callFake(() => {
+      modalRef = {
+        setValues: jest.fn(),
+        setViewing: jest.fn()
+      };
+      return modalRef;
+    });
+    component.showKeyModal();
+    expect(modalShowSpy).toHaveBeenCalled();
+    // expect(s).toHaveBeenCalledWith( modalRef.componentInstance.setViewing);
+  });
+  it('should call showKeyModal when key selection is of type Swift', () => {
+    component.keysSelection.first = () => {
+      return { type: 'Swift', ref: { user: '', access_key: '', secret_key: '' } };
+    };
+    const modalShowSpy = spyOn(component['cdsModalService'], 'show').and.callFake(() => {
+      modalRef = {
+        setValues: jest.fn(),
+        setViewing: jest.fn()
+      };
+      return modalRef;
+    });
+    component.showKeyModal();
+    expect(modalShowSpy).toHaveBeenCalled();
+    // expect(s).toHaveBeenCalledWith( modalRef.componentInstance.setViewing);
   });
 });

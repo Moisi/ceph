@@ -17,8 +17,6 @@
 
 #include <boost/system/error_code.hpp>
 
-#include "include/rados.h"
-
 const boost::system::error_category& osdc_category() noexcept;
 
 enum class osdc_errc {
@@ -30,7 +28,8 @@ enum class osdc_errc {
   snapshot_exists,
   snapshot_dne,
   timed_out,
-  pool_eio
+  pool_eio,
+  handler_failed
 };
 
 namespace boost::system {

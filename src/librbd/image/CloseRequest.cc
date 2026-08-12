@@ -17,6 +17,8 @@
 #include "librbd/io/ImageDispatchSpec.h"
 #include "librbd/io/ObjectDispatcherInterface.h"
 
+#include <shared_mutex> // for std::shared_lock
+
 #define dout_subsys ceph_subsys_rbd
 #undef dout_prefix
 #define dout_prefix *_dout << "librbd::image::CloseRequest: "
@@ -307,6 +309,11 @@ void CloseRequest<I>::handle_close_parent(int r) {
   ldout(cct, 10) << this << " " << __func__ << ": r=" << r << dendl;
 
   m_image_ctx->parent = nullptr;
+  if (m_image_ctx->parent_rados != nullptr) {
+    delete m_image_ctx->parent_rados;
+    m_image_ctx->parent_rados = nullptr;
+  }
+
   save_result(r);
   if (r < 0) {
     lderr(cct) << "error closing parent image: " << cpp_strerror(r) << dendl;

@@ -13,8 +13,26 @@
 #ifndef COHORT_LRU_H
 #define COHORT_LRU_H
 
+#include <algorithm>
+#include <atomic>
+#include <cstdint>
+#include <functional>
+#include <mutex>
+
 #include <boost/intrusive/list.hpp>
 #include <boost/intrusive/slist.hpp>
+#include <cstdint>
+#include <atomic>
+#include <mutex>
+#include <algorithm>
+#include <functional>
+#include <vector>
+
+#ifdef __CEPH__
+# include "include/ceph_assert.h"
+#else
+# include <assert.h>
+#endif
 
 #include "common/likely.h"
 

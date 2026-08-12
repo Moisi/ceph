@@ -16,10 +16,21 @@
 
 #include <string.h>
 #include "common/ceph_context.h"
-#if defined(WITH_SEASTAR) && !defined(WITH_ALIEN)
+#ifdef WITH_CRIMSON
 #include "crimson/common/config_proxy.h"
 #endif
 
+#ifdef WITH_CRIMSON
+namespace ceph::global {
+int __attribute__((weak)) g_conf_set_val(const std::string& key, const std::string& s) {
+  return 0;
+}
+
+int __attribute__((weak)) g_conf_rm_val(const std::string& key) {
+  return 0;
+}
+}
+#endif
 
 /*
  * Global variables for use from process context.
@@ -27,12 +38,30 @@
 namespace TOPNSPC::global {
 CephContext *g_ceph_context = NULL;
 ConfigProxy& g_conf() {
-#if defined(WITH_SEASTAR) && !defined(WITH_ALIEN)
+#ifdef WITH_CRIMSON
   return crimson::common::local_conf();
 #else
   return g_ceph_context->_conf;
 #endif
 }
+
+#ifndef WITH_CRIMSON
+int g_conf_set_val(const std::string& key, const std::string& s)
+{
+  if (g_ceph_context != NULL)
+    return g_ceph_context->_conf.set_val(key, s);
+
+  return 0;
+}
+
+int g_conf_rm_val(const std::string& key)
+{
+  if (g_ceph_context != NULL)
+    return g_ceph_context->_conf.rm_val(key);
+
+  return 0;
+}
+#endif
 
 const char *g_assert_file = 0;
 int g_assert_line = 0;

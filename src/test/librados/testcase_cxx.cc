@@ -3,9 +3,14 @@
 
 #include "testcase_cxx.h"
 
+#include <chrono>
+#include <thread>
+
 #include <errno.h>
+#include <fmt/format.h>
 #include "test_cxx.h"
 #include "test_shared.h"
+#include "crimson_utils.h"
 #include "include/scope_guard.h"
 
 using namespace librados;
@@ -29,7 +34,8 @@ Rados RadosTestPPNS::s_cluster;
 
 void RadosTestPPNS::SetUpTestCase()
 {
-  pool_name = get_temp_pool_name();
+  auto pool_prefix = fmt::format("{}_", ::testing::UnitTest::GetInstance()->current_test_case()->name());
+  pool_name = get_temp_pool_name(pool_prefix);
   ASSERT_EQ("", create_one_pool_pp(pool_name, s_cluster));
 }
 
@@ -72,7 +78,8 @@ Rados RadosTestParamPPNS::s_cluster;
 
 void RadosTestParamPPNS::SetUpTestCase()
 {
-  pool_name = get_temp_pool_name();
+  auto pool_prefix = fmt::format("{}_", ::testing::UnitTest::GetInstance()->current_test_case()->name());
+  pool_name = get_temp_pool_name(pool_prefix);
   ASSERT_EQ("", create_one_pool_pp(pool_name, s_cluster));
 }
 
@@ -100,7 +107,9 @@ void RadosTestParamPPNS::TearDownTestCase()
 
 void RadosTestParamPPNS::SetUp()
 {
-  if (strcmp(GetParam(), "cache") == 0 && cache_pool_name.empty()) {
+  if (!is_crimson_cluster() && strcmp(GetParam(), "cache") == 0 &&
+      cache_pool_name.empty()) {
+    auto pool_prefix = fmt::format("{}_", ::testing::UnitTest::GetInstance()->current_test_case()->name());
     cache_pool_name = get_temp_pool_name();
     bufferlist inbl;
     ASSERT_EQ(0, cluster.mon_command(
@@ -154,7 +163,8 @@ Rados RadosTestECPPNS::s_cluster;
 
 void RadosTestECPPNS::SetUpTestCase()
 {
-  pool_name = get_temp_pool_name();
+  auto pool_prefix = fmt::format("{}_", ::testing::UnitTest::GetInstance()->current_test_case()->name());
+  pool_name = get_temp_pool_name(pool_prefix);
   ASSERT_EQ("", create_one_ec_pool_pp(pool_name, s_cluster));
 }
 
@@ -186,8 +196,8 @@ Rados RadosTestPP::s_cluster;
 void RadosTestPP::SetUpTestCase()
 {
   init_rand();
-
-  pool_name = get_temp_pool_name();
+  auto pool_prefix = fmt::format("{}_", ::testing::UnitTest::GetInstance()->current_test_case()->name());
+  pool_name = get_temp_pool_name(pool_prefix);
   ASSERT_EQ("", create_one_pool_pp(pool_name, s_cluster));
 }
 
@@ -268,7 +278,8 @@ Rados RadosTestParamPP::s_cluster;
 
 void RadosTestParamPP::SetUpTestCase()
 {
-  pool_name = get_temp_pool_name();
+  auto pool_prefix = fmt::format("{}_", ::testing::UnitTest::GetInstance()->current_test_case()->name());
+  pool_name = get_temp_pool_name(pool_prefix);
   ASSERT_EQ("", create_one_pool_pp(pool_name, s_cluster));
 }
 
@@ -296,7 +307,9 @@ void RadosTestParamPP::TearDownTestCase()
 
 void RadosTestParamPP::SetUp()
 {
-  if (strcmp(GetParam(), "cache") == 0 && cache_pool_name.empty()) {
+  if (!is_crimson_cluster() && strcmp(GetParam(), "cache") == 0 &&
+      cache_pool_name.empty()) {
+    auto pool_prefix = fmt::format("{}_", ::testing::UnitTest::GetInstance()->current_test_case()->name());
     cache_pool_name = get_temp_pool_name();
     bufferlist inbl;
     ASSERT_EQ(0, cluster.mon_command(
@@ -359,17 +372,21 @@ Rados RadosTestECPP::s_cluster;
 
 void RadosTestECPP::SetUpTestCase()
 {
-  pool_name = get_temp_pool_name();
+  SKIP_IF_CRIMSON();
+  auto pool_prefix = fmt::format("{}_", ::testing::UnitTest::GetInstance()->current_test_case()->name());
+  pool_name = get_temp_pool_name(pool_prefix);
   ASSERT_EQ("", create_one_ec_pool_pp(pool_name, s_cluster));
 }
 
 void RadosTestECPP::TearDownTestCase()
 {
+  SKIP_IF_CRIMSON();
   ASSERT_EQ(0, destroy_one_ec_pool_pp(pool_name, s_cluster));
 }
 
 void RadosTestECPP::SetUp()
 {
+  SKIP_IF_CRIMSON();
   ASSERT_EQ(0, cluster.ioctx_create(pool_name.c_str(), ioctx));
   nspace = get_temp_pool_name();
   ioctx.set_namespace(nspace);
@@ -382,10 +399,37 @@ void RadosTestECPP::SetUp()
 
 void RadosTestECPP::TearDown()
 {
+  SKIP_IF_CRIMSON();
   if (cleanup) {
     cleanup_default_namespace(ioctx);
     cleanup_namespace(ioctx, nspace);
   }
+  if (ec_overwrites_set) {
+    ASSERT_EQ(0, destroy_one_ec_pool_pp(pool_name, s_cluster));
+    ASSERT_EQ("", create_one_ec_pool_pp(pool_name, s_cluster));
+    ec_overwrites_set = false;
+  }
   ioctx.close();
 }
 
+void RadosTestECPP::set_allow_ec_overwrites()
+{
+  ec_overwrites_set = true;
+  ASSERT_EQ("", set_allow_ec_overwrites_pp(pool_name, cluster, true));
+
+  char buf[128];
+  memset(buf, 0xcc, sizeof(buf));
+  bufferlist bl;
+  bl.append(buf, sizeof(buf));
+
+  const std::string objname = "RadosTestECPP::set_allow_ec_overwrites:test_obj";
+  ASSERT_EQ(0, ioctx.write(objname, bl, sizeof(buf), 0));
+  const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(120);
+  while (true) {
+    if (0 == ioctx.write(objname, bl, sizeof(buf), 0)) {
+      break;
+    }
+    ASSERT_LT(std::chrono::steady_clock::now(), end);
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+  }
+}

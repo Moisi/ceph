@@ -23,6 +23,7 @@
 #include <string>
 #include <fmt/format.h>
 
+#include "include/encoding.h"
 #include "include/types.h"
 #include "common/Formatter.h"
 
@@ -88,6 +89,18 @@ struct rgw_pool {
     }
 
     DECODE_FINISH(bl);
+  }
+
+  void dump(ceph::Formatter *f) const {
+    f->dump_string("name", name);
+    f->dump_string("ns", ns);
+  }
+
+  static std::list<rgw_pool> generate_test_instances() {
+    std::list<rgw_pool> o;
+    o.emplace_back();
+    o.push_back(rgw_pool("pool", "ns"));
+    return o;
   }
 
   rgw_pool& operator=(const rgw_pool&) = default;

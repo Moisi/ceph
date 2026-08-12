@@ -200,7 +200,7 @@ if [ $stop_all -eq 1 ]; then
     fi
 
     # killing processes
-    to_kill="$ceph_osd ceph-mon ceph-mds ceph-mgr radosgw lt-radosgw apache2 ganesha.nfsd cephfs-top"
+    to_kill="$ceph_osd ceph-mon ceph-mds ceph-mgr radosgw lt-radosgw apache2 ganesha.nfsd cephfs-top cephfs-mirror rbd-mirror"
     since_kill=0
     for step in 0 1 1 2 3 5 8; do
         sleep $step
@@ -233,4 +233,9 @@ else
     [ $stop_ganesha -eq 1 ] && do_killall ganesha.nfsd
     [ $stop_rgw -eq 1 ] && do_killall radosgw lt-radosgw apache2
     [ $stop_cephadm -eq 1 ] && do_killcephadm
+fi
+
+# Check whether the --crimson-balance-cpu option was used, if so remove any auxiliary files left:
+if [ "$ceph_osd" == "crimson-osd" ] && [ -f /tmp/numa_args_*.out ]; then
+    rm -f /tmp/numa_args_*.out
 fi

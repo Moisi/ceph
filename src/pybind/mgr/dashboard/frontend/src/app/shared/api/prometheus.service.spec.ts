@@ -29,8 +29,8 @@ describe('PrometheusService', () => {
   });
 
   it('should get alerts', () => {
-    service.getAlerts().subscribe();
-    const req = httpTesting.expectOne('api/prometheus');
+    service.getGroupedAlerts().subscribe();
+    const req = httpTesting.expectOne('api/prometheus/alertgroup?cluster_filter=false');
     expect(req.request.method).toBe('GET');
   });
 
@@ -168,7 +168,7 @@ describe('PrometheusService', () => {
     let host: string;
 
     const receiveConfig = () => {
-      const req = httpTesting.expectOne('api/settings/alertmanager-api-host');
+      const req = httpTesting.expectOne('ui-api/prometheus/alertmanager-api-host');
       expect(req.request.method).toBe('GET');
       req.flush({ value: host });
     };
@@ -209,7 +209,7 @@ describe('PrometheusService', () => {
     let host: string;
 
     const receiveConfig = () => {
-      const req = httpTesting.expectOne('api/settings/prometheus-api-host');
+      const req = httpTesting.expectOne('ui-api/prometheus/prometheus-api-host');
       expect(req.request.method).toBe('GET');
       req.flush({ value: host });
     };

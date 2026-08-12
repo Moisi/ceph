@@ -7,6 +7,7 @@
 #include "include/neorados/RADOS.hpp"
 
 #include "common/ceph_context.h"
+#include "common/Clock.h" // for ceph_clock_now()
 #include "common/dout.h"
 #include "common/errno.h"
 #include "common/perf_counters.h"
@@ -30,6 +31,7 @@
 #include "librbd/exclusive_lock/AutomaticPolicy.h"
 #include "librbd/exclusive_lock/StandardPolicy.h"
 #include "librbd/crypto/EncryptionFormat.h"
+#include "librbd/crypto/CryptoInterface.h"
 #include "librbd/io/AioCompletion.h"
 #include "librbd/io/AsyncOperation.h"
 #include "librbd/io/ImageDispatcher.h"
@@ -42,6 +44,8 @@
 
 #include "osdc/Striper.h"
 #include <boost/algorithm/string/predicate.hpp>
+
+#include <shared_mutex> // for std::shared_lock
 
 #define dout_subsys ceph_subsys_rbd
 #undef dout_prefix
@@ -111,7 +115,7 @@ librados::IoCtx duplicate_io_ctx(librados::IoCtx& io_ctx) {
       old_format(false),
       order(0), size(0), features(0),
       format_string(NULL),
-      id(image_id), parent(NULL),
+      id(image_id),
       stripe_unit(0), stripe_count(0), flags(0),
       readahead(),
       total_bytes_read(0),
@@ -156,6 +160,8 @@ librados::IoCtx duplicate_io_ctx(librados::IoCtx& io_ctx) {
   ImageCtx::~ImageCtx() {
     ldout(cct, 10) << this << " " << __func__ << dendl;
 
+    ceph_assert(parent == nullptr);
+    ceph_assert(parent_rados == nullptr);
     ceph_assert(config_watcher == nullptr);
     ceph_assert(image_watcher == NULL);
     ceph_assert(exclusive_lock == NULL);
@@ -733,18 +739,7 @@ librados::IoCtx duplicate_io_ctx(librados::IoCtx& io_ctx) {
 
     auto overlap = reduce_parent_overlap(raw_overlap, migration_write);
     if (area == overlap.second) {
-      // drop extents completely beyond the overlap
-      while (!image_extents.empty() &&
-             image_extents.back().first >= overlap.first) {
-        image_extents.pop_back();
-      }
-      if (!image_extents.empty()) {
-        // trim final overlapping extent
-        auto& last_extent = image_extents.back();
-        if (last_extent.first + last_extent.second > overlap.first) {
-          last_extent.second = overlap.first - last_extent.first;
-        }
-      }
+      io::util::prune_extents(image_extents, overlap.first);
     } else if (area == io::ImageArea::DATA &&
                overlap.second == io::ImageArea::CRYPTO_HEADER) {
       // all extents completely beyond the overlap
@@ -945,6 +940,13 @@ librados::IoCtx duplicate_io_ctx(librados::IoCtx& io_ctx) {
     return new Journal<ImageCtx>(*this);
   }
 
+  uint64_t ImageCtx::get_data_offset() const {
+    if (encryption_format != nullptr) {
+      return encryption_format->get_crypto()->get_data_offset();
+    }
+    return 0;
+  }
+
   void ImageCtx::set_image_name(const std::string &image_name) {
     // update the name so rename can be invoked repeatedly
     std::shared_lock owner_locker{owner_lock};
@@ -995,22 +997,30 @@ librados::IoCtx duplicate_io_ctx(librados::IoCtx& io_ctx) {
     auto ctx = std::make_shared<neorados::IOContext>(
       data_ctx.get_id(), data_ctx.get_namespace());
     if (snap_id != CEPH_NOSNAP) {
-      ctx->read_snap(snap_id);
+      ctx->set_read_snap(snap_id);
     }
     if (!snapc.snaps.empty()) {
-      ctx->write_snap_context(
+      ctx->set_write_snap_context(
         {{snapc.seq, {snapc.snaps.begin(), snapc.snaps.end()}}});
     }
     if (data_ctx.get_pool_full_try()) {
-      ctx->full_try(true);
+      ctx->set_full_try(true);
     }
 
     // atomically reset the data IOContext to new version
+#ifdef __cpp_lib_atomic_shared_ptr
+    data_io_context.store(ctx);
+#else
     atomic_store(&data_io_context, ctx);
+#endif
   }
 
   IOContext ImageCtx::get_data_io_context() const {
+#ifdef __cpp_lib_atomic_shared_ptr
+    return data_io_context.load();
+#else
     return atomic_load(&data_io_context);
+#endif
   }
 
   IOContext ImageCtx::duplicate_data_io_context() const {

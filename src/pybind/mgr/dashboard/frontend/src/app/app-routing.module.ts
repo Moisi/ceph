@@ -26,7 +26,6 @@ import { ServicesComponent } from './ceph/cluster/services/services.component';
 import { TelemetryComponent } from './ceph/cluster/telemetry/telemetry.component';
 import { DashboardComponent } from './ceph/dashboard/dashboard/dashboard.component';
 import { NfsFormComponent } from './ceph/nfs/nfs-form/nfs-form.component';
-import { NfsListComponent } from './ceph/nfs/nfs-list/nfs-list.component';
 import { PerformanceCounterComponent } from './ceph/performance-counter/performance-counter/performance-counter.component';
 import { LoginPasswordFormComponent } from './core/auth/login-password-form/login-password-form.component';
 import { LoginComponent } from './core/auth/login/login.component';
@@ -37,7 +36,7 @@ import { LoginLayoutComponent } from './core/layouts/login-layout/login-layout.c
 import { WorkbenchLayoutComponent } from './core/layouts/workbench-layout/workbench-layout.component';
 import { ApiDocsComponent } from './core/navigation/api-docs/api-docs.component';
 import { ActionLabels, URLVerbs } from './shared/constants/app.constants';
-import { CrudFormComponent } from './shared/datatable/crud-table/crud-form/crud-form.component';
+import { CrudFormComponent } from './shared/forms/crud-form/crud-form.component';
 import { CRUDTableComponent } from './shared/datatable/crud-table/crud-table.component';
 import { BreadcrumbsResolver, IBreadcrumb } from './shared/models/breadcrumbs';
 import { AuthGuardService } from './shared/services/auth-guard.service';
@@ -45,6 +44,21 @@ import { ChangePasswordGuardService } from './shared/services/change-password-gu
 import { FeatureTogglesGuardService } from './shared/services/feature-toggles-guard.service';
 import { ModuleStatusGuardService } from './shared/services/module-status-guard.service';
 import { NoSsoGuardService } from './shared/services/no-sso-guard.service';
+import { UpgradeComponent } from './ceph/cluster/upgrade/upgrade.component';
+import { CephfsVolumeFormComponent } from './ceph/cephfs/cephfs-form/cephfs-form.component';
+import { UpgradeProgressComponent } from './ceph/cluster/upgrade/upgrade-progress/upgrade-progress.component';
+import { MultiClusterComponent } from './ceph/cluster/multi-cluster/multi-cluster.component';
+import { MultiClusterListComponent } from './ceph/cluster/multi-cluster/multi-cluster-list/multi-cluster-list.component';
+import { MultiClusterDetailsComponent } from './ceph/cluster/multi-cluster/multi-cluster-details/multi-cluster-details.component';
+import { SmbClusterFormComponent } from './ceph/smb/smb-cluster-form/smb-cluster-form.component';
+import { SmbShareFormComponent } from './ceph/smb/smb-share-form/smb-share-form.component';
+import { SmbJoinAuthFormComponent } from './ceph/smb/smb-join-auth-form/smb-join-auth-form.component';
+import { SmbUsersgroupsFormComponent } from './ceph/smb/smb-usersgroups-form/smb-usersgroups-form.component';
+import { NfsClusterComponent } from './ceph/nfs/nfs-cluster/nfs-cluster.component';
+import { SmbClusterListComponent } from './ceph/smb/smb-cluster-list/smb-cluster-list.component';
+import { SmbJoinAuthListComponent } from './ceph/smb/smb-join-auth-list/smb-join-auth-list.component';
+import { SmbUsersgroupsListComponent } from './ceph/smb/smb-usersgroups-list/smb-usersgroups-list.component';
+import { SmbOverviewComponent } from './ceph/smb/smb-overview/smb-overview.component';
 
 @Injectable()
 export class PerformanceCounterBreadcrumbsResolver extends BreadcrumbsResolver {
@@ -102,7 +116,7 @@ const routes: Routes = [
             redirectTo: 'dashboard',
             backend: 'cephadm'
           },
-          breadcrumbs: 'Expand Cluster'
+          breadcrumbs: 'Cluster/Expand Cluster'
         }
       },
       {
@@ -121,7 +135,7 @@ const routes: Routes = [
         path: 'ceph-users',
         component: CRUDTableComponent,
         data: {
-          breadcrumbs: 'Cluster/Users',
+          breadcrumbs: 'Administration/Ceph Users',
           resource: 'api.cluster.user@1.0'
         }
       },
@@ -129,7 +143,23 @@ const routes: Routes = [
         path: 'cluster/user/create',
         component: CrudFormComponent,
         data: {
-          breadcrumbs: 'Cluster/Users',
+          breadcrumbs: 'Administration/Ceph Users/Create',
+          resource: 'api.cluster.user@1.0'
+        }
+      },
+      {
+        path: 'cluster/user/import',
+        component: CrudFormComponent,
+        data: {
+          breadcrumbs: 'Administration/Ceph Users/Import',
+          resource: 'api.cluster.user@1.0'
+        }
+      },
+      {
+        path: 'cluster/user/edit',
+        component: CrudFormComponent,
+        data: {
+          breadcrumbs: 'Administration/Ceph Users/Edit',
           resource: 'api.cluster.user@1.0'
         }
       },
@@ -150,7 +180,7 @@ const routes: Routes = [
             section_info: 'Orchestrator',
             header: 'Orchestrator is not available'
           },
-          breadcrumbs: 'Cluster/Services'
+          breadcrumbs: 'Administration/Services'
         },
         children: [
           {
@@ -159,9 +189,36 @@ const routes: Routes = [
             outlet: 'modal'
           },
           {
+            path: `${URLVerbs.CREATE}/:type`,
+            component: ServiceFormComponent,
+            outlet: 'modal'
+          },
+          {
             path: `${URLVerbs.EDIT}/:type/:name`,
             component: ServiceFormComponent,
             outlet: 'modal'
+          }
+        ]
+      },
+      {
+        path: 'multi-cluster',
+        children: [
+          {
+            path: 'overview',
+            component: MultiClusterComponent
+          },
+          {
+            path: 'manage-clusters',
+            component: MultiClusterListComponent,
+            data: {
+              breadcrumbs: 'Multi-Cluster/Manage Clusters'
+            },
+            children: [
+              {
+                path: 'performance-details',
+                component: MultiClusterDetailsComponent
+              }
+            ]
           }
         ]
       },
@@ -194,7 +251,7 @@ const routes: Routes = [
       },
       {
         path: 'configuration',
-        data: { breadcrumbs: 'Cluster/Configuration' },
+        data: { breadcrumbs: 'Administration/Configuration' },
         children: [
           { path: '', component: ConfigurationComponent },
           {
@@ -212,7 +269,7 @@ const routes: Routes = [
       {
         path: 'logs',
         component: LogsComponent,
-        data: { breadcrumbs: 'Cluster/Logs' }
+        data: { breadcrumbs: 'Observability/Logs' }
       },
       {
         path: 'telemetry',
@@ -221,7 +278,7 @@ const routes: Routes = [
       },
       {
         path: 'monitoring',
-        data: { breadcrumbs: 'Cluster/Monitoring' },
+        data: { breadcrumbs: 'Observability/Alerts' },
         children: [
           { path: '', redirectTo: 'active-alerts', pathMatch: 'full' },
           {
@@ -267,6 +324,32 @@ const routes: Routes = [
         ]
       },
       {
+        path: 'upgrade',
+        canActivate: [ModuleStatusGuardService],
+        data: {
+          moduleStatusGuardConfig: {
+            uiApiPath: 'orchestrator',
+            redirectTo: 'error',
+            backend: 'cephadm',
+            section: 'orch',
+            section_info: 'Orchestrator',
+            header: 'Orchestrator is not available'
+          },
+          breadcrumbs: 'Administration/Upgrade'
+        },
+        children: [
+          {
+            path: '',
+            component: UpgradeComponent
+          },
+          {
+            path: 'progress',
+            component: UpgradeProgressComponent,
+            data: { breadcrumbs: 'Progress' }
+          }
+        ]
+      },
+      {
         path: 'perf_counters/:type/:id',
         component: PerformanceCounterComponent,
         data: {
@@ -276,7 +359,7 @@ const routes: Routes = [
       // Mgr modules
       {
         path: 'mgr-modules',
-        data: { breadcrumbs: 'Cluster/Manager Modules' },
+        data: { breadcrumbs: 'Administrator/Manager Modules' },
         children: [
           {
             path: '',
@@ -294,7 +377,7 @@ const routes: Routes = [
       // Pools
       {
         path: 'pool',
-        data: { breadcrumbs: 'Pools' },
+        data: { breadcrumbs: 'Cluster/Pools' },
         loadChildren: () => import('./ceph/pool/pool.module').then((m) => m.RoutedPoolModule)
       },
       // Block
@@ -306,14 +389,143 @@ const routes: Routes = [
       // File Systems
       {
         path: 'cephfs',
-        component: CephfsListComponent,
         canActivate: [FeatureTogglesGuardService],
-        data: { breadcrumbs: 'File Systems' }
+        children: [
+          {
+            path: 'fs',
+            component: CephfsListComponent,
+            data: { breadcrumbs: 'File/File Systems' }
+          },
+          {
+            path: `fs/${URLVerbs.CREATE}`,
+            component: CephfsVolumeFormComponent,
+            data: { breadcrumbs: ActionLabels.CREATE }
+          },
+          {
+            path: `fs/${URLVerbs.EDIT}/:id`,
+            component: CephfsVolumeFormComponent,
+            data: { breadcrumbs: ActionLabels.EDIT }
+          },
+          {
+            path: 'nfs',
+            canActivateChild: [FeatureTogglesGuardService, ModuleStatusGuardService],
+            data: {
+              moduleStatusGuardConfig: {
+                uiApiPath: 'nfs-ganesha',
+                redirectTo: 'error',
+                section: 'nfs-ganesha',
+                section_info: 'NFS GANESHA',
+                header: 'NFS-Ganesha is not configured'
+              },
+              breadcrumbs: 'File/NFS'
+            },
+            children: [
+              { path: '', component: NfsClusterComponent },
+              {
+                path: `${URLVerbs.CREATE}/:fs_name/:subvolume_group`,
+                component: NfsFormComponent,
+                data: { breadcrumbs: ActionLabels.CREATE }
+              },
+              {
+                path: `${URLVerbs.CREATE}`,
+                component: NfsFormComponent,
+                data: { breadcrumbs: ActionLabels.CREATE }
+              },
+              {
+                path: `${URLVerbs.EDIT}/:cluster_id/:export_id`,
+                component: NfsFormComponent,
+                data: { breadcrumbs: ActionLabels.EDIT }
+              }
+            ]
+          },
+          {
+            path: 'smb',
+            canActivate: [ModuleStatusGuardService],
+            data: {
+              moduleStatusGuardConfig: {
+                uiApiPath: 'smb',
+                redirectTo: 'error',
+                header: 'SMB module is not enabled',
+                module_name: 'smb',
+                navigate_to: 'cephfs/smb'
+              },
+              breadcrumbs: 'File/SMB'
+            },
+            children: [
+              { path: '', component: SmbClusterListComponent },
+              {
+                path: 'cluster',
+                data: { breadcrumbs: 'Cluster' },
+                children: [
+                  { path: '', component: SmbClusterListComponent },
+                  {
+                    path: `${URLVerbs.CREATE}`,
+                    component: SmbClusterFormComponent,
+                    data: { breadcrumbs: ActionLabels.CREATE }
+                  },
+                  {
+                    path: `${URLVerbs.EDIT}/:cluster_id`,
+                    component: SmbClusterFormComponent,
+                    data: { breadcrumbs: ActionLabels.EDIT }
+                  }
+                ]
+              },
+              {
+                path: 'active-directory',
+                data: { breadcrumbs: 'Active Directory' },
+                children: [
+                  { path: '', component: SmbJoinAuthListComponent },
+                  {
+                    path: `${URLVerbs.CREATE}`,
+                    component: SmbJoinAuthFormComponent,
+                    data: { breadcrumbs: ActionLabels.CREATE }
+                  },
+                  {
+                    path: `${URLVerbs.EDIT}/:authId`,
+                    component: SmbJoinAuthFormComponent,
+                    data: { breadcrumbs: ActionLabels.EDIT }
+                  }
+                ]
+              },
+              {
+                path: 'standalone',
+                data: { breadcrumbs: 'Standalone' },
+                children: [
+                  { path: '', component: SmbUsersgroupsListComponent },
+                  {
+                    path: `${URLVerbs.CREATE}`,
+                    component: SmbUsersgroupsFormComponent,
+                    data: { breadcrumbs: ActionLabels.CREATE }
+                  },
+                  {
+                    path: `${URLVerbs.EDIT}/:usersGroupsId`,
+                    component: SmbUsersgroupsFormComponent
+                  }
+                ]
+              },
+              {
+                path: 'overview',
+                component: SmbOverviewComponent,
+                data: { breadcrumbs: 'Overview' }
+              },
+              {
+                path: `share/${URLVerbs.CREATE}/:clusterId`,
+                component: SmbShareFormComponent,
+                data: { breadcrumbs: ActionLabels.CREATE }
+              },
+              {
+                path: `share/${URLVerbs.EDIT}/:clusterId/:shareId`,
+                component: SmbShareFormComponent,
+                data: { breadcrumbs: ActionLabels.EDIT }
+              }
+            ]
+          }
+        ]
       },
       // Object Gateway
       {
         path: 'rgw',
-        canActivateChild: [FeatureTogglesGuardService, ModuleStatusGuardService],
+        canActivate: [FeatureTogglesGuardService, ModuleStatusGuardService],
         data: {
           moduleStatusGuardConfig: {
             uiApiPath: 'rgw',
@@ -323,7 +535,7 @@ const routes: Routes = [
             header: 'The Object Gateway Service is not configured'
           },
           breadcrumbs: true,
-          text: 'Object Gateway',
+          text: 'Object',
           path: null
         },
         loadChildren: () => import('./ceph/rgw/rgw.module').then((m) => m.RoutedRgwModule)
@@ -343,34 +555,6 @@ const routes: Routes = [
             path: URLVerbs.EDIT,
             component: UserPasswordFormComponent,
             canActivate: [NoSsoGuardService],
-            data: { breadcrumbs: ActionLabels.EDIT }
-          }
-        ]
-      },
-      // NFS
-      {
-        path: 'nfs',
-        canActivateChild: [FeatureTogglesGuardService, ModuleStatusGuardService],
-        data: {
-          moduleStatusGuardConfig: {
-            uiApiPath: 'nfs-ganesha',
-            redirectTo: 'error',
-            section: 'nfs-ganesha',
-            section_info: 'NFS GANESHA',
-            header: 'NFS-Ganesha is not configured'
-          },
-          breadcrumbs: 'NFS'
-        },
-        children: [
-          { path: '', component: NfsListComponent },
-          {
-            path: URLVerbs.CREATE,
-            component: NfsFormComponent,
-            data: { breadcrumbs: ActionLabels.CREATE }
-          },
-          {
-            path: `${URLVerbs.EDIT}/:cluster_id/:export_id`,
-            component: NfsFormComponent,
             data: { breadcrumbs: ActionLabels.EDIT }
           }
         ]
@@ -400,8 +584,7 @@ const routes: Routes = [
   imports: [
     RouterModule.forRoot(routes, {
       useHash: true,
-      preloadingStrategy: PreloadAllModules,
-      relativeLinkResolution: 'legacy'
+      preloadingStrategy: PreloadAllModules
     })
   ],
   exports: [RouterModule],

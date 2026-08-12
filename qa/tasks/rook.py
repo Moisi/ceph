@@ -8,7 +8,7 @@ import json
 import logging
 import os
 import yaml
-from io import BytesIO
+from io import BytesIO, StringIO
 
 from tarfile import ReadError
 from tasks.ceph_manager import CephManager
@@ -235,10 +235,14 @@ def ceph_log(ctx, config):
             r = ctx.rook[cluster_name].remote.run(
                 stdout=BytesIO(),
                 args=args,
+                stderr=StringIO(),
             )
             stdout = r.stdout.getvalue().decode()
             if stdout:
                 return stdout
+            stderr = r.stderr.getvalue()
+            if stderr:
+                return stderr
             return None
 
         if first_in_ceph_log('\[ERR\]|\[WRN\]|\[SEC\]',
@@ -263,6 +267,7 @@ def ceph_log(ctx, config):
             run.wait(
                 ctx.cluster.run(
                     args=[
+                        'time',
                         'sudo',
                         'find',
                         log_dir,
@@ -272,10 +277,15 @@ def ceph_log(ctx, config):
                         run.Raw('|'),
                         'sudo',
                         'xargs',
+                        '--max-args=1',
+                        '--max-procs=0',
+                        '--verbose',
                         '-0',
                         '--no-run-if-empty',
                         '--',
                         'gzip',
+                        '-5',
+                        '--verbose',
                         '--',
                     ],
                     wait=False,
@@ -616,7 +626,7 @@ def task(ctx, config):
         sha1 = config.get('sha1')
         flavor = config.get('flavor', 'default')
         if sha1:
-            if flavor == "crimson":
+            if flavor == "crimson-debug" or flavor == "crimson-release":
                 ctx.rook[cluster_name].image = container_image_name + ':' + sha1 + '-' + flavor
             else:
                 ctx.rook[cluster_name].image = container_image_name + ':' + sha1

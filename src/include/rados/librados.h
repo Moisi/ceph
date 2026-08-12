@@ -155,6 +155,7 @@ enum {
   LIBRADOS_ALLOC_HINT_FLAG_LONGLIVED = 128,
   LIBRADOS_ALLOC_HINT_FLAG_COMPRESSIBLE = 256,
   LIBRADOS_ALLOC_HINT_FLAG_INCOMPRESSIBLE = 512,
+  LIBRADOS_ALLOC_HINT_FLAG_LOG = 1024,
 };
 /** @} */
 
@@ -3225,6 +3226,22 @@ CEPH_RADOS_API int rados_aio_write_op_operate(rados_write_op_t write_op,
                                               const char *oid,
                                               time_t *mtime,
 			                      int flags);
+
+/**
+ * Perform a write operation asynchronously
+ * @param write_op operation to perform
+ * @param io the ioctx that the object is in
+ * @param completion what to do when operation has been attempted
+ * @param oid the object id
+ * @param mtime the time to set the mtime to, NULL for the current time
+ * @param flags flags to apply to the entire operation (LIBRADOS_OPERATION_*)
+ */
+CEPH_RADOS_API int rados_aio_write_op_operate2(rados_write_op_t write_op,
+                                               rados_ioctx_t io,
+                                               rados_completion_t completion,
+                                               const char *oid,
+                                               struct timespec *mtime,
+                                               int flags);
 
 /**
  * Create a new rados_read_op_t read operation. This will store all

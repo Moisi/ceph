@@ -21,6 +21,8 @@
 #include "../CDir.h"
 #include "../CDentry.h"
 #include "../LogSegment.h"
+#include "../LogSegmentRef.h"
+
 
 #include "include/interval_set.h"
 #include "common/strescape.h"
@@ -43,7 +45,6 @@ struct MDPeerUpdate;
  *   it is journaled).
  *
  */
-
 
 class EMetaBlob {
 
@@ -103,7 +104,7 @@ public:
     void encode(bufferlist& bl, uint64_t features) const;
     void decode(bufferlist::const_iterator &bl);
     void dump(Formatter *f) const;
-    static void generate_test_instances(std::list<EMetaBlob::fullbit*>& ls);
+    static std::list<EMetaBlob::fullbit> generate_test_instances();
 
     void update_inode(MDSRank *mds, CInode *in);
     bool is_dirty() const { return (state & STATE_DIRTY); }
@@ -147,18 +148,25 @@ public:
     version_t dnv = 0;
     inodeno_t ino = 0;
     unsigned char d_type = '\0';
+    inodeno_t referent_ino = 0;
+    CInode::inode_const_ptr referent_inode;      // if it's not XXX should not be part of mempool; wait for std::pmr to simplify
     bool dirty = false;
 
     remotebit(std::string_view d, std::string_view an, snapid_t df, snapid_t dl, version_t v, inodeno_t i, unsigned char dt, bool dr) : 
       dn(d), alternate_name(an), dnfirst(df), dnlast(dl), dnv(v), ino(i), d_type(dt), dirty(dr) { }
+    remotebit(std::string_view d, std::string_view an, snapid_t df, snapid_t dl, version_t v, inodeno_t i, unsigned char dt, inodeno_t ref_ino, const CInode::inode_const_ptr& ref_inode, bool dr) :
+      dn(d), alternate_name(an), dnfirst(df), dnlast(dl), dnv(v), ino(i), d_type(dt), referent_ino(ref_ino), referent_inode(ref_inode), dirty(dr) {}
     explicit remotebit(bufferlist::const_iterator &p) { decode(p); }
     remotebit() = default;
 
-    void encode(bufferlist& bl) const;
+    void update_referent_inode(MDSRank *mds, CInode *in);
+    void encode(bufferlist& bl, uint64_t features) const;
     void decode(bufferlist::const_iterator &bl);
     void print(std::ostream& out) const {
       out << " remotebit dn " << dn << " [" << dnfirst << "," << dnlast << "] dnv " << dnv
 	  << " ino " << ino
+	  << " referent ino " << referent_ino
+	  << " referent inode " << referent_inode
 	  << " dirty=" << dirty;
       if (!alternate_name.empty()) {
         out << " altn " << binstrprint(alternate_name, 8);
@@ -166,9 +174,9 @@ public:
       out << std::endl;
     }
     void dump(Formatter *f) const;
-    static void generate_test_instances(std::list<remotebit*>& ls);
+    static std::list<remotebit> generate_test_instances();
   };
-  WRITE_CLASS_ENCODER(remotebit)
+  WRITE_CLASS_ENCODER_FEATURES(remotebit)
 
   /*
    * nullbit - a null dentry
@@ -187,7 +195,7 @@ public:
     void encode(bufferlist& bl) const;
     void decode(bufferlist::const_iterator &bl);
     void dump(Formatter *f) const;
-    static void generate_test_instances(std::list<nullbit*>& ls);
+    static std::list<nullbit> generate_test_instances();
     void print(std::ostream& out) const {
       out << " nullbit dn " << dn << " [" << dnfirst << "," << dnlast << "] dnv " << dnv
 	  << " dirty=" << dirty << std::endl;
@@ -237,6 +245,7 @@ public:
     const std::list<fullbit>		&get_dfull() const { return dfull; }
     std::list<fullbit>			&_get_dfull() { return dfull; }
     const std::vector<remotebit>	&get_dremote() const { return dremote; }
+    std::vector<remotebit>	        &get_dremote() { return dremote; }
     const std::vector<nullbit>		&get_dnull() const { return dnull; }
 
     template< class... Args>
@@ -288,7 +297,7 @@ public:
       using ceph::encode;
       if (!dn_decoded) return;
       encode(dfull, dnbl, features);
-      encode(dremote, dnbl);
+      encode(dremote, dnbl, features);
       encode(dnull, dnbl);
     }
     void _decode_bits() const { 
@@ -304,7 +313,7 @@ public:
     void encode(bufferlist& bl, uint64_t features) const;
     void decode(bufferlist::const_iterator &bl);
     void dump(Formatter *f) const;
-    static void generate_test_instances(std::list<dirlump*>& ls);
+    static std::list<dirlump> generate_test_instances();
   };
   WRITE_CLASS_ENCODER_FEATURES(dirlump)
 
@@ -340,26 +349,27 @@ private:
   std::vector<std::pair<metareqid_t,uint64_t> > client_reqs;
   std::vector<std::pair<metareqid_t,uint64_t> > client_flushes;
 
+  std::set<CInode*> touched;
+
  public:
   void encode(bufferlist& bl, uint64_t features) const;
   void decode(bufferlist::const_iterator& bl);
   void get_inodes(std::set<inodeno_t> &inodes) const;
+  const auto& get_touched_inodes(void) const {
+    return touched;
+  }
   void get_paths(std::vector<std::string> &paths) const;
   void get_dentries(std::map<dirfrag_t, std::set<std::string> > &dentries) const;
   entity_name_t get_client_name() const {return client_name;}
 
   void dump(Formatter *f) const;
-  static void generate_test_instances(std::list<EMetaBlob*>& ls);
-  // soft stateadd
-  uint64_t last_subtree_map;
-  uint64_t event_seq;
+  static std::list<EMetaBlob> generate_test_instances();
 
   // for replay, in certain cases
   //LogSegment *_segment;
 
   EMetaBlob() : opened_ino(0), renamed_dirino(0),
-                inotablev(0), sessionmapv(0), allocated_ino(0),
-                last_subtree_map(0), event_seq(0)
+                inotablev(0), sessionmapv(0), allocated_ino(0)
                 {}
   EMetaBlob(const EMetaBlob&) = delete;
   ~EMetaBlob() { }
@@ -417,26 +427,44 @@ private:
   }
   void add_null_dentry(dirlump& lump, CDentry *dn, bool dirty) {
     // add the dir
+    dn->check_corruption(false);
     lump.nnull++;
     lump.add_dnull(dn->get_name(), dn->first, dn->last,
 		   dn->get_projected_version(), dirty);
   }
 
   void add_remote_dentry(CDentry *dn, bool dirty) {
-    add_remote_dentry(add_dir(dn->get_dir(), false), dn, dirty, 0, 0);
+    add_remote_dentry(add_dir(dn->get_dir(), false), dn, dirty, 0, 0, 0, nullptr);
   }
-  void add_remote_dentry(CDentry *dn, bool dirty, inodeno_t rino, int rdt) {
-    add_remote_dentry(add_dir(dn->get_dir(), false), dn, dirty, rino, rdt);
+  void add_remote_dentry(CDentry *dn, bool dirty, inodeno_t rino, int rdt, inodeno_t referent_ino, CInode *ref_in) {
+    add_remote_dentry(add_dir(dn->get_dir(), false), dn, dirty, rino, rdt, referent_ino, ref_in);
   }
   void add_remote_dentry(dirlump& lump, CDentry *dn, bool dirty, 
-			 inodeno_t rino=0, unsigned char rdt=0) {
+			 inodeno_t rino=0, unsigned char rdt=0, inodeno_t referent_ino=0, CInode *ref_in=nullptr) {
+    dn->check_corruption(false);
+    /* In multi-version inode, i.e., a file has hardlinks and the primary link is being deleted,
+     * the primary inode is added as remote in the journal. In this case, it will not have a
+     * referent inode. So referent_ino=0 and ref_in=nullptr.
+     */
     if (!rino) {
       rino = dn->get_projected_linkage()->get_remote_ino();
       rdt = dn->get_projected_linkage()->get_remote_d_type();
+      referent_ino = dn->get_projected_linkage()->get_referent_ino();
+      ref_in = dn->get_projected_linkage()->get_referent_inode();
     }
+
     lump.nremote++;
-    lump.add_dremote(dn->get_name(), dn->get_alternate_name(), dn->first, dn->last,
-		     dn->get_projected_version(), rino, rdt, dirty);
+    if (ref_in) {
+      ceph_assert(referent_ino > 0);
+      const auto& ref_pi = ref_in->get_projected_inode();
+      ceph_assert(ref_pi->version > 0);
+      lump.add_dremote(dn->get_name(), dn->get_alternate_name(), dn->first, dn->last,
+                       dn->get_projected_version(), rino, rdt, referent_ino, ref_pi, dirty);
+    } else {
+      ceph_assert(referent_ino == 0);
+      lump.add_dremote(dn->get_name(), dn->get_alternate_name(), dn->first, dn->last,
+                       dn->get_projected_version(), rino, rdt, dirty);
+    }
   }
 
   // return remote pointer to to-be-journaled inode
@@ -451,6 +479,8 @@ private:
     add_primary_dentry(add_dir(dn->get_dir(), false), dn, in, state);
   }
   void add_primary_dentry(dirlump& lump, CDentry *dn, CInode *in, __u8 state) {
+    dn->check_corruption(false);
+
     if (!in) 
       in = dn->get_projected_linkage()->get_inode();
 
@@ -476,7 +506,8 @@ private:
                    state, in->get_old_inodes());
 
     // make note of where this inode was last journaled
-    in->last_journaled = event_seq;
+
+    touched.insert(in);
     //cout << "journaling " << in->inode.ino << " at " << my_offset << std::endl;
   }
 
@@ -496,20 +527,19 @@ private:
     add_dentry(lump, dn, dn->is_dirty(), dirty_parent, dirty_pool);
   }
   void add_dentry(dirlump& lump, CDentry *dn, bool dirty, bool dirty_parent, bool dirty_pool) {
-    // primary or remote
-    if (dn->get_projected_linkage()->is_remote()) {
+    // primary or remote or referent_remote
+    if (dn->get_projected_linkage()->is_remote() || dn->get_projected_linkage()->is_referent_remote()) {
       add_remote_dentry(dn, dirty);
-      return;
     } else if (dn->get_projected_linkage()->is_null()) {
       add_null_dentry(dn, dirty);
-      return;
+    } else {
+      ceph_assert(dn->get_projected_linkage()->is_primary());
+      add_primary_dentry(dn, 0, dirty, dirty_parent, dirty_pool);
     }
-    ceph_assert(dn->get_projected_linkage()->is_primary());
-    add_primary_dentry(dn, 0, dirty, dirty_parent, dirty_pool);
   }
 
   void add_root(bool dirty, CInode *in) {
-    in->last_journaled = event_seq;
+    touched.insert(in);
     //cout << "journaling " << in->inode.ino << " at " << my_offset << std::endl;
 
     const auto& pi = in->get_projected_inode();
@@ -597,18 +627,13 @@ private:
     out << "]";
   }
 
-  void update_segment(LogSegment *ls);
-  void replay(MDSRank *mds, LogSegment *ls, MDPeerUpdate *su=NULL);
+  void update_segment(LogSegmentRef const& ls);
+  void replay(MDSRank *mds, LogSegmentRef const& ls, int type, MDPeerUpdate *su=NULL);
 };
 WRITE_CLASS_ENCODER_FEATURES(EMetaBlob)
 WRITE_CLASS_ENCODER_FEATURES(EMetaBlob::fullbit)
-WRITE_CLASS_ENCODER(EMetaBlob::remotebit)
+WRITE_CLASS_ENCODER_FEATURES(EMetaBlob::remotebit)
 WRITE_CLASS_ENCODER(EMetaBlob::nullbit)
 WRITE_CLASS_ENCODER_FEATURES(EMetaBlob::dirlump)
-
-inline std::ostream& operator<<(std::ostream& out, const EMetaBlob& t) {
-  t.print(out);
-  return out;
-}
 
 #endif

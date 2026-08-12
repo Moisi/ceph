@@ -9,6 +9,7 @@
 
 #include "acconfig.h"
 #include "include/buffer_fwd.h"
+#include "kv/KeyValueDB.h"
 #ifdef WITH_BLUESTORE
 #include "os/bluestore/BlueStore.h"
 #endif
@@ -43,9 +44,9 @@ class StoreTool
 public:
   StoreTool(const std::string& type,
 	    const std::string& path,
+            bool read_only,
 	    bool need_open_db = true,
 	    bool need_stats = false);
-  int load_bluestore(const std::string& path, bool need_open_db);
   uint32_t traverse(const std::string& prefix,
                     const bool do_crc,
                     const bool do_value_dump,
@@ -78,4 +79,9 @@ public:
 
   int print_stats() const;
   int build_size_histogram(const std::string& prefix) const;
+
+#ifdef WITH_BLUESTORE
+private:
+  int load_bluestore(const std::string& path, bool read_only, bool need_open_db);
+#endif // WITH_BLUESTORE
 };

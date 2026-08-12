@@ -1,5 +1,13 @@
-import { Component, EventEmitter, Input, OnInit, Output, ViewChild } from '@angular/core';
-import { FormControl } from '@angular/forms';
+import {
+  Component,
+  EventEmitter,
+  Input,
+  OnDestroy,
+  OnInit,
+  Output,
+  ViewChild
+} from '@angular/core';
+import { UntypedFormControl } from '@angular/forms';
 import { Router } from '@angular/router';
 
 import _ from 'lodash';
@@ -34,7 +42,7 @@ import { OsdFeature } from './osd-feature.interface';
   templateUrl: './osd-form.component.html',
   styleUrls: ['./osd-form.component.scss']
 })
-export class OsdFormComponent extends CdForm implements OnInit {
+export class OsdFormComponent extends CdForm implements OnInit, OnDestroy {
   @ViewChild('dataDeviceSelectionGroups')
   dataDeviceSelectionGroups: OsdDevicesSelectionGroupsComponent;
 
@@ -121,12 +129,23 @@ export class OsdFormComponent extends CdForm implements OnInit {
 
     this.osdService.getDeploymentOptions().subscribe((options) => {
       this.deploymentOptions = options;
-      this.form.get('deploymentOption').setValue(this.deploymentOptions?.recommended_option);
+      if (!this.osdService.selectedFormValues) {
+        this.form.get('deploymentOption').setValue(this.deploymentOptions?.recommended_option);
+      }
 
       if (this.deploymentOptions?.recommended_option) {
         this.enableFeatures();
       }
     });
+
+    // restoring form value on back/next
+    if (this.osdService.selectedFormValues) {
+      this.form = _.cloneDeep(this.osdService.selectedFormValues);
+      this.form
+        .get('deploymentOption')
+        .setValue(this.osdService.selectedFormValues.value?.deploymentOption);
+    }
+    this.simpleDeployment = this.osdService.isDeployementModeSimple;
     this.form.get('walSlots').valueChanges.subscribe((value) => this.setSlots('wal', value));
     this.form.get('dbSlots').valueChanges.subscribe((value) => this.setSlots('db', value));
     _.each(this.features, (feature) => {
@@ -139,16 +158,16 @@ export class OsdFormComponent extends CdForm implements OnInit {
 
   createForm() {
     this.form = new CdFormGroup({
-      walSlots: new FormControl(0),
-      dbSlots: new FormControl(0),
+      walSlots: new UntypedFormControl(0),
+      dbSlots: new UntypedFormControl(0),
       features: new CdFormGroup(
         this.featureList.reduce((acc: object, e) => {
           // disable initially because no data devices are selected
-          acc[e.key] = new FormControl({ value: false, disabled: true });
+          acc[e.key] = new UntypedFormControl({ value: false, disabled: true });
           return acc;
         }, {})
       ),
-      deploymentOption: new FormControl(0)
+      deploymentOption: new UntypedFormControl(0)
     });
   }
 
@@ -282,5 +301,10 @@ export class OsdFormComponent extends CdForm implements OnInit {
       });
       this.previewButtonPanel.submitButton.loading = false;
     }
+  }
+
+  ngOnDestroy() {
+    this.osdService.selectedFormValues = _.cloneDeep(this.form);
+    this.osdService.isDeployementModeSimple = this.dataDeviceSelectionGroups?.devices?.length === 0;
   }
 }

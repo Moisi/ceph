@@ -173,7 +173,7 @@ class CephArgtype(object):
             assert len(type_args) == 1
             attrs['n'] = 'N'
             return CephArgtype.to_argdesc(type_args[0], attrs, positional=positional)
-        elif orig_type is Tuple:
+        elif orig_type in (Tuple, tuple):
             assert len(type_args) >= 1
             inner_tp = type_args[0]
             assert type_args.count(inner_tp) == len(type_args), \
@@ -386,10 +386,20 @@ class CephIPAddr(CephArgtype):
         # parse off port, use socket to validate addr
         type = 6
         p: Optional[str] = None
-        if s.startswith('['):
+        if s.startswith('v1:'):
+            s = s[3:]
+            type = 4
+        elif s.startswith('v2:'):
+            s = s[3:]
+            type = 6
+        elif s.startswith('any:'):
+            s = s[4:]
+            type = 4
+        elif s.startswith('['):
             type = 6
         elif s.find('.') != -1:
             type = 4
+
         if type == 4:
             port = s.find(':')
             if port != -1:
@@ -441,6 +451,9 @@ class CephEntityAddr(CephIPAddr):
         nonce = None
         if '/' in s:
             ip, nonce = s.split('/')
+            if nonce.endswith(']'):
+                nonce = nonce[:-1]
+                ip += ']'
         else:
             ip = s
         super(self.__class__, self).valid(ip)
@@ -489,13 +502,13 @@ class CephPgid(CephArgtype):
         try:
             poolid = int(poolid_s)
         except ValueError:
-            raise ArgumentFormat('pool {0} not integer'.format(poolid))
+            raise ArgumentFormat('pool {0} not integer'.format(poolid_s))
         if poolid < 0:
             raise ArgumentFormat('pool {0} < 0'.format(poolid))
         try:
             pgnum = int(pgnum_s, 16)
         except ValueError:
-            raise ArgumentFormat('pgnum {0} not hex integer'.format(pgnum))
+            raise ArgumentFormat('pgnum {0} not hex integer'.format(pgnum_s))
         self.val = s
 
     def __str__(self):
@@ -1109,6 +1122,9 @@ def store_arg(desc: argdesc, args: Sequence[ValidatedArg], d: ValidatedArgs):
         # prefixes' values should be a space-joined concatenation
         d[desc.name] += ' ' + desc.instance.val
     else:
+        # did we already get this argument
+        if desc.name in d:
+            raise ArgumentError(f"Duplicate argument '{desc.name}' found.")
         # if first CephPrefix or any other type, just set it
         d[desc.name] = desc.instance.val
 

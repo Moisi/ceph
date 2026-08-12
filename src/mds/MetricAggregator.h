@@ -7,21 +7,25 @@
 #include <map>
 #include <set>
 #include <thread>
+#include <unordered_set>
 
-#include "msg/msg_types.h"
+#include "msg/msg_types.h" // for entity_inst_t
 #include "msg/Dispatcher.h"
 #include "common/ceph_mutex.h"
+#include "common/perf_counters.h"
 #include "include/common_fwd.h"
-#include "messages/MMDSMetrics.h"
 
-#include "mgr/MetricTypes.h"
+#include "mgr/Types.h" // for PerformanceCounters
+#include "mgr/MetricTypes.h" // for MetricPayload
 #include "mgr/MDSPerfMetricTypes.h"
 
 #include "mdstypes.h"
-#include "MDSMap.h"
 #include "MDSPinger.h"
 
+class MDSMap;
 class MDSRank;
+class MMDSMetrics;
+struct Metrics;
 class MgrClient;
 
 class MetricAggregator : public Dispatcher {
@@ -33,12 +37,7 @@ public:
 
   void notify_mdsmap(const MDSMap &mdsmap);
 
-  bool ms_can_fast_dispatch_any() const override {
-    return true;
-  }
-  bool ms_can_fast_dispatch2(const cref_t<Message> &m) const override;
-  void ms_fast_dispatch2(const ref_t<Message> &m) override;
-  bool ms_dispatch2(const ref_t<Message> &m) override;
+  Dispatcher::dispatch_result_t ms_dispatch2(const ref_t<Message> &m) override;
 
   void ms_handle_connect(Connection *c) override {
   }
@@ -55,6 +54,7 @@ private:
   // drop this lock when calling ->send_message_mds() else mds might
   // deadlock
   ceph::mutex lock = ceph::make_mutex("MetricAggregator::lock");
+  CephContext *m_cct;
   MDSRank *mds;
   MgrClient *mgrc;
 
@@ -72,10 +72,17 @@ private:
 
   bool stopping = false;
 
+  PerfCounters *m_perf_counters;
+  std::map<std::pair<entity_inst_t, mds_rank_t>, PerfCounters*> client_perf_counters;
+  uint64_t subv_window_sec;
+  std::unordered_map<std::string, SlidingWindowTracker<SubvolumeMetric>> subvolume_aggregated_metrics;
+  std::map<std::string, PerfCounters*> subvolume_perf_counters;
+
   void handle_mds_metrics(const cref_t<MMDSMetrics> &m);
 
   void refresh_metrics_for_rank(const entity_inst_t &client, mds_rank_t rank,
                                 const Metrics &metrics);
+  void refresh_subvolume_metrics_for_rank(mds_rank_t rank, const std::vector<SubvolumeMetric> &metrics);
   void remove_metrics_for_rank(const entity_inst_t &client, mds_rank_t rank, bool remove);
 
   void cull_metrics_for_rank(mds_rank_t rank);

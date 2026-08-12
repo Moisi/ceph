@@ -16,24 +16,27 @@
 
 #include "PyModuleRegistry.h"
 
+#include <map>
 #include <set>
 #include <string>
-#include <boost/variant.hpp>
+#include <unordered_map>
+#include <vector>
 
 #include "common/ceph_mutex.h"
 #include "common/LogClient.h"
 #include "common/Timer.h"
-
-#include <msg/Messenger.h>
-#include <mon/MonClient.h>
+#include "common/TrackedOp.h" // for class OpTracker
+#include "include/utime.h"
 
 #include "ServiceMap.h"
-#include "MgrSession.h"
-#include "DaemonState.h"
 #include "MetricCollector.h"
 #include "OSDPerfMetricCollector.h"
 #include "MDSPerfMetricCollector.h"
 
+#include <boost/scoped_ptr.hpp>
+
+class DaemonStateIndex;
+class Messenger;
 class MMgrReport;
 class MMgrOpen;
 class MMgrUpdate;
@@ -41,17 +44,19 @@ class MMgrClose;
 class MMonMgrReport;
 class MCommand;
 class MMgrCommand;
+class MgrSession;
 struct MonCommand;
+class MonClient;
 class CommandContext;
 struct OSDPerfMetricQuery;
 struct MDSPerfMetricQuery;
 
 
 struct offline_pg_report {
-  set<int> osds;
-  set<pg_t> ok, not_ok, unknown;
-  set<pg_t> ok_become_degraded, ok_become_more_degraded;             // ok
-  set<pg_t> bad_no_pool, bad_already_inactive, bad_become_inactive;  // not ok
+  std::set<int> osds;
+  std::set<pg_t> ok, not_ok, unknown;
+  std::set<pg_t> ok_become_degraded, ok_become_more_degraded;             // ok
+  std::set<pg_t> bad_no_pool, bad_already_inactive, bad_become_inactive;  // not ok
 
   bool ok_to_stop() const {
     return not_ok.empty() && unknown.empty();
@@ -117,7 +122,6 @@ struct offline_pg_report {
   }
 };
 
-
 /**
  * Server used in ceph-mgr to communicate with Ceph daemons like
  * MDSs and OSDs.
@@ -147,7 +151,7 @@ protected:
   std::set<ConnectionRef> daemon_connections;
 
   /// connections for osds
-  ceph::unordered_map<int,std::set<ConnectionRef>> osd_cons;
+  std::unordered_map<int, std::set<ConnectionRef>> osd_cons;
 
   ServiceMap pending_service_map;  // uncommitted
 
@@ -165,6 +169,8 @@ protected:
     const std::map<std::string,std::string>& param_str_map,
     const MonCommand *this_cmd);
 
+  class DaemonServerHook *asok_hook;
+
 private:
   friend class ReplyOnFinish;
   bool _reply(MCommand* m,
@@ -178,7 +184,7 @@ private:
     const PGMap& pgmap,
     offline_pg_report *report);
   void _maximize_ok_to_stop_set(
-    const set<int>& orig_osds,
+    const std::set<int>& orig_osds,
     unsigned max,
     const OSDMap& osdmap,
     const PGMap& pgmap,
@@ -190,7 +196,6 @@ private:
   void maybe_ready(int32_t osd_id);
 
   SafeTimer timer;
-  bool shutting_down;
   Context *tick_event;
   void tick();
   void schedule_tick_locked(double delay_sec);
@@ -252,10 +257,12 @@ private:
 
   void update_task_status(DaemonKey key,
 			  const std::map<std::string,std::string>& task_status);
+private:
+  // -- op tracking --
+  OpTracker op_tracker;
 
 public:
   int init(uint64_t gid, entity_addrvec_t client_addrs);
-  void shutdown();
 
   entity_addrvec_t get_myaddrs() const;
 
@@ -268,8 +275,9 @@ public:
 	       LogChannelRef auditcl);
   ~DaemonServer() override;
 
-  bool ms_dispatch2(const ceph::ref_t<Message>& m) override;
-  int ms_handle_authentication(Connection *con) override;
+  Dispatcher::dispatch_result_t ms_dispatch2(const ceph::ref_t<Message>& m) override;
+  bool ms_handle_fast_authentication(Connection *con) override;
+  void ms_handle_accept(Connection *con) override;
   bool ms_handle_reset(Connection *con) override;
   void ms_handle_remote_reset(Connection *con) override {}
   bool ms_handle_refused(Connection *con) override;
@@ -301,8 +309,8 @@ public:
   void reregister_mds_perf_queries();
   int get_mds_perf_counters(MDSPerfCollector *collector);
 
-  virtual const char** get_tracked_conf_keys() const override;
-  virtual void handle_conf_change(const ConfigProxy& conf,
+  std::vector<std::string> get_tracked_keys() const noexcept override;
+  void handle_conf_change(const ConfigProxy& conf,
                           const std::set <std::string> &changed) override;
 
   void schedule_tick(double delay_sec);
@@ -310,6 +318,11 @@ public:
   void log_access_denied(std::shared_ptr<CommandContext>& cmdctx,
                          MgrSession* session, std::stringstream& ss);
   void dump_pg_ready(ceph::Formatter *f);
+
+  bool asok_command(std::string_view admin_command,
+                    const cmdmap_t& cmdmap,
+                    Formatter *f,
+                    std::ostream& ss);
 };
 
 #endif

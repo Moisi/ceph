@@ -25,7 +25,7 @@
 #
 # 4b) If all good so far, reset the journal:
 #
-#    cephfs-journal-tool --rank=<fs_name>:0 journal reset
+#    cephfs-journal-tool --rank=<fs_name>:0 journal reset --yes-i-really-really-mean-it
 #
 # 5) Run this tool to see list of damaged dentries:
 #
@@ -56,18 +56,23 @@ MEMO = None
 REMOVE = False
 POOL = None
 NEXT_SNAP = None
-CONF = os.environ.get('CEPH_CONF')
+CONF = os.environ.get('CEPH_CONF', '/etc/ceph/ceph.conf')
 REPAIR_NOSNAP = None
 
-CEPH_NOSNAP = 0xfffffffe # int32 -2
+CEPH_NOSNAP = 0xfffffffffffffffe # int64 -2
+ROOT_INODE  = "1.00000000"
+LOST_FOUND_INODE  = "4.00000000"
 
 DIR_PATTERN = re.compile(r'[0-9a-fA-F]{8,}\.[0-9a-fA-F]+')
+STRAY_DIR_PATTERN = re.compile(r'6[0-9a-fA-F]{2,}\.[0-9a-fA-F]+')
 
 CACHE = set()
 
 def traverse(MEMO, ioctx):
     for o in ioctx.list_objects():
-        if not DIR_PATTERN.fullmatch(o.key):
+        if (not DIR_PATTERN.fullmatch(o.key) and
+            not STRAY_DIR_PATTERN.fullmatch(o.key)
+            and o.key not in [ROOT_INODE, LOST_FOUND_INODE]):
             log.debug("skipping %s", o.key)
             continue
         elif o.key in CACHE:
@@ -78,19 +83,20 @@ def traverse(MEMO, ioctx):
         with rados.ReadOpCtx() as rctx:
             nkey = None
             while True:
-                it = ioctx.get_omap_vals(rctx, nkey, None, 100)[0]
+                it = ioctx.get_omap_vals(rctx, nkey, None, 100, omap_key_type=bytes)[0]
                 ioctx.operate_read_op(rctx, o.key)
                 nkey = None
                 for (dnk, val) in it:
-                    log.debug('\t%s: val size %d', dnk, len(val))
-                    (first,) = struct.unpack('<I', val[:4])
+                    log.debug(f'\t{dnk}: val size {len(val)}')
+                    (first,) = struct.unpack('<Q', val[:8])
+                    log.debug(f'\t{dnk}: first {first}')
                     if first > NEXT_SNAP:
                         log.warning(f"found {o.key}:{dnk} first (0x{first:x}) > NEXT_SNAP (0x{NEXT_SNAP:x})")
-                        if REPAIR_NOSNAP and dnk.endswith("_head") and first == CEPH_NOSNAP:
+                        if REPAIR_NOSNAP and dnk.endswith(b"_head") and first == CEPH_NOSNAP:
                             log.warning(f"repairing first==CEPH_NOSNAP damage, setting to NEXT_SNAP (0x{NEXT_SNAP:x})")
                             first = NEXT_SNAP
                             nval = bytearray(val)
-                            struct.pack_into("<I", nval, 0, NEXT_SNAP)
+                            struct.pack_into("<Q", nval, 0, NEXT_SNAP)
                             with rados.WriteOpCtx() as wctx:
                                 ioctx.set_omap(wctx, (dnk,), (bytes(nval),))
                                 ioctx.operate_write_op(wctx, o.key)

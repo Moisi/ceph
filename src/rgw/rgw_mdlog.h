@@ -16,14 +16,18 @@
 
 #pragma once
 
+#include "include/rados/librados.hpp"
+
 #include "common/RWLock.h"
 
 #include "rgw_metadata.h"
 #include "rgw_mdlog_types.h"
-
-#include "services/svc_rados.h"
+#include "rgw_tools.h"
 
 #define META_LOG_OBJ_PREFIX "meta.log."
+
+class RGWSI_Cls;
+class RGWSI_Zone;
 
 struct RGWMetadataLogInfo {
   std::string marker;
@@ -37,10 +41,10 @@ class RGWCompletionManager;
 
 class RGWMetadataLogInfoCompletion : public RefCountedObject {
  public:
-  using info_callback_t = std::function<void(int, const cls_log_header&)>;
+  using info_callback_t = std::function<void(int, const cls::log::header&)>;
  private:
-  cls_log_header header;
-  RGWSI_RADOS::Obj io_obj;
+  cls::log::header header;
+  rgw_rados_ref io_obj;
   librados::AioCompletion *completion;
   std::mutex mutex; //< protects callback between cancel/complete
   boost::optional<info_callback_t> callback; //< cleared on cancel
@@ -48,8 +52,8 @@ class RGWMetadataLogInfoCompletion : public RefCountedObject {
   explicit RGWMetadataLogInfoCompletion(info_callback_t callback);
   ~RGWMetadataLogInfoCompletion() override;
 
-  RGWSI_RADOS::Obj& get_io_obj() { return io_obj; }
-  cls_log_header& get_header() { return header; }
+  rgw_rados_ref& get_io_obj() { return io_obj; }
+  cls::log::header& get_header() { return header; }
   librados::AioCompletion* get_completion() { return completion; }
 
   void finish(librados::completion_t cb) {
@@ -102,9 +106,9 @@ public:
     oid = prefix + buf;
   }
 
-  int add_entry(const DoutPrefixProvider *dpp, const std::string& hash_key, const std::string& section, const std::string& key, bufferlist& bl);
+  int add_entry(const DoutPrefixProvider *dpp, const std::string& hash_key, const std::string& section, const std::string& key, bufferlist& bl, optional_yield y);
   int get_shard_id(const std::string& hash_key, int *shard_id);
-  int store_entries_in_shard(const DoutPrefixProvider *dpp, std::list<cls_log_entry>& entries, int shard_id, librados::AioCompletion *completion);
+  int store_entries_in_shard(const DoutPrefixProvider *dpp, std::vector<cls::log::entry>& entries, int shard_id, librados::AioCompletion *completion);
 
   struct LogListCtx {
     int cur_shard;
@@ -126,12 +130,13 @@ public:
   int list_entries(const DoutPrefixProvider *dpp,
                    void *handle,
                    int max_entries,
-                   std::list<cls_log_entry>& entries,
+                   std::vector<cls::log::entry>& entries,
 		   std::string *out_marker,
-		   bool *truncated);
+		   bool *truncated,
+		   optional_yield y);
 
-  int trim(const DoutPrefixProvider *dpp, int shard_id, const real_time& from_time, const real_time& end_time, const std::string& start_marker, const std::string& end_marker);
-  int get_info(const DoutPrefixProvider *dpp, int shard_id, RGWMetadataLogInfo *info);
+  int trim(const DoutPrefixProvider *dpp, int shard_id, const real_time& from_time, const real_time& end_time, const std::string& start_marker, const std::string& end_marker, optional_yield y);
+  int get_info(const DoutPrefixProvider *dpp, int shard_id, RGWMetadataLogInfo *info, optional_yield y);
   int get_info_async(const DoutPrefixProvider *dpp, int shard_id, RGWMetadataLogInfoCompletion *completion);
   int lock_exclusive(const DoutPrefixProvider *dpp, int shard_id, timespan duration, std::string&zone_id, std::string& owner_id);
   int unlock(const DoutPrefixProvider *dpp, int shard_id, std::string& zone_id, std::string& owner_id);
@@ -159,6 +164,7 @@ struct RGWMetadataLogData {
   void decode(bufferlist::const_iterator& bl);
   void dump(Formatter *f) const;
   void decode_json(JSONObj *obj);
+  static std::list<RGWMetadataLogData> generate_test_instances();
 };
 WRITE_CLASS_ENCODER(RGWMetadataLogData)
 

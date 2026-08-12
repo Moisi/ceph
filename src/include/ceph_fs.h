@@ -14,6 +14,7 @@
 
 #include "msgr.h"
 #include "rados.h"
+#include "include/buffer.h" // for ceph::buffer::list
 
 /*
  * The data structures defined here are shared between Linux kernel and
@@ -286,7 +287,12 @@ struct ceph_mon_subscribe_ack {
 #define CEPH_MDSMAP_ALLOW_MULTIMDS_SNAPS	     (1<<4)  /* cluster alllowed to enable MULTIMDS
                                                             and SNAPS at the same time */
 #define CEPH_MDSMAP_ALLOW_STANDBY_REPLAY         (1<<5)  /* cluster alllowed to enable MULTIMDS */
-
+#define CEPH_MDSMAP_REFUSE_CLIENT_SESSION        (1<<6)  /* cluster allowed to refuse client session
+                                                            request */
+#define CEPH_MDSMAP_REFUSE_STANDBY_FOR_ANOTHER_FS (1<<7) /* fs is forbidden to use standby
+                                                            for another fs */
+#define CEPH_MDSMAP_BALANCE_AUTOMATE             (1<<8)  /* automate metadata balancing */
+#define CEPH_MDSMAP_REFERENT_INODES              (1<<9)  /* create referent inode for hardlinks to store backtrace */
 #define CEPH_MDSMAP_DEFAULTS (CEPH_MDSMAP_ALLOW_SNAPS | \
 			      CEPH_MDSMAP_ALLOW_MULTIMDS_SNAPS)
 
@@ -327,18 +333,24 @@ extern const char *ceph_mds_state_name(int s);
  */
 #define CEPH_LOCK_DN          (1 << 0)
 #define CEPH_LOCK_DVERSION    (1 << 1)
-#define CEPH_LOCK_ISNAP       (1 << 4)  /* snapshot lock. MDS internal */
-#define CEPH_LOCK_IPOLICY     (1 << 5)  /* policy lock on dirs. MDS internal */
-#define CEPH_LOCK_IFILE       (1 << 6)
-#define CEPH_LOCK_INEST       (1 << 7)  /* mds internal */
-#define CEPH_LOCK_IDFT        (1 << 8)  /* dir frag tree */
-#define CEPH_LOCK_IAUTH       (1 << 9)
-#define CEPH_LOCK_ILINK       (1 << 10)
-#define CEPH_LOCK_IXATTR      (1 << 11)
-#define CEPH_LOCK_IFLOCK      (1 << 12)  /* advisory file locks */
-#define CEPH_LOCK_IVERSION    (1 << 13)  /* mds internal */
+#define CEPH_LOCK_IQUIESCE    (1 << 4)  /* mds internal */
+#define CEPH_LOCK_ISNAP       (1 << 5)  /* snapshot lock. MDS internal */
+#define CEPH_LOCK_IPOLICY     (1 << 6)  /* policy lock on dirs. MDS internal */
+#define CEPH_LOCK_IFILE       (1 << 7)
+#define CEPH_LOCK_INEST       (1 << 8)  /* mds internal */
+#define CEPH_LOCK_IDFT        (1 << 9)  /* dir frag tree */
+#define CEPH_LOCK_IAUTH       (1 << 10)
+#define CEPH_LOCK_ILINK       (1 << 11)
+#define CEPH_LOCK_IXATTR      (1 << 12)
+#define CEPH_LOCK_IFLOCK      (1 << 13)  /* advisory file locks */
+#define CEPH_LOCK_IVERSION    (1 << 14)  /* mds internal */
 
-#define CEPH_LOCK_IFIRST      CEPH_LOCK_ISNAP
+#define CEPH_LOCK_IFIRST      CEPH_LOCK_IQUIESCE
+#define CEPH_LOCK_ILAST       CEPH_LOCK_IVERSION
+
+static inline bool is_inode_lock(int l) {
+  return (CEPH_LOCK_IFIRST <= l && l <= CEPH_LOCK_ILAST);
+}
 
 
 /* client_session ops */
@@ -415,6 +427,8 @@ enum {
 	CEPH_MDS_OP_RMSNAP     = 0x01401,
 	CEPH_MDS_OP_LSSNAP     = 0x00402,
 	CEPH_MDS_OP_RENAMESNAP = 0x01403,
+	CEPH_MDS_OP_READDIR_SNAPDIFF   = 0x01404,
+	CEPH_MDS_OP_FILE_BLOCKDIFF = 0x01405,
 
 	// internal op
 	CEPH_MDS_OP_FRAGMENTDIR= 0x01500,
@@ -423,8 +437,17 @@ enum {
 	CEPH_MDS_OP_ENQUEUE_SCRUB  = 0x01503,
 	CEPH_MDS_OP_REPAIR_FRAGSTATS = 0x01504,
 	CEPH_MDS_OP_REPAIR_INODESTATS = 0x01505,
-	CEPH_MDS_OP_RDLOCK_FRAGSSTATS = 0x01507
+	CEPH_MDS_OP_RDLOCK_FRAGSSTATS = 0x01507,
+	CEPH_MDS_OP_QUIESCE_PATH = 0x01508,
+	CEPH_MDS_OP_QUIESCE_INODE = 0x01509,
+	CEPH_MDS_OP_LOCK_PATH = 0x0150a,
+	CEPH_MDS_OP_UNINLINE_DATA = 0x0150b
 };
+
+#define IS_CEPH_MDS_OP_NEWINODE(op) (op == CEPH_MDS_OP_CREATE     || \
+				     op == CEPH_MDS_OP_MKNOD      || \
+				     op == CEPH_MDS_OP_MKDIR      || \
+				     op == CEPH_MDS_OP_SYMLINK)
 
 extern const char *ceph_mds_op_name(int op);
 
@@ -443,6 +466,8 @@ extern const char *ceph_mds_op_name(int op);
 #define CEPH_SETATTR_KILL_SGUID		(1 << 10)
 #define CEPH_SETATTR_FSCRYPT_AUTH	(1 << 11)
 #define CEPH_SETATTR_FSCRYPT_FILE	(1 << 12)
+#define CEPH_SETATTR_KILL_SUID		(1 << 13)
+#define CEPH_SETATTR_KILL_SGID		(1 << 14)
 #endif
 
 /*
@@ -465,15 +490,16 @@ int ceph_flags_sys2wire(int flags);
  */
 #define CEPH_XATTR_CREATE  (1 << 0)
 #define CEPH_XATTR_REPLACE (1 << 1)
+#define CEPH_XATTR_REMOVE2 (1 << 30)
 #define CEPH_XATTR_REMOVE  (1 << 31)
 
 /*
- * readdir request flags;
+ * readdir/readdir_snapdiff request flags;
  */
 #define CEPH_READDIR_REPLY_BITFLAGS	(1<<0)
 
 /*
- * readdir reply flags.
+ * readdir/readdir_snapdiff reply flags.
  */
 #define CEPH_READDIR_FRAG_END		(1<<0)
 #define CEPH_READDIR_FRAG_COMPLETE	(1<<8)
@@ -617,9 +643,23 @@ union ceph_mds_request_args {
 		__le64 parent;
 		__le32 hash;
 	} __attribute__ ((packed)) lookupino;
+	struct {
+		__le32 frag;                 /* which dir fragment */
+		__le32 max_entries;          /* how many dentries to grab */
+		__le32 max_bytes;
+		__le16 flags;
+                __le32 offset_hash;
+		__le64 snap_other;
+	} __attribute__ ((packed)) snapdiff;
+        struct {
+                // latest scan "pointer"
+                __le64 scan_idx;
+                // how many data objects to scan in one invocation (capped by the mds).
+                __le64 max_objects;
+        } __attribute__ ((packed)) blockdiff;
 } __attribute__ ((packed));
 
-#define CEPH_MDS_REQUEST_HEAD_VERSION	1
+#define CEPH_MDS_REQUEST_HEAD_VERSION	3
 
 /*
  * Note that any change to this structure must ensure that it is compatible
@@ -630,14 +670,23 @@ struct ceph_mds_request_head {
 	__le64 oldest_client_tid;
 	__le32 mdsmap_epoch;           /* on client */
 	__le32 flags;                  /* CEPH_MDS_FLAG_* */
-	__u8 num_retry, num_fwd;       /* count retry, fwd attempts */
+	__u8 num_retry, num_fwd;       /* legacy count retry and fwd attempts */
 	__le16 num_releases;           /* # include cap/lease release records */
 	__le32 op;                     /* mds op code */
 	__le32 caller_uid, caller_gid;
 	__le64 ino;                    /* use this ino for openc, mkdir, mknod,
 					  etc. (if replaying) */
 	union ceph_mds_request_args args;
+
+	__le32 ext_num_retry;          /* new count retry attempts */
+	__le32 ext_num_fwd;            /* new count fwd attempts */
+
+	__le32 struct_len;             /* to store size of struct ceph_mds_request_head */
+	__le32 owner_uid, owner_gid;   /* used for OPs which create inodes */
 } __attribute__ ((packed));
+
+void encode(const struct ceph_mds_request_head& h, ceph::buffer::list& bl);
+void decode(struct ceph_mds_request_head& h, ceph::buffer::list::const_iterator& bl);
 
 /* cap/lease release record */
 struct ceph_mds_request_release {
@@ -668,8 +717,10 @@ copy_to_legacy_head(struct ceph_mds_request_head_legacy *legacy,
 
 /* client reply */
 struct ceph_mds_reply_head {
+	using code_t = __le32;
 	__le32 op;
-	__le32 result;
+	// the result field is interpreted by MClientReply message as errorcode32_t
+	code_t result;
 	__le32 mdsmap_epoch;
 	__u8 safe;                     /* true if committed to disk */
 	__u8 is_dentry, is_target;     /* true if dentry, target inode records
@@ -864,7 +915,7 @@ extern const char *ceph_cap_op_name(int op);
 /* extra info for cap import/export */
 struct ceph_mds_cap_peer {
 	__le64 cap_id;
-	__le32 seq;
+	__le32 issue_seq;
 	__le32 mseq;
 	__le32 mds;
 	__u8   flags;
@@ -917,7 +968,7 @@ struct ceph_mds_cap_release {
 struct ceph_mds_cap_item {
 	__le64 ino;
 	__le64 cap_id;
-	__le32 migrate_seq, seq;
+	__le32 migrate_seq, issue_seq;
 } __attribute__ ((packed));
 
 #define CEPH_MDS_LEASE_REVOKE           1  /*    mds  -> client */

@@ -29,6 +29,7 @@
 
 #include "librados/AioCompletionImpl.h"
 #include "librados/IoCtxImpl.h"
+#include "librados/ObjectOperationImpl.h"
 #include "librados/PoolAsyncCompletionImpl.h"
 #include "librados/RadosClient.h"
 #include "librados/RadosXattrIter.h"
@@ -87,18 +88,6 @@ static TracepointProvider::Traits tracepoint_traits("librados_tp.so", "rados_tra
  * |          RadosClient                 |
  * +--------------------------------------+
  */
-
-namespace librados {
-
-struct ObjectOperationImpl {
-  ::ObjectOperation o;
-  real_time rt;
-  real_time *prt;
-
-  ObjectOperationImpl() : prt(NULL) {}
-};
-
-}
 
 size_t librados::ObjectOperation::size()
 {
@@ -989,130 +978,137 @@ uint32_t librados::NObjectIterator::get_pg_hash_position() const
 const librados::NObjectIterator librados::NObjectIterator::__EndObjectIterator(NULL);
 
 ///////////////////////////// PoolAsyncCompletion //////////////////////////////
-librados::PoolAsyncCompletion::PoolAsyncCompletion::~PoolAsyncCompletion()
+librados::PoolAsyncCompletion::~PoolAsyncCompletion()
 {
   auto c = reinterpret_cast<PoolAsyncCompletionImpl *>(pc);
   c->release();
 }
 
-int librados::PoolAsyncCompletion::PoolAsyncCompletion::set_callback(void *cb_arg,
-								     rados_callback_t cb)
+int librados::PoolAsyncCompletion::set_callback(void *cb_arg, rados_callback_t cb)
 {
   PoolAsyncCompletionImpl *c = (PoolAsyncCompletionImpl *)pc;
   return c->set_callback(cb_arg, cb);
 }
 
-int librados::PoolAsyncCompletion::PoolAsyncCompletion::wait()
+int librados::PoolAsyncCompletion::wait()
 {
   PoolAsyncCompletionImpl *c = (PoolAsyncCompletionImpl *)pc;
   return c->wait();
 }
 
-bool librados::PoolAsyncCompletion::PoolAsyncCompletion::is_complete()
+bool librados::PoolAsyncCompletion::is_complete()
 {
   PoolAsyncCompletionImpl *c = (PoolAsyncCompletionImpl *)pc;
   return c->is_complete();
 }
 
-int librados::PoolAsyncCompletion::PoolAsyncCompletion::get_return_value()
+int librados::PoolAsyncCompletion::get_return_value()
 {
   PoolAsyncCompletionImpl *c = (PoolAsyncCompletionImpl *)pc;
   return c->get_return_value();
 }
 
-void librados::PoolAsyncCompletion::PoolAsyncCompletion::release()
+void librados::PoolAsyncCompletion::release()
 {
   delete this;
 }
 
 ///////////////////////////// AioCompletion //////////////////////////////
-librados::AioCompletion::AioCompletion::~AioCompletion()
+librados::AioCompletion::~AioCompletion()
 {
   auto c = reinterpret_cast<AioCompletionImpl *>(pc);
   c->release();
 }
 
-int librados::AioCompletion::AioCompletion::set_complete_callback(void *cb_arg, rados_callback_t cb)
+int librados::AioCompletion::set_complete_callback(void *cb_arg, rados_callback_t cb)
 {
   AioCompletionImpl *c = (AioCompletionImpl *)pc;
   return c->set_complete_callback(cb_arg, cb);
 }
 
-int librados::AioCompletion::AioCompletion::set_safe_callback(void *cb_arg, rados_callback_t cb)
+int librados::AioCompletion::set_safe_callback(void *cb_arg, rados_callback_t cb)
 {
   AioCompletionImpl *c = (AioCompletionImpl *)pc;
   return c->set_safe_callback(cb_arg, cb);
 }
 
-int librados::AioCompletion::AioCompletion::wait_for_complete()
+int librados::AioCompletion::wait_for_complete()
 {
   AioCompletionImpl *c = (AioCompletionImpl *)pc;
   return c->wait_for_complete();
 }
 
-int librados::AioCompletion::AioCompletion::wait_for_safe()
+int librados::AioCompletion::wait_for_safe()
 {
   AioCompletionImpl *c = (AioCompletionImpl *)pc;
   return c->wait_for_complete();
 }
 
-bool librados::AioCompletion::AioCompletion::is_complete()
+bool librados::AioCompletion::is_complete()
 {
   AioCompletionImpl *c = (AioCompletionImpl *)pc;
   return c->is_complete();
 }
 
-bool librados::AioCompletion::AioCompletion::is_safe()
+bool librados::AioCompletion::is_safe()
 {
   AioCompletionImpl *c = (AioCompletionImpl *)pc;
   return c->is_safe();
 }
 
-int librados::AioCompletion::AioCompletion::wait_for_complete_and_cb()
+int librados::AioCompletion::wait_for_complete_and_cb()
 {
   AioCompletionImpl *c = (AioCompletionImpl *)pc;
   return c->wait_for_complete_and_cb();
 }
 
-int librados::AioCompletion::AioCompletion::wait_for_safe_and_cb()
+int librados::AioCompletion::wait_for_safe_and_cb()
 {
   AioCompletionImpl *c = (AioCompletionImpl *)pc;
   return c->wait_for_safe_and_cb();
 }
 
-bool librados::AioCompletion::AioCompletion::is_complete_and_cb()
+bool librados::AioCompletion::is_complete_and_cb()
 {
   AioCompletionImpl *c = (AioCompletionImpl *)pc;
   return c->is_complete_and_cb();
 }
 
-bool librados::AioCompletion::AioCompletion::is_safe_and_cb()
+bool librados::AioCompletion::is_safe_and_cb()
 {
   AioCompletionImpl *c = (AioCompletionImpl *)pc;
   return c->is_safe_and_cb();
 }
 
-int librados::AioCompletion::AioCompletion::get_return_value()
+int librados::AioCompletion::get_return_value()
 {
   AioCompletionImpl *c = (AioCompletionImpl *)pc;
   return c->get_return_value();
 }
 
-int librados::AioCompletion::AioCompletion::get_version()
+int librados::AioCompletion::get_version()
 {
   AioCompletionImpl *c = (AioCompletionImpl *)pc;
   return c->get_version();
 }
 
-uint64_t librados::AioCompletion::AioCompletion::get_version64()
+uint64_t librados::AioCompletion::get_version64()
 {
   AioCompletionImpl *c = (AioCompletionImpl *)pc;
   return c->get_version();
 }
 
-void librados::AioCompletion::AioCompletion::release()
+void librados::AioCompletion::release()
 {
   delete this;
+}
+
+int librados::AioCompletion::cancel()
+{
+  if (!pc->io) {
+    return 0; // no operation was started
+  }
+  return pc->io->aio_cancel(pc);
 }
 
 ///////////////////////////// IoCtx //////////////////////////////
@@ -1536,6 +1532,14 @@ int librados::IoCtx::operate(const std::string& oid, librados::ObjectWriteOperat
   return io_ctx_impl->operate(obj, &o->impl->o, (ceph::real_time *)o->impl->prt, translate_flags(flags));
 }
 
+int librados::IoCtx::operate(const std::string& oid, librados::ObjectWriteOperation *o, int flags, const jspan_context* otel_trace)
+{
+  object_t obj(oid);
+  if (unlikely(!o->impl))
+    return -EINVAL;
+  return io_ctx_impl->operate(obj, &o->impl->o, (ceph::real_time *)o->impl->prt, translate_flags(flags), otel_trace);
+}
+
 int librados::IoCtx::operate(const std::string& oid, librados::ObjectReadOperation *o, bufferlist *pbl)
 {
   object_t obj(oid);
@@ -1559,8 +1563,9 @@ int librados::IoCtx::aio_operate(const std::string& oid, AioCompletion *c,
   if (unlikely(!o->impl))
     return -EINVAL;
   return io_ctx_impl->aio_operate(obj, &o->impl->o, c->pc,
-				  io_ctx_impl->snapc, 0);
+				  io_ctx_impl->snapc, o->impl->prt, 0);
 }
+
 int librados::IoCtx::aio_operate(const std::string& oid, AioCompletion *c,
 				 ObjectWriteOperation *o, int flags)
 {
@@ -1568,8 +1573,19 @@ int librados::IoCtx::aio_operate(const std::string& oid, AioCompletion *c,
   if (unlikely(!o->impl))
     return -EINVAL;
   return io_ctx_impl->aio_operate(obj, &o->impl->o, c->pc,
-				  io_ctx_impl->snapc,
-				  translate_flags(flags));
+				  io_ctx_impl->snapc, o->impl->prt,
+				  translate_flags(flags), nullptr);
+}
+
+int librados::IoCtx::aio_operate(const std::string& oid, AioCompletion *c,
+				 ObjectWriteOperation *o, int flags, const jspan_context* otel_trace)
+{
+  object_t obj(oid);
+  if (unlikely(!o->impl))
+    return -EINVAL;
+  return io_ctx_impl->aio_operate(obj, &o->impl->o, c->pc,
+				  io_ctx_impl->snapc, o->impl->prt,
+				  translate_flags(flags), nullptr, otel_trace);
 }
 
 int librados::IoCtx::aio_operate(const std::string& oid, AioCompletion *c,
@@ -1585,7 +1601,7 @@ int librados::IoCtx::aio_operate(const std::string& oid, AioCompletion *c,
     snv[i] = snaps[i];
   SnapContext snapc(snap_seq, snv);
   return io_ctx_impl->aio_operate(obj, &o->impl->o, c->pc,
-				  snapc, 0);
+				  snapc, o->impl->prt, 0);
 }
 
 int librados::IoCtx::aio_operate(const std::string& oid, AioCompletion *c,
@@ -1602,7 +1618,7 @@ int librados::IoCtx::aio_operate(const std::string& oid, AioCompletion *c,
     snv[i] = snaps[i];
   SnapContext snapc(snap_seq, snv);
   return io_ctx_impl->aio_operate(obj, &o->impl->o, c->pc,
-          snapc, 0, trace_info);
+          snapc, o->impl->prt, 0, trace_info);
 }
 
 int librados::IoCtx::aio_operate(const std::string& oid, AioCompletion *c,
@@ -1618,7 +1634,7 @@ int librados::IoCtx::aio_operate(const std::string& oid, AioCompletion *c,
   for (size_t i = 0; i < snaps.size(); ++i)
     snv[i] = snaps[i];
   SnapContext snapc(snap_seq, snv);
-  return io_ctx_impl->aio_operate(obj, &o->impl->o, c->pc, snapc,
+  return io_ctx_impl->aio_operate(obj, &o->impl->o, c->pc, snapc, o->impl->prt,
                                   translate_flags(flags), trace_info);
 }
 
@@ -2730,9 +2746,16 @@ int librados::Rados::get_pool_stats(std::list<string>& v,
   return -EOPNOTSUPP;
 }
 
+// deprecated, use pool_is_in_selfmanaged_snaps_mode() instead
 bool librados::Rados::get_pool_is_selfmanaged_snaps_mode(const std::string& pool)
 {
-  return client->get_pool_is_selfmanaged_snaps_mode(pool);
+  // errors are ignored, prone to false negative results
+  return client->pool_is_in_selfmanaged_snaps_mode(pool) > 0;
+}
+
+int librados::Rados::pool_is_in_selfmanaged_snaps_mode(const std::string& pool)
+{
+  return client->pool_is_in_selfmanaged_snaps_mode(pool);
 }
 
 int librados::Rados::cluster_stat(cluster_stat_t& result)

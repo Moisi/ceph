@@ -1,6 +1,8 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
+#include "Watch.h"
 #include "PG.h"
 
+#include "common/debug.h"
 #include "include/types.h"
 #include "messages/MWatchNotify.h"
 
@@ -8,7 +10,6 @@
 
 #include "OSD.h"
 #include "PrimaryLogPG.h"
-#include "Watch.h"
 #include "Session.h"
 
 #include "common/config.h"
@@ -393,7 +394,14 @@ void Watch::connect(ConnectionRef con, bool _will_ping)
     last_ping = ceph_clock_now();
     register_cb();
   } else {
-    unregister_cb();
+    if (!con->get_priv()) {
+      // if session is already nullptr
+      // !will_ping should also register WatchTimeout
+      conn = ConnectionRef();
+      register_cb();
+    } else {
+      unregister_cb();
+    }
   }
 }
 

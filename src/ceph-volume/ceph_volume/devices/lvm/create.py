@@ -1,12 +1,12 @@
 from __future__ import print_function
 from textwrap import dedent
 import logging
+import argparse
 from ceph_volume.util import system
 from ceph_volume.util.arg_validators import exclude_group_options
-from ceph_volume import decorators, terminal
+from ceph_volume import decorators, terminal, objectstore
 from .common import create_parser, rollback_osd
-from .prepare import Prepare
-from .activate import Activate
+from typing import List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -15,29 +15,34 @@ class Create(object):
 
     help = 'Create a new OSD from an LVM device'
 
-    def __init__(self, argv):
+    def __init__(self, argv: Optional[List[str]] = None,
+                 args: Optional[argparse.Namespace] = None) -> None:
+        self.objectstore: Optional[objectstore.baseobjectstore.BaseObjectStore] = None
         self.argv = argv
+        self.args = args
 
     @decorators.needs_root
-    def create(self, args):
-        if not args.osd_fsid:
-            args.osd_fsid = system.generate_uuid()
-        prepare_step = Prepare([])
-        prepare_step.safe_prepare(args)
-        osd_id = prepare_step.osd_id
-        try:
-            # we try this for activate only when 'creating' an OSD, because a rollback should not
-            # happen when doing normal activation. For example when starting an OSD, systemd will call
-            # activate, which would never need to be rolled back.
-            Activate([]).activate(args)
-        except Exception:
-            logger.exception('lvm activate was unable to complete, while creating the OSD')
-            logger.info('will rollback OSD ID creation')
-            rollback_osd(args, osd_id)
-            raise
-        terminal.success("ceph-volume lvm create successful for: %s" % args.data)
+    def create(self) -> None:
+        if self.args is not None:
+            if not self.args.osd_fsid:
+                self.args.osd_fsid = system.generate_uuid()
+            self.objectstore = objectstore.mapping['LVM'][self.args.objectstore](args=self.args)
+            if self.objectstore is not None:
+                self.objectstore.safe_prepare()
+                osd_id = self.objectstore.osd_id
+                try:
+                    # we try this for activate only when 'creating' an OSD, because a rollback should not
+                    # happen when doing normal activation. For example when starting an OSD, systemd will call
+                    # activate, which would never need to be rolled back.
+                    self.objectstore.activate()
+                except Exception:
+                    logger.exception('lvm activate was unable to complete, while creating the OSD')
+                    logger.info('will rollback OSD ID creation')
+                    rollback_osd(osd_id)
+                    raise
+                terminal.success("ceph-volume lvm create successful for: %s" % self.args.data)
 
-    def main(self):
+    def main(self) -> None:
         sub_command_help = dedent("""
         Create an OSD by assigning an ID and FSID, registering them with the
         cluster with an ID and FSID, formatting and mounting the volume, adding
@@ -65,13 +70,15 @@ class Create(object):
             prog='ceph-volume lvm create',
             description=sub_command_help,
         )
+        if self.argv is None:
+            self.argv = []
         if len(self.argv) == 0:
             print(sub_command_help)
             return
-        exclude_group_options(parser, groups=['filestore', 'bluestore'], argv=self.argv)
-        args = parser.parse_args(self.argv)
-        # Default to bluestore here since defaulting it in add_argument may
-        # cause both to be True
-        if not args.bluestore and not args.filestore:
-            args.bluestore = True
-        self.create(args)
+        exclude_group_options(parser, groups=['bluestore'], argv=self.argv)
+        if self.args is None:
+            self.args = parser.parse_args(self.argv)
+        if self.args.bluestore:
+            self.args.objectstore = 'bluestore'
+        self.objectstore = objectstore.mapping['LVM'][self.args.objectstore]
+        self.create()

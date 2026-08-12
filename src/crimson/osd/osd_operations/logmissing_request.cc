@@ -16,11 +16,13 @@ namespace {
   }
 }
 
+SET_SUBSYS(osd);
+
 namespace crimson::osd {
 
 LogMissingRequest::LogMissingRequest(crimson::net::ConnectionRef&& conn,
 		       Ref<MOSDPGUpdateLogMissing> &&req)
-  : conn{std::move(conn)},
+  : RemoteOperation{std::move(conn)},
     req{std::move(req)}
 {}
 
@@ -46,23 +48,51 @@ void LogMissingRequest::dump_detail(Formatter *f) const
 
 ConnectionPipeline &LogMissingRequest::get_connection_pipeline()
 {
-  return get_osd_priv(conn.get()).replicated_request_conn_pipeline;
+  return get_osd_priv(&get_local_connection()
+         ).replicated_request_conn_pipeline;
 }
 
-RepRequest::PGPipeline &LogMissingRequest::pp(PG &pg)
+PerShardPipeline &LogMissingRequest::get_pershard_pipeline(
+    ShardServices &shard_services)
 {
-  return pg.replicated_request_pg_pipeline;
+  return shard_services.get_replicated_request_pipeline();
+}
+
+PGRepopPipeline &LogMissingRequest::repop_pipeline(PG &pg)
+{
+  return pg.repop_pipeline;
 }
 
 seastar::future<> LogMissingRequest::with_pg(
   ShardServices &shard_services, Ref<PG> pg)
 {
-  logger().debug("{}: LogMissingRequest::with_pg", *this);
+  LOG_PREFIX(LogMissingRequest::with_pg);
+  DEBUGI("{}: LogMissingRequest::with_pg", *this);
 
   IRef ref = this;
   return interruptor::with_interruption([this, pg] {
-    return pg->do_update_log_missing(req);
-  }, [ref](std::exception_ptr) { return seastar::now(); }, pg);
+    LOG_PREFIX(LogMissingRequest::with_pg);
+    DEBUGI("{}: pg present", *this);
+    return this->template enter_stage<interruptor>(repop_pipeline(*pg).process
+    ).then_interruptible([this, pg] {
+      return this->template with_blocking_event<
+        PG_OSDMapGate::OSDMapBlocker::BlockingEvent
+      >([this, pg](auto &&trigger) {
+        return pg->osdmap_gate.wait_for_map(
+          std::move(trigger), req->min_epoch);
+      });
+    }).then_interruptible([this, pg](auto) {
+      return pg->do_update_log_missing(req, get_remote_connection());
+    }).then_interruptible([this] {
+      logger().debug("{}: complete", *this);
+      return handle.complete();
+    });
+  }, [](std::exception_ptr) {
+    return seastar::now();
+  }, pg, pg->get_osdmap_epoch()).finally([this, ref=std::move(ref)] {
+    logger().debug("{}: exit", *this);
+    handle.exit();
+  });
 }
 
 }

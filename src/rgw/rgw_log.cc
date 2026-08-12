@@ -171,7 +171,7 @@ public:
     num_entries = 0;
     lock.unlock();
 
-    driver->log_usage(this, old_map);
+    driver->log_usage(this, old_map, null_yield);
   }
 
   CephContext *get_cct() const override { return cct; }
@@ -200,21 +200,23 @@ static void log_usage(req_state *s, const string& op_name)
   if (!usage_logger)
     return;
 
-  rgw_user user;
-  rgw_user payer;
-  string bucket_name;
-
-  bucket_name = s->bucket_name;
+  std::string user = to_string(s->owner.id);
+  std::string payer;
+  string bucket_name = s->bucket_name;
 
   if (!bucket_name.empty()) {
-  bucket_name = s->bucket_name;
-    user = s->bucket_owner.get_id();
+    user = to_string(s->bucket_owner.id);
+
+    // As per https://docs.aws.amazon.com/AmazonS3/latest/userguide/RequesterPaysBuckets.html#ChargeDetails
+    // If the bucket has requester pays enabled,
+    // and the requerster includes x-amz-request-payer in the header (this is checked by verify_requester_payer_permission and results in 403 if not present),
+    // and the status code isn't 403,
+    // then the requester is the payer.
     if (!rgw::sal::Bucket::empty(s->bucket.get()) &&
-	s->bucket->get_info().requester_pays) {
-      payer = s->user->get_id();
+        s->bucket->get_info().requester_pays &&
+        s->err.http_ret != 403) {
+      payer = s->user->get_id().to_str();
     }
-  } else {
-      user = s->user->get_id();
   }
 
   bool error = s->err.is_err();
@@ -222,9 +224,7 @@ static void log_usage(req_state *s, const string& op_name)
     bucket_name = "-"; /* bucket not found, use the invalid '-' as bucket name */
   }
 
-  string u = user.to_str();
-  string p = payer.to_str();
-  rgw_usage_log_entry entry(u, p, bucket_name);
+  rgw_usage_log_entry entry(user, payer, bucket_name);
 
   uint64_t bytes_sent = ACCOUNTING_IO(s)->get_bytes_sent();
   uint64_t bytes_received = ACCOUNTING_IO(s)->get_bytes_received();
@@ -238,9 +238,12 @@ static void log_usage(req_state *s, const string& op_name)
   ldpp_dout(s, 30) << "log_usage: bucket_name=" << bucket_name
 	<< " tenant=" << s->bucket_tenant
 	<< ", bytes_sent=" << bytes_sent << ", bytes_received="
-	<< bytes_received << ", success=" << data.successful_ops << dendl;
+	<< bytes_received << ", success=" << data.successful_ops
+	<< ", bytes_processed=" << s->s3select_usage.bytes_processed
+	<< ", bytes_returned=" << s->s3select_usage.bytes_returned << dendl;
 
-  entry.add(op_name, data);
+  entry.add_usage(op_name, data);
+  entry.s3select_usage = s->s3select_usage;
 
   utime_t ts = ceph_clock_now();
 
@@ -251,13 +254,14 @@ void rgw_format_ops_log_entry(struct rgw_log_entry& entry, Formatter *formatter)
 {
   formatter->open_object_section("log_entry");
   formatter->dump_string("bucket", entry.bucket);
+  formatter->dump_string("object", entry.obj.name);
   {
     auto t = utime_t{entry.time};
     t.gmtime(formatter->dump_stream("time"));      // UTC
     t.localtime(formatter->dump_stream("time_local"));
   }
   formatter->dump_string("remote_addr", entry.remote_addr);
-  string obj_owner = entry.object_owner.to_str();
+  string obj_owner = to_string(entry.object_owner);
   if (obj_owner.length())
     formatter->dump_string("object_owner", obj_owner);
   formatter->dump_string("user", entry.user);
@@ -300,6 +304,9 @@ void rgw_format_ops_log_entry(struct rgw_log_entry& entry, Formatter *formatter)
       break;
     case TYPE_ROLE:
       formatter->dump_string("authentication_type","STS");
+      break;
+    case TYPE_ROOT:
+      formatter->dump_string("authentication_type", "Local Account Root");
       break;
     default:
       break;
@@ -605,13 +612,9 @@ int rgw_log_op(RGWREST* const rest, req_state *s, const RGWOp* op, OpsLogSink *o
     uri.append(s->info.env->get("REQUEST_URI"));
   }
 
-  if (s->info.env->exists("QUERY_STRING")) {
-    const char* qs = s->info.env->get("QUERY_STRING");
-    if(qs && (*qs != '\0')) {
-      uri.append("?");
-      uri.append(qs);
-    }
-  }
+  /* Formerly, we appended QUERY_STRING to uri, but in RGW, QUERY_STRING is a
+   * substring of REQUEST_URI--appending qs to uri here duplicates qs to the
+   * ops log */
 
   if (s->info.env->exists("HTTP_VERSION")) {
     uri.append(" ");
@@ -650,9 +653,8 @@ int rgw_log_op(RGWREST* const rest, req_state *s, const RGWOp* op, OpsLogSink *o
   }
 
   entry.user = s->user->get_id().to_str();
-  if (s->object_acl)
-    entry.object_owner = s->object_acl->get_owner().get_id();
-  entry.bucket_owner = s->bucket_owner.get_id();
+  entry.object_owner = s->object_acl.get_owner().id;
+  entry.bucket_owner = s->bucket_owner.id;
 
   uint64_t bytes_sent = ACCOUNTING_IO(s)->get_bytes_sent();
   uint64_t bytes_received = ACCOUNTING_IO(s)->get_bytes_received();
@@ -677,34 +679,38 @@ int rgw_log_op(RGWREST* const rest, req_state *s, const RGWOp* op, OpsLogSink *o
   return 0;
 }
 
-void rgw_log_entry::generate_test_instances(list<rgw_log_entry*>& o)
+list<rgw_log_entry> rgw_log_entry::generate_test_instances()
 {
-  rgw_log_entry *e = new rgw_log_entry;
-  e->object_owner = "object_owner";
-  e->bucket_owner = "bucket_owner";
-  e->bucket = "bucket";
-  e->remote_addr = "1.2.3.4";
-  e->user = "user";
-  e->obj = rgw_obj_key("obj");
-  e->uri = "http://uri/bucket/obj";
-  e->http_status = "200";
-  e->error_code = "error_code";
-  e->bytes_sent = 1024;
-  e->bytes_received = 512;
-  e->obj_size = 2048;
-  e->user_agent = "user_agent";
-  e->referrer = "referrer";
-  e->bucket_id = "10";
-  e->trans_id = "trans_id";
-  e->identity_type = TYPE_RGW;
-  o.push_back(e);
-  o.push_back(new rgw_log_entry);
+  list<rgw_log_entry> o;
+  rgw_log_entry e;
+  e.object_owner = parse_owner("object_owner");
+  e.bucket_owner = parse_owner("bucket_owner");
+  e.bucket = "bucket";
+  e.remote_addr = "1.2.3.4";
+  e.user = "user";
+  e.obj = rgw_obj_key("obj");
+  e.uri = "http://uri/bucket/obj";
+  e.http_status = "200";
+  e.error_code = "error_code";
+  e.bytes_sent = 1024;
+  e.bytes_received = 512;
+  e.obj_size = 2048;
+  e.user_agent = "user_agent";
+  e.referrer = "referrer";
+  e.bucket_id = "10";
+  e.trans_id = "trans_id";
+  e.identity_type = TYPE_RGW;
+  e.account_id = "account_id";
+  e.role_id = "role_id";
+  o.push_back(std::move(e));
+  o.emplace_back();
+  return o;
 }
 
 void rgw_log_entry::dump(Formatter *f) const
 {
-  f->dump_string("object_owner", object_owner.to_str());
-  f->dump_string("bucket_owner", bucket_owner.to_str());
+  f->dump_string("object_owner", to_string(object_owner));
+  f->dump_string("bucket_owner", to_string(bucket_owner));
   f->dump_string("bucket", bucket);
   f->dump_stream("time") << time;
   f->dump_string("remote_addr", remote_addr);
@@ -723,4 +729,10 @@ void rgw_log_entry::dump(Formatter *f) const
   f->dump_string("bucket_id", bucket_id);
   f->dump_string("trans_id", trans_id);
   f->dump_unsigned("identity_type", identity_type);
+  if (!account_id.empty()) {
+    f->dump_string("account_id", account_id);
+  }
+  if (!role_id.empty()) {
+    f->dump_string("role_id", role_id);
+  }
 }

@@ -30,9 +30,9 @@ assumed to be keyword arguments too.
 Snapshot schedules are identified by path, their repeat interval and their start
 time. The
 repeat interval defines the time between two subsequent snapshots. It is
-specified by a number and a period multiplier, one of `h(our)`, `d(ay)` and
-`w(eek)`. E.g. a repeat interval of `12h` specifies one snapshot every 12
-hours.
+specified by a number and a period multiplier, one of `h(our)`, `d(ay)`,
+`w(eek)`, `M(onth)` and `y(ear)`. E.g. a repeat interval of `12h` specifies one
+snapshot every 12 hours.
 The start time is specified as a time string (more details about passing times
 below). By default
 the start time is last midnight. So when a snapshot schedule with repeat
@@ -52,8 +52,8 @@ space or concatenated pairs of `<number><time period>`.
 The semantics are that a spec will ensure `<number>` snapshots are kept that are
 at least `<time period>` apart. For Example `7d` means the user wants to keep 7
 snapshots that are at least one day (but potentially longer) apart from each other.
-The following time periods are recognized: `h(our), d(ay), w(eek), m(onth),
-y(ear)` and `n`. The latter is a special modifier where e.g. `10n` means keep
+The following time periods are recognized: `h(our)`, `d(ay)`, `w(eek)`, `M(onth)`, 
+`y(ear)` and `n`. The latter is a special modifier where e.g. `10n` means keep
 the last 10 snapshots regardless of timing,
 
 All subcommands take optional `fs` argument to specify paths in
@@ -149,6 +149,26 @@ Examples::
   ceph fs snap-schedule retention add / 24h4w # add 24 hourly and 4 weekly to retention
   ceph fs snap-schedule retention remove / 7d4w # remove 7 daily and 4 weekly, leaves 24 hourly
 
+.. note: When adding a path to snap-schedule, remember to strip off the mount
+   point path prefix. Paths to snap-schedule should start at the appropriate
+   CephFS file system root and not at the host file system root.
+   e.g. if the Ceph File System is mounted at ``/mnt`` and the path under which
+   snapshots need to be taken is ``/mnt/some/path`` then the acutal path required
+   by snap-schedule is only ``/some/path``.
+
+.. note: It should be noted that the "created" field in the snap-schedule status
+   command output is the timestamp at which the schedule was created. The "created"
+   timestamp has nothing to do with the creation of actual snapshots. The actual
+   snapshot creation is accounted for in the "created_count" field, which is a
+   cumulative count of the total number of snapshots created so far.
+
+.. note: The maximum number of snapshots to retain per directory is limited by the
+   config tunable `mds_max_snaps_per_dir`. This tunable defaults to 100.
+   To ensure a new snapshot can be created, one snapshot less than this will be
+   retained. So by default, a maximum of 99 snapshots will be retained.
+
+.. note: The --fs argument is now required if there is more than one file system.
+
 Active and inactive schedules
 -----------------------------
 Snapshot schedules can be added for a path that doesn't exist yet in the
@@ -176,6 +196,15 @@ might not get scheduled right away, resulting in a slightly delayed snapshot. If
 this happens, the next snapshot will be schedule as if the previous one was not
 delayed, i.e. one or more delayed snapshots will not cause drift in the overall
 schedule.
+
+If a volume is deleted while snapshot schedules are active on the volume, then
+there might be cases when Python Tracebacks are seen in the log file or on the
+command-line when commands are executed on such volumes. Although measures have
+been taken to take note of the fs_map changes and delete active timers and
+close database connections to avoid Python Tracebacks, it is not possible to
+completely mute the tracebacks due to the inherent nature of problem. In the
+event that such tracebacks are seen, the only solution to get the system to a
+stable state is the disable and re-enable the snap_schedule Manager Module.
 
 In order to somewhat limit the overall number of snapshots in a file system, the
 module will only keep a maximum of 50 snapshots per directory. If the retention

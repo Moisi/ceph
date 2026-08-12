@@ -15,12 +15,14 @@ import { EmptyPipe } from './empty.pipe';
 import { EncodeUriPipe } from './encode-uri.pipe';
 import { FilterPipe } from './filter.pipe';
 import { HealthColorPipe } from './health-color.pipe';
+import { HealthIconPipe } from './health-icon.pipe';
 import { HealthLabelPipe } from './health-label.pipe';
 import { IopsPipe } from './iops.pipe';
 import { IscsiBackstorePipe } from './iscsi-backstore.pipe';
 import { JoinPipe } from './join.pipe';
 import { LogPriorityPipe } from './log-priority.pipe';
 import { MapPipe } from './map.pipe';
+import { MgrSummaryPipe } from './mgr-summary.pipe';
 import { MillisecondsPipe } from './milliseconds.pipe';
 import { NotAvailablePipe } from './not-available.pipe';
 import { OrdinalPipe } from './ordinal.pipe';
@@ -31,6 +33,13 @@ import { SanitizeHtmlPipe } from './sanitize-html.pipe';
 import { SearchHighlightPipe } from './search-highlight.pipe';
 import { TruncatePipe } from './truncate.pipe';
 import { UpperFirstPipe } from './upper-first.pipe';
+import { OctalToHumanReadablePipe } from './octal-to-human-readable.pipe';
+import { PathPipe } from './path.pipe';
+import { PluralizePipe } from './pluralize.pipe';
+import { XmlPipe } from './xml.pipe';
+import { MbpersecondPipe } from './mbpersecond.pipe';
+import { PipeFunctionPipe } from './pipe-function.pipe';
+import { DimlessBinaryPerMinutePipe } from './dimless-binary-per-minute.pipe';
 
 @NgModule({
   imports: [CommonModule],
@@ -64,7 +73,16 @@ import { UpperFirstPipe } from './upper-first.pipe';
     MapPipe,
     TruncatePipe,
     SanitizeHtmlPipe,
-    SearchHighlightPipe
+    SearchHighlightPipe,
+    HealthIconPipe,
+    MgrSummaryPipe,
+    OctalToHumanReadablePipe,
+    PathPipe,
+    PluralizePipe,
+    XmlPipe,
+    MbpersecondPipe,
+    PipeFunctionPipe,
+    DimlessBinaryPerMinutePipe
   ],
   exports: [
     ArrayPipe,
@@ -96,7 +114,16 @@ import { UpperFirstPipe } from './upper-first.pipe';
     MapPipe,
     TruncatePipe,
     SanitizeHtmlPipe,
-    SearchHighlightPipe
+    SearchHighlightPipe,
+    HealthIconPipe,
+    MgrSummaryPipe,
+    OctalToHumanReadablePipe,
+    PathPipe,
+    PluralizePipe,
+    XmlPipe,
+    MbpersecondPipe,
+    PipeFunctionPipe,
+    DimlessBinaryPerMinutePipe
   ],
   providers: [
     ArrayPipe,
@@ -123,7 +150,12 @@ import { UpperFirstPipe } from './upper-first.pipe';
     DurationPipe,
     MapPipe,
     TruncatePipe,
-    SanitizeHtmlPipe
+    SanitizeHtmlPipe,
+    HealthIconPipe,
+    MgrSummaryPipe,
+    OctalToHumanReadablePipe,
+    MbpersecondPipe,
+    DimlessBinaryPerMinutePipe
   ]
 })
 export class PipesModule {}

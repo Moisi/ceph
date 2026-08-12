@@ -16,11 +16,18 @@
 
 #include "acconfig.h"
 
+#include <algorithm>
 #include <iostream>
 #include <fstream>
+#include <iterator>
 
 #include "AsyncMessenger.h"
+#include <utime.h>
+#include <errno.h>
 
+#include "common/Clock.h"
+#include "common/Formatter.h"
+#include "common/cmdparse.h"
 #include "common/config.h"
 #include "common/Timer.h"
 #include "common/errno.h"
@@ -207,22 +214,22 @@ void Processor::accept()
 	} else if (r == -EAGAIN) {
 	  break;
 	} else if (r == -EMFILE || r == -ENFILE) {
-	  lderr(msgr->cct) << __func__ << " open file descriptions limit reached sd = " << listen_socket.fd()
+	  lderr(msgr->cct) << __func__ << " open file descriptors limit reached fd = " << listen_socket.fd()
 			   << " errno " << r << " " << cpp_strerror(r) << dendl;
 	  if (++accept_error_num > msgr->cct->_conf->ms_max_accept_failures) {
-	    lderr(msgr->cct) << "Proccessor accept has encountered enough error numbers, just do ceph_abort()." << dendl;
+	    lderr(msgr->cct) << "Proccessor accept has encountered too many errors, just do ceph_abort()." << dendl;
 	    ceph_abort();
 	  }
 	  continue;
 	} else if (r == -ECONNABORTED) {
-	  ldout(msgr->cct, 0) << __func__ << " it was closed because of rst arrived sd = " << listen_socket.fd()
+	  ldout(msgr->cct, 0) << __func__ << " closed because of rst arrival fd = " << listen_socket.fd()
 			      << " errno " << r << " " << cpp_strerror(r) << dendl;
 	  continue;
 	} else {
 	  lderr(msgr->cct) << __func__ << " no incoming connection?"
 			   << " errno " << r << " " << cpp_strerror(r) << dendl;
 	  if (++accept_error_num > msgr->cct->_conf->ms_max_accept_failures) {
-	    lderr(msgr->cct) << "Proccessor accept has encountered enough error numbers, just do ceph_abort()." << dendl;
+	    lderr(msgr->cct) << "Proccessor accept has encountered too many errors, just do ceph_abort()." << dendl;
 	    ceph_abort();
 	  }
 	  continue;
@@ -274,6 +281,85 @@ class C_handle_reap : public EventCallback {
 };
 
 /*******************
+ * Admin Socket Hook
+ */
+
+AsyncMessengerSocketHook::AsyncMessengerSocketHook(
+    AsyncMessenger& m, const std::string& name)
+    : m_msgrs{{name, &m}} {}
+
+int AsyncMessengerSocketHook::call(
+    std::string_view command, const cmdmap_t& cmdmap, const bufferlist&,
+    Formatter* f, std::ostream& errss, ceph::buffer::list& out) {
+  if (command == "messenger dump") {
+    std::string name;
+    if (common::cmd_getval(cmdmap, "msgr", name)) {
+      if (auto it = m_msgrs.find(name); it != m_msgrs.end()) {
+        std::vector<std::string> opts;
+        const bool tcp_info =
+            common::cmd_getval_or<bool>(cmdmap, "tcp_info", false);
+        const bool has_filter =
+            common::cmd_getval(cmdmap, "dumpcontents", opts);
+        const std::set<std::string> optset(opts.begin(), opts.end());
+        const bool all = !has_filter || optset.contains("all");
+        const auto filter_fn = [&](const std::string& key) {
+          if (key == "tcp_info") {
+            return tcp_info;
+          } else if (all) {
+            return true;
+          } else {
+            return optset.contains(key);
+          }
+        };
+
+        const auto msgr = (*it).second;
+        f->open_object_section("status");
+	f->dump_string("name", name);
+        f->open_object_section("messenger");
+        msgr->dump(f, filter_fn);
+        f->close_section();  // messenger
+        f->close_section();  // status
+        return 0;
+      } else {
+        return -ENOENT;
+      }
+    } else {
+      f->open_object_section("status");
+      f->open_array_section("messengers");
+      for (const auto& [name, _] : m_msgrs) {
+        f->dump_string("name", name);
+      }
+      f->close_section();
+      f->close_section();
+      return 0;
+    }
+  }
+  return -ENOSYS;
+}
+
+bool AsyncMessengerSocketHook::add_messenger(
+    const std::string& name, AsyncMessenger& msgr) {
+  const auto result = m_msgrs.try_emplace(name, &msgr);
+  return result.second;
+}
+
+void AsyncMessengerSocketHook::remove_messenger(
+    AsyncMessenger& msgr) {
+  for (auto it = m_msgrs.begin(); it != m_msgrs.end(); ++it) {
+    if (&msgr == it->second) {
+      m_msgrs.erase(it);
+      break;
+    }
+  }
+}
+std::list<std::string> AsyncMessengerSocketHook::messengers() const {
+  std::list<std::string> result;
+  std::transform(m_msgrs.begin(), m_msgrs.end(), std::back_inserter(result),
+		 [](const auto& pair) { return pair.first; });
+  return result;
+}
+
+/*******************
  * AsyncMessenger
  */
 
@@ -304,6 +390,49 @@ AsyncMessenger::AsyncMessenger(CephContext *cct, entity_name_t name,
     processor_num = stack->get_num_worker();
   for (unsigned i = 0; i < processor_num; ++i)
     processors.push_back(new Processor(this, stack->get_worker(i), cct));
+
+  cct->modify_msgr_hook(
+      [&]() {
+        auto hook = new AsyncMessengerSocketHook(*this, mname);
+        const int asok_ret = cct->get_admin_socket()->register_command(
+            AsyncMessengerSocketHook::COMMAND, hook, "dump messenger status");
+        if (asok_ret != 0) {
+          ldout(cct, 0) << __func__ << " messenger asok command \""
+                        << AsyncMessengerSocketHook::COMMAND << "\" failed with"
+                        << asok_ret << dendl;
+        }
+        return hook;
+      },
+      [&](AdminSocketHook* ptr) {
+        if (auto hook = dynamic_cast<AsyncMessengerSocketHook*>(ptr)) {
+          // Name collisions may occur. A common case is RGW running
+          // multiple librados connections - each with a "radosclient"
+          // messenger.
+          std::string msgr_key(mname);
+          if (mname == "radosclient") {  // librados
+            msgr_key.append("-");
+            msgr_key.append(std::to_string(_nonce));
+          }
+          bool added = hook->add_messenger(msgr_key, *this);
+          if (!added) {
+            msgr_key.append("-");
+            msgr_key.append(std::to_string(_nonce));
+          }
+          added = hook->add_messenger(msgr_key, *this);
+          if (!added) {
+            ldout(cct, 10)
+                << __func__ << " registering messenger " << mname
+                << " using key " << msgr_key
+                << " failed due to a name collision. "
+                   "messenger won't be available to \"messenger dump\""
+                << dendl;
+          }
+        } else {
+          ceph_abort(
+              "BUG: messenger hook obj set, but not of type "
+              "AsyncMessengerSocketHook");
+        }
+      });
 }
 
 /**
@@ -312,6 +441,17 @@ AsyncMessenger::AsyncMessenger(CephContext *cct, entity_name_t name,
  */
 AsyncMessenger::~AsyncMessenger()
 {
+  cct->modify_msgr_hook(
+      []() -> AdminSocketHook* { return nullptr; },
+      [&](AdminSocketHook* ptr) {
+	if (auto hook = dynamic_cast<AsyncMessengerSocketHook*>(ptr)) {
+	  hook->remove_messenger(*this);
+	} else {
+	  ceph_abort(
+	      "BUG: messenger hook obj set, but not of type "
+	      "AsyncMessengerSocketHook");
+	}
+      });
   delete reap_handler;
   ceph_assert(!did_bind); // either we didn't bind or we shut down the Processor
   for (auto &&p : processors)
@@ -324,7 +464,7 @@ void AsyncMessenger::ready()
 
   stack->ready();
   if (pending_bind) {
-    int err = bindv(pending_bind_addrs);
+    int err = bindv(pending_bind_addrs, saved_public_addrs);
     if (err) {
       lderr(cct) << __func__ << " postponed bind failed" << dendl;
       ceph_abort();
@@ -341,6 +481,7 @@ int AsyncMessenger::shutdown()
 {
   ldout(cct,10) << __func__ << " " << get_myaddrs() << dendl;
 
+  stack->drain();
   // done!  clean up.
   for (auto &&p : processors)
     p->stop();
@@ -353,13 +494,93 @@ int AsyncMessenger::shutdown()
   stop_cond.notify_all();
   stopped = true;
   lock.unlock();
-  stack->drain();
+
   return 0;
 }
 
-int AsyncMessenger::bind(const entity_addr_t &bind_addr)
+void AsyncMessenger::dump(
+    Formatter* f, std::function<bool(const std::string&)> filter) const {
+  const bool tcp_info = filter("tcp_info");
+  std::lock_guard l{lock};
+  f->dump_unsigned("nonce", nonce);
+  f->open_object_section("my_name");
+  my_name.dump(f);
+  f->close_section();  // my_name
+  f->open_object_section("my_addrs");
+  my_addrs->dump(f);
+  f->close_section();  // my_addrs
+
+  if (filter("listen_sockets")) {
+    f->open_array_section("listen_sockets");
+    for (const auto& proc : processors) {
+      for (const auto& sock : proc->listen_sockets) {
+        f->open_object_section("socket");
+        f->dump_int("socket_fd", sock.fd());
+
+        f->dump_int("worker_id", proc->worker ? proc->worker->id : -1);
+        f->close_section();  // socket
+      }
+    }
+    f->close_section();  // listen_sockets
+  }
+
+  f->open_object_section("dispatch_queue");
+  f->dump_int("length", get_dispatch_queue_len());
+  utime_t dispatch_queue_max_age;
+  dispatch_queue_max_age.set_from_double(
+      get_dispatch_queue_max_age(ceph_clock_now()));
+  f->dump_string("max_age_ago", utimespan_str(dispatch_queue_max_age));
+  f->close_section();  // dispatch_queue
+
+  f->dump_int("connections_count", conns.size());
+
+  if (filter("connections")) {
+    f->open_array_section("connections");
+    for (const auto& [e, c] : conns) {
+      f->open_object_section("connection");
+      e.dump(f);
+      c->dump(f, tcp_info);
+      f->close_section();  // connection
+    }
+    f->close_section();  // connections
+  }
+
+  if (filter("anon_conns")) {
+    f->open_array_section("anon_conns");
+    for (const auto& c : anon_conns) {
+      c->dump(f, tcp_info);
+    }
+    f->close_section();  // anon_conns
+  }
+
+  if (filter("accepting_conns")) {
+    f->open_array_section("accepting_conns");
+    for (const auto& c : accepting_conns) {
+      c->dump(f, tcp_info);
+    }
+    f->close_section();  // accepting_conns
+  }
+
+  if (filter("deleted_conns")) {
+    f->open_array_section("deleted_conns");
+    for (const auto& c : deleted_conns) {
+      c->dump(f, tcp_info);
+    }
+    f->close_section();  // deleted_conns
+  }
+
+  if (local_connection) {
+    f->open_array_section("local_connection");
+    local_connection->dump(f, tcp_info);
+    f->close_section();  // local_connection
+  }
+}
+
+int AsyncMessenger::bind(const entity_addr_t &bind_addr,
+                         std::optional<entity_addrvec_t> public_addrs)
 {
-  ldout(cct,10) << __func__ << " " << bind_addr << dendl;
+  ldout(cct, 10) << __func__ << " " << bind_addr
+                 << " public " << public_addrs << dendl;
   // old bind() can take entity_addr_t(). new bindv() can take a
   // 0.0.0.0-like address but needs type and family to be set.
   auto a = bind_addr;
@@ -371,10 +592,11 @@ int AsyncMessenger::bind(const entity_addr_t &bind_addr)
       a.set_family(AF_INET);
     }
   }
-  return bindv(entity_addrvec_t(a));
+  return bindv(entity_addrvec_t(a), public_addrs);
 }
 
-int AsyncMessenger::bindv(const entity_addrvec_t &bind_addrs)
+int AsyncMessenger::bindv(const entity_addrvec_t &bind_addrs,
+                          std::optional<entity_addrvec_t> public_addrs)
 {
   lock.lock();
 
@@ -384,7 +606,14 @@ int AsyncMessenger::bindv(const entity_addrvec_t &bind_addrs)
     return -1;
   }
 
-  ldout(cct,10) << __func__ << " " << bind_addrs << dendl;
+  ldout(cct, 10) << __func__ << " " << bind_addrs
+                 << " public " << public_addrs << dendl;
+  if (public_addrs && bind_addrs != public_addrs) {
+    // for the sake of rebind() and the is-not-ready case let's
+    // store public_addrs. there is no point in that if public
+    // addrs are indifferent from bind_addrs.
+    saved_public_addrs = std::move(public_addrs);
+  }
 
   if (!stack->is_ready()) {
     ldout(cct, 10) << __func__ << " Network Stack is not ready for bind yet - postponed" << dendl;
@@ -491,9 +720,29 @@ void AsyncMessenger::_finish_bind(const entity_addrvec_t& bind_addrs,
   if (get_myaddrs().front().get_port() == 0) {
     set_myaddrs(listen_addrs);
   }
-  entity_addrvec_t newaddrs = *my_addrs;
-  for (auto& a : newaddrs.v) {
-    a.set_nonce(nonce);
+
+  entity_addrvec_t newaddrs;
+  if (saved_public_addrs) {
+    newaddrs = *saved_public_addrs;
+    for (auto& public_addr : newaddrs.v) {
+      public_addr.set_nonce(nonce);
+      if (public_addr.is_ip() && public_addr.get_port() == 0) {
+	// port is not explicitly set. This is fine as it can be figured
+	// out by msgr. For instance, the low-level `Processor::bind`
+	// scans for free ports in a range controlled by ms_bind_port_min
+	// and ms_bind_port_max.
+        for (const auto& a : my_addrs->v) {
+          if (public_addr.get_type() == a.get_type() && a.is_ip()) {
+             public_addr.set_port(a.get_port());
+          }
+        }
+      }
+    }
+  } else {
+    newaddrs = *my_addrs;
+    for (auto& a : newaddrs.v) {
+      a.set_nonce(nonce);
+    }
   }
   set_myaddrs(newaddrs);
 
@@ -552,7 +801,7 @@ void AsyncMessenger::wait()
     if (!started) {
       return;
     }
-    if (!stopped)
+    while (!stopped)
       stop_cond.wait(locker);
   }
   dispatch_queue.shutdown();
@@ -581,6 +830,7 @@ void AsyncMessenger::add_accept(Worker *w, ConnectedSocket cli_socket,
 						listen_addr.is_msgr2(), false);
   conn->accept(std::move(cli_socket), listen_addr, peer_addr);
   accepting_conns.insert(conn);
+  w->get_perf_counter()->inc(l_msgr_active_connections);
 }
 
 AsyncConnectionRef AsyncMessenger::create_connect(
@@ -765,17 +1015,6 @@ bool AsyncMessenger::set_addr_unknowns(const entity_addrvec_t &addrs)
   return ret;
 }
 
-void AsyncMessenger::set_addrs(const entity_addrvec_t &addrs)
-{
-  std::lock_guard l{lock};
-  auto t = addrs;
-  for (auto& a : t.v) {
-    a.set_nonce(nonce);
-  }
-  set_myaddrs(t);
-  _init_local_connection();
-}
-
 void AsyncMessenger::shutdown_connections(bool queue_reset)
 {
   ldout(cct,1) << __func__ << " " << dendl;
@@ -846,7 +1085,6 @@ int AsyncMessenger::accept_conn(const AsyncConnectionRef& conn)
       conn->policy.lossy &&
       !conn->policy.register_lossy_clients) {
     anon_conns.insert(conn);
-    conn->get_perf_counter()->inc(l_msgr_active_connections);
     return 0;
   }
   auto it = conns.find(*conn->peer_addrs);
@@ -865,7 +1103,6 @@ int AsyncMessenger::accept_conn(const AsyncConnectionRef& conn)
   }
   ldout(cct, 10) << __func__ << " " << conn << " " << *conn->peer_addrs << dendl;
   conns[*conn->peer_addrs] = conn;
-  conn->get_perf_counter()->inc(l_msgr_active_connections);
   accepting_conns.erase(conn);
   return 0;
 }

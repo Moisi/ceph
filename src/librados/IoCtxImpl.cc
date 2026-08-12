@@ -241,6 +241,9 @@ librados::IoCtxImpl::IoCtxImpl(RadosClient *c, Objecter *objecter,
     oloc(poolid),
     aio_write_seq(0), objecter(objecter)
 {
+  if (!c->cct->_conf.get_val<bool>("rados_replica_read_policy_on_objclass")) {
+    objclass_flags_mask = ~(CEPH_OSD_FLAG_LOCALIZE_READS | CEPH_OSD_FLAG_BALANCE_READS);
+  }
 }
 
 void librados::IoCtxImpl::set_snap_read(snapid_t s)
@@ -637,7 +640,7 @@ int librados::IoCtxImpl::writesame(const object_t& oid, bufferlist& bl,
 }
 
 int librados::IoCtxImpl::operate(const object_t& oid, ::ObjectOperation *o,
-				 ceph::real_time *pmtime, int flags)
+				 ceph::real_time *pmtime, int flags, const jspan_context* otel_trace)
 {
   ceph::real_time ut = (pmtime ? *pmtime :
     ceph::real_clock::now());
@@ -664,7 +667,7 @@ int librados::IoCtxImpl::operate(const object_t& oid, ::ObjectOperation *o,
     oid, oloc,
     *o, snapc, ut,
     flags | extra_op_flags,
-    oncommit, &ver);
+    oncommit, &ver, osd_reqid_t(), nullptr, otel_trace);
   objecter->op_submit(objecter_op);
 
   {
@@ -682,7 +685,8 @@ int librados::IoCtxImpl::operate(const object_t& oid, ::ObjectOperation *o,
 int librados::IoCtxImpl::operate_read(const object_t& oid,
 				      ::ObjectOperation *o,
 				      bufferlist *pbl,
-				      int flags)
+				      int flags,
+                                      int flags_mask)
 {
   if (!o->size())
     return 0;
@@ -701,6 +705,7 @@ int librados::IoCtxImpl::operate_read(const object_t& oid,
     oid, oloc,
     *o, snap_seq, pbl,
     flags | extra_op_flags,
+    flags_mask,
     onack, &ver);
   objecter->op_submit(objecter_op);
 
@@ -741,7 +746,7 @@ int librados::IoCtxImpl::aio_operate_read(const object_t &oid,
   trace.event("init root span");
   Objecter::Op *objecter_op = objecter->prepare_read_op(
     oid, oloc,
-    *o, snap_seq, pbl, flags | extra_op_flags,
+    *o, snap_seq, pbl, flags | extra_op_flags, -1,
     oncomplete, &c->objver, nullptr, 0, &trace);
   objecter->op_submit(objecter_op, &c->tid);
   trace.event("rados operate read submitted");
@@ -751,12 +756,13 @@ int librados::IoCtxImpl::aio_operate_read(const object_t &oid,
 
 int librados::IoCtxImpl::aio_operate(const object_t& oid,
 				     ::ObjectOperation *o, AioCompletionImpl *c,
-				     const SnapContext& snap_context, int flags,
-                                     const blkin_trace_info *trace_info)
+				     const SnapContext& snap_context,
+				     const ceph::real_time *pmtime, int flags,
+                                     const blkin_trace_info *trace_info, const jspan_context *otel_trace)
 {
   FUNCTRACE(client->cct);
   OID_EVENT_TRACE(oid.name.c_str(), "RADOS_WRITE_OP_BEGIN");
-  auto ut = ceph::real_clock::now();
+  const ceph::real_time ut = (pmtime ? *pmtime : ceph::real_clock::now());
   /* can't write to a snapshot */
   if (snap_seq != CEPH_NOSNAP)
     return -EROFS;
@@ -778,7 +784,7 @@ int librados::IoCtxImpl::aio_operate(const object_t& oid,
   trace.event("init root span");
   Objecter::Op *op = objecter->prepare_mutate_op(
     oid, oloc, *o, snap_context, ut, flags | extra_op_flags,
-    oncomplete, &c->objver, osd_reqid_t(), &trace);
+    oncomplete, &c->objver, osd_reqid_t(), &trace, otel_trace);
   objecter->op_submit(op, &c->tid);
   trace.event("rados operate op submitted");
 
@@ -882,7 +888,7 @@ int librados::IoCtxImpl::aio_sparse_read(const object_t oid,
 
   Objecter::Op *o = objecter->prepare_read_op(
     oid, oloc,
-    onack->m_ops, snapid, NULL, extra_op_flags,
+    onack->m_ops, snapid, NULL, extra_op_flags, -1,
     onack, &c->objver);
   objecter->op_submit(o, &c->tid);
   return 0;
@@ -931,7 +937,7 @@ int librados::IoCtxImpl::aio_cmpext(const object_t& oid,
   onack->m_ops.cmpext(off, cmp_len, cmp_buf, NULL);
 
   Objecter::Op *o = objecter->prepare_read_op(
-    oid, oloc, onack->m_ops, snap_seq, NULL, extra_op_flags, onack, &c->objver);
+    oid, oloc, onack->m_ops, snap_seq, NULL, extra_op_flags, -1, onack, &c->objver);
   objecter->op_submit(o, &c->tid);
   return 0;
 }
@@ -1137,7 +1143,7 @@ int librados::IoCtxImpl::aio_rmxattr(const object_t& oid, AioCompletionImpl *c,
   ::ObjectOperation op;
   prepare_assert_ops(&op);
   op.rmxattr(name);
-  return aio_operate(oid, &op, c, snapc, 0);
+  return aio_operate(oid, &op, c, snapc, nullptr, 0);
 }
 
 int librados::IoCtxImpl::aio_setxattr(const object_t& oid, AioCompletionImpl *c,
@@ -1146,7 +1152,7 @@ int librados::IoCtxImpl::aio_setxattr(const object_t& oid, AioCompletionImpl *c,
   ::ObjectOperation op;
   prepare_assert_ops(&op);
   op.setxattr(name, bl);
-  return aio_operate(oid, &op, c, snapc, 0);
+  return aio_operate(oid, &op, c, snapc, nullptr, 0);
 }
 
 namespace {
@@ -1234,7 +1240,7 @@ int librados::IoCtxImpl::remove(const object_t& oid)
   ::ObjectOperation op;
   prepare_assert_ops(&op);
   op.remove();
-  return operate(oid, &op, nullptr, librados::OPERATION_FULL_FORCE);
+  return operate(oid, &op, nullptr, CEPH_OSD_FLAG_FULL_FORCE);
 }
 
 int librados::IoCtxImpl::remove(const object_t& oid, int flags)
@@ -1310,7 +1316,7 @@ int librados::IoCtxImpl::exec(const object_t& oid,
   ::ObjectOperation rd;
   prepare_assert_ops(&rd);
   rd.call(cls, method, inbl);
-  return operate_read(oid, &rd, &outbl);
+  return operate_read(oid, &rd, &outbl, 0, objclass_flags_mask);
 }
 
 int librados::IoCtxImpl::aio_exec(const object_t& oid, AioCompletionImpl *c,
@@ -1330,7 +1336,7 @@ int librados::IoCtxImpl::aio_exec(const object_t& oid, AioCompletionImpl *c,
   prepare_assert_ops(&rd);
   rd.call(cls, method, inbl);
   Objecter::Op *o = objecter->prepare_read_op(
-    oid, oloc, rd, snap_seq, outbl, extra_op_flags, oncomplete, &c->objver);
+    oid, oloc, rd, snap_seq, outbl, extra_op_flags, objclass_flags_mask, oncomplete, &c->objver);
   objecter->op_submit(o, &c->tid);
   return 0;
 }
@@ -1356,7 +1362,7 @@ int librados::IoCtxImpl::aio_exec(const object_t& oid, AioCompletionImpl *c,
   prepare_assert_ops(&rd);
   rd.call(cls, method, inbl);
   Objecter::Op *o = objecter->prepare_read_op(
-    oid, oloc, rd, snap_seq, &c->bl, extra_op_flags, oncomplete, &c->objver);
+    oid, oloc, rd, snap_seq, &c->bl, extra_op_flags, objclass_flags_mask, oncomplete, &c->objver);
   objecter->op_submit(o, &c->tid);
   return 0;
 }
@@ -1787,9 +1793,12 @@ int librados::IoCtxImpl::notify(const object_t& oid, bufferlist& bl,
                                                             extra_op_flags);
 
   C_SaferCond notify_finish_cond;
+  auto e = boost::asio::prefer(
+    objecter->service.get_executor(),
+    boost::asio::execution::outstanding_work.tracked);
   linger_op->on_notify_finish =
-    Objecter::LingerOp::OpComp::create(
-      objecter->service.get_executor(),
+    boost::asio::bind_executor(
+      std::move(e),
       CB_notify_Finish(client->cct, &notify_finish_cond,
                        objecter, linger_op, preply_bl,
                        preply_buf, preply_buf_len));
@@ -1843,9 +1852,12 @@ int librados::IoCtxImpl::aio_notify(const object_t& oid, AioCompletionImpl *c,
   c->io = this;
 
   C_aio_notify_Complete *oncomplete = new C_aio_notify_Complete(c, linger_op);
+  auto e = boost::asio::prefer(
+    objecter->service.get_executor(),
+    boost::asio::execution::outstanding_work.tracked);
   linger_op->on_notify_finish =
-    Objecter::LingerOp::OpComp::create(
-      objecter->service.get_executor(),
+    boost::asio::bind_executor(
+      std::move(e),
       CB_notify_Finish(client->cct, oncomplete,
                        objecter, linger_op,
                        preply_bl, preply_buf,

@@ -10,8 +10,6 @@ endif()
 
 set(dencoder_srcs
   ceph_dencoder.cc
-  ../../include/uuid.cc
-  ../../include/utime.cc
   $<TARGET_OBJECTS:common_texttable_obj>)
 add_executable(ceph-dencoder ${dencoder_srcs})
 set_target_properties(ceph-dencoder PROPERTIES
@@ -20,6 +18,7 @@ set_target_properties(ceph-dencoder PROPERTIES
 
 set(denc_plugin_dir ${CEPH_INSTALL_FULL_PKGLIBDIR}/denc)
 add_custom_target(ceph-dencoder-modules)
+add_dependencies(ceph-dencoder ceph-dencoder-modules)
 
 function(add_denc_mod name)
   add_library(${name} SHARED
@@ -39,6 +38,7 @@ endfunction()
 add_denc_mod(denc-mod-common
   common_types.cc)
 target_link_libraries(denc-mod-common
+  ceph-common
   journal
   cls_cas_internal
   cls_lock_client
@@ -87,6 +87,16 @@ if(WITH_RBD)
   endif()
 endif()
 
+if(WITH_NVMEOF_GATEWAY_MONITOR_CLIENT)
+  add_denc_mod(denc-mod-nvmeof
+    nvmeof_types.cc)
+  target_link_libraries(denc-mod-nvmeof
+    mon
+    ceph-common
+    )
+endif()
+
+
 if(WITH_CEPHFS)
   add_denc_mod(denc-mod-cephfs
     mds_types.cc)
@@ -99,7 +109,7 @@ target_compile_definitions(ceph-dencoder PRIVATE
 
 target_link_libraries(ceph-dencoder
   StdFilesystem::filesystem
-  ceph-common
+  global
   ${DENCODER_EXTRALIBS}
   cls_log_client
   cls_version_client

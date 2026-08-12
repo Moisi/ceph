@@ -5,6 +5,8 @@ from typing import Tuple, Optional, List, Dict, Any
 from mgr_module import MgrModule, CLICommand, Option, CLICheckNonemptyFileInput
 import object_format
 import orchestrator
+from orchestrator.module import IngressType
+from mgr_util import CephFSEarmarkResolver
 
 from .export import ExportMgr, AppliedExportResults
 from .cluster import NFSCluster
@@ -37,8 +39,10 @@ class Module(orchestrator.OrchestratorClientMixin, MgrModule):
             client_addr: Optional[List[str]] = None,
             squash: str = 'none',
             sectype: Optional[List[str]] = None,
+            cmount_path: Optional[str] = "/"
     ) -> Dict[str, Any]:
         """Create a CephFS export"""
+        earmark_resolver = CephFSEarmarkResolver(self)
         return self.export_mgr.create_export(
             fsal_type='cephfs',
             fs_name=fsname,
@@ -49,6 +53,8 @@ class Module(orchestrator.OrchestratorClientMixin, MgrModule):
             squash=squash,
             addr=client_addr,
             sectype=sectype,
+            cmount_path=cmount_path,
+            earmark_resolver=earmark_resolver
         )
 
     @CLICommand('nfs export create rgw', perm='rw')
@@ -111,8 +117,10 @@ class Module(orchestrator.OrchestratorClientMixin, MgrModule):
     @CLICheckNonemptyFileInput(desc='Export JSON or Ganesha EXPORT specification')
     @object_format.Responder()
     def _cmd_nfs_export_apply(self, cluster_id: str, inbuf: str) -> AppliedExportResults:
+        earmark_resolver = CephFSEarmarkResolver(self)
         """Create or update an export by `-i <json_or_ganesha_export_file>`"""
-        return self.export_mgr.apply_export(cluster_id, export_config=inbuf)
+        return self.export_mgr.apply_export(cluster_id, export_config=inbuf,
+                                            earmark_resolver=earmark_resolver)
 
     @CLICommand('nfs cluster create', perm='rw')
     @object_format.EmptyResponder()
@@ -121,11 +129,12 @@ class Module(orchestrator.OrchestratorClientMixin, MgrModule):
                                 placement: Optional[str] = None,
                                 ingress: Optional[bool] = None,
                                 virtual_ip: Optional[str] = None,
+                                ingress_mode: Optional[IngressType] = None,
                                 port: Optional[int] = None) -> None:
         """Create an NFS Cluster"""
         return self.nfs.create_nfs_cluster(cluster_id=cluster_id, placement=placement,
                                            virtual_ip=virtual_ip, ingress=ingress,
-                                           port=port)
+                                           ingress_mode=ingress_mode, port=port)
 
     @CLICommand('nfs cluster rm', perm='rw')
     @object_format.EmptyResponder()
@@ -174,8 +183,10 @@ class Module(orchestrator.OrchestratorClientMixin, MgrModule):
     def fetch_nfs_export_obj(self) -> ExportMgr:
         return self.export_mgr
 
-    def export_ls(self) -> List[Dict[Any, Any]]:
-        return self.export_mgr.list_all_exports()
+    def export_ls(self, cluster_id: Optional[str] = None, detailed: bool = False) -> List[Dict[Any, Any]]:
+        if not (cluster_id):
+            return self.export_mgr.list_all_exports()
+        return self.export_mgr.list_exports(cluster_id, detailed)
 
     def export_get(self, cluster_id: str, export_id: int) -> Optional[Dict[str, Any]]:
         return self.export_mgr.get_export_by_id(cluster_id, export_id)
@@ -185,3 +196,9 @@ class Module(orchestrator.OrchestratorClientMixin, MgrModule):
 
     def cluster_ls(self) -> List[str]:
         return available_clusters(self)
+
+    def cluster_info(self, cluster_id: Optional[str] = None) -> Dict[str, Any]:
+        return self.nfs.show_nfs_cluster_info(cluster_id=cluster_id)
+
+    def fetch_nfs_cluster_obj(self) -> NFSCluster:
+        return self.nfs

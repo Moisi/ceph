@@ -526,7 +526,7 @@ bool cephx_verify_authorizer(CephContext *cct, const KeyStore& keys,
     // generate a connection secret
     connection_secret->resize(connection_secret_required_len);
     if (connection_secret_required_len) {
-#ifdef WITH_SEASTAR
+#ifdef WITH_CRIMSON
       std::random_device rd;
       std::generate_n(connection_secret->data(),
 		      connection_secret_required_len,
@@ -584,7 +584,7 @@ bool CephXAuthorizer::add_challenge(CephContext *cct,
   auto p = challenge.begin();
   if (!p.end()) {
     std::string error;
-    CephXAuthorizeChallenge ch;
+    CephXAuthorizeChallenge ch{};
     decode_decrypt_enc_bl(cct, ch, session_key, challenge, error);
     if (!error.empty()) {
       ldout(cct, 0) << "failed to decrypt challenge (" << challenge.length() << " bytes): "

@@ -89,6 +89,18 @@ struct rgw_placement_rule {
     from_str(s);
   }
 
+  void dump(Formatter *f) const {
+    f->dump_string("name", name);
+    f->dump_string("storage_class", get_storage_class());
+  }
+
+  static std::list<rgw_placement_rule> generate_test_instances() {
+    std::list<rgw_placement_rule> o;
+    o.emplace_back();
+    o.push_back(rgw_placement_rule("name", "storage_class"));
+    return o;
+  }
+
   std::string to_str() const {
     if (standard_storage_class()) {
       return name;

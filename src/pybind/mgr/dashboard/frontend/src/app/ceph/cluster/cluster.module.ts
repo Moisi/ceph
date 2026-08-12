@@ -3,18 +3,36 @@ import { NgModule } from '@angular/core';
 import { FormsModule, ReactiveFormsModule } from '@angular/forms';
 import { RouterModule } from '@angular/router';
 
-import { TreeModule } from '@circlon/angular-tree-component';
+import {
+  ComboBoxModule,
+  DropdownModule,
+  CheckboxModule,
+  ButtonModule,
+  GridModule,
+  ProgressIndicatorModule,
+  InputModule,
+  ModalModule,
+  TreeviewModule,
+  ListModule,
+  ToggletipModule,
+  IconModule,
+  IconService
+} from 'carbon-components-angular';
+import Analytics from '@carbon/icons/es/analytics/16';
+import CloseFilled from '@carbon/icons/es/close--filled/16';
+import ProgressBarRoundIcon from '@carbon/icons/es/progress-bar--round/32';
 import {
   NgbActiveModal,
   NgbDatepickerModule,
   NgbDropdownModule,
   NgbNavModule,
   NgbPopoverModule,
+  NgbProgressbarModule,
   NgbTimepickerModule,
   NgbTooltipModule,
   NgbTypeaheadModule
 } from '@ng-bootstrap/ng-bootstrap';
-import { NgxPipeFunctionModule } from 'ngx-pipe-function';
+import { PipesModule } from '~/app/shared/pipes/pipes.module';
 
 import { SharedModule } from '~/app/shared/shared.module';
 import { PerformanceCounterModule } from '../performance-counter/performance-counter.module';
@@ -57,6 +75,14 @@ import { ServiceDetailsComponent } from './services/service-details/service-deta
 import { ServiceFormComponent } from './services/service-form/service-form.component';
 import { ServicesComponent } from './services/services.component';
 import { TelemetryComponent } from './telemetry/telemetry.component';
+import { UpgradeComponent } from './upgrade/upgrade.component';
+import { UpgradeStartModalComponent } from './upgrade/upgrade-form/upgrade-start-modal.component';
+import { UpgradeProgressComponent } from './upgrade/upgrade-progress/upgrade-progress.component';
+import { MultiClusterComponent } from './multi-cluster/multi-cluster.component';
+import { MultiClusterFormComponent } from './multi-cluster/multi-cluster-form/multi-cluster-form.component';
+import { MultiClusterListComponent } from './multi-cluster/multi-cluster-list/multi-cluster-list.component';
+import { DashboardV3Module } from '../dashboard-v3/dashboard-v3.module';
+import { MultiClusterDetailsComponent } from './multi-cluster/multi-cluster-details/multi-cluster-details.component';
 
 @NgModule({
   imports: [
@@ -71,15 +97,27 @@ import { TelemetryComponent } from './telemetry/telemetry.component';
     MgrModulesModule,
     NgbTypeaheadModule,
     NgbTimepickerModule,
-    TreeModule,
+    TreeviewModule,
     CephSharedModule,
     NgbDatepickerModule,
     NgbPopoverModule,
     NgbDropdownModule,
-    NgxPipeFunctionModule
+    PipesModule,
+    NgbProgressbarModule,
+    DashboardV3Module,
+    ComboBoxModule,
+    DropdownModule,
+    CheckboxModule,
+    GridModule,
+    ProgressIndicatorModule,
+    ButtonModule,
+    InputModule,
+    ModalModule,
+    ListModule,
+    ToggletipModule,
+    IconModule
   ],
   declarations: [
-    HostsComponent,
     MonitorComponent,
     ConfigurationComponent,
     OsdListComponent,
@@ -116,8 +154,20 @@ import { TelemetryComponent } from './telemetry/telemetry.component';
     OsdFlagsIndivModalComponent,
     PlacementPipe,
     CreateClusterComponent,
-    CreateClusterReviewComponent
+    CreateClusterReviewComponent,
+    UpgradeComponent,
+    UpgradeStartModalComponent,
+    UpgradeProgressComponent,
+    MultiClusterComponent,
+    MultiClusterFormComponent,
+    MultiClusterListComponent,
+    MultiClusterDetailsComponent,
+    HostsComponent
   ],
   providers: [NgbActiveModal]
 })
-export class ClusterModule {}
+export class ClusterModule {
+  constructor(private iconService: IconService) {
+    this.iconService.registerAll([Analytics, CloseFilled, ProgressBarRoundIcon]);
+  }
+}

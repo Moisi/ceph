@@ -15,7 +15,7 @@
 #ifndef CEPHFS_FEATURES_H
 #define CEPHFS_FEATURES_H
 
-#include "include/cephfs/metrics/Types.h"
+#include <string>
 
 class feature_bitset_t;
 namespace ceph {
@@ -27,7 +27,7 @@ namespace ceph {
 // and update Server::update_required_client_features(). This feature bit
 // is used to indicate that operator only wants clients from that release or
 // later to mount CephFS.
-#define CEPHFS_CURRENT_RELEASE  CEPH_RELEASE_REEF
+#define CEPHFS_CURRENT_RELEASE  CEPH_RELEASE_TENTACLE
 
 // The first 5 bits are reserved for old ceph releases.
 #define CEPHFS_FEATURE_JEWEL                5
@@ -45,7 +45,13 @@ namespace ceph {
 #define CEPHFS_FEATURE_ALTERNATE_NAME       15
 #define CEPHFS_FEATURE_NOTIFY_SESSION_STATE 16
 #define CEPHFS_FEATURE_OP_GETVXATTR         17
-#define CEPHFS_FEATURE_MAX                  17
+#define CEPHFS_FEATURE_32BITS_RETRY_FWD     18
+#define CEPHFS_FEATURE_NEW_SNAPREALM_INFO   19
+#define CEPHFS_FEATURE_HAS_OWNER_UIDGID     20
+#define CEPHFS_FEATURE_MDS_AUTH_CAPS_CHECK  21
+#define CEPHFS_FEATURE_CHARMAP              22
+#define CEPHFS_FEATURE_BLOCKDIFF            23
+#define CEPHFS_FEATURE_MAX                  23
 
 #define CEPHFS_FEATURES_ALL {		\
   0, 1, 2, 3, 4,			\
@@ -64,6 +70,12 @@ namespace ceph {
   CEPHFS_FEATURE_ALTERNATE_NAME,        \
   CEPHFS_FEATURE_NOTIFY_SESSION_STATE,  \
   CEPHFS_FEATURE_OP_GETVXATTR,          \
+  CEPHFS_FEATURE_32BITS_RETRY_FWD,      \
+  CEPHFS_FEATURE_NEW_SNAPREALM_INFO,    \
+  CEPHFS_FEATURE_HAS_OWNER_UIDGID,      \
+  CEPHFS_FEATURE_MDS_AUTH_CAPS_CHECK,   \
+  CEPHFS_FEATURE_CHARMAP,               \
+  CEPHFS_FEATURE_BLOCKDIFF,             \
 }
 
 #define CEPHFS_METRIC_FEATURES_ALL {		\
@@ -82,7 +94,8 @@ namespace ceph {
     CLIENT_METRIC_TYPE_AVG_WRITE_LATENCY,	\
     CLIENT_METRIC_TYPE_STDEV_WRITE_LATENCY,	\
     CLIENT_METRIC_TYPE_AVG_METADATA_LATENCY,	\
-    CLIENT_METRIC_TYPE_STDEV_METADATA_LATENCY,	\
+    CLIENT_METRIC_TYPE_STDEV_METADATA_LATENCY, \
+    CLIENT_METRIC_TYPE_SUBVOLUME_METRICS, \
 }
 
 #define CEPHFS_FEATURES_MDS_SUPPORTED CEPHFS_FEATURES_ALL

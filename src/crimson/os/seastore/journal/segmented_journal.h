@@ -17,6 +17,7 @@
 #include "crimson/osd/exceptions.h"
 #include "segment_allocator.h"
 #include "crimson/os/seastore/segment_seq_allocator.h"
+#include "record_submitter.h"
 
 namespace crimson::os::seastore::journal {
 /**
@@ -33,15 +34,21 @@ public:
     return trimmer;
   }
 
+  writer_stats_t get_writer_stats() const final {
+    return record_submitter.get_stats();
+  }
+
   open_for_mkfs_ret open_for_mkfs() final;
 
   open_for_mount_ret open_for_mount() final;
 
   close_ertr::future<> close() final;
 
-  submit_record_ret submit_record(
+  submit_record_ertr::future<> submit_record(
     record_t &&record,
-    OrderingHandle &handle) final;
+    OrderingHandle &handle,
+    transaction_type_t t_src,
+    on_submission_func_t &&on_submission) final;
 
   seastar::future<> flush(OrderingHandle &handle) final;
 
@@ -51,18 +58,20 @@ public:
     write_pipeline = _write_pipeline;
   }
 
-  journal_type_t get_type() final {
-    return journal_type_t::SEGMENTED;
+  backend_type_t get_type() final {
+    return backend_type_t::SEGMENTED;
   }
-  seastar::future<> finish_commit(transaction_type_t type) {
-    return seastar::now();
+
+  bool is_checksum_needed() final {
+    // segmented journal always requires checksum
+    return true;
   }
 
 private:
-  submit_record_ret do_submit_record(
+  submit_record_ertr::future<> do_submit_record(
     record_t &&record,
-    OrderingHandle &handle
-  );
+    OrderingHandle &handle,
+    on_submission_func_t &&on_submission);
 
   SegmentSeqAllocatorRef segment_seq_allocator;
   SegmentAllocator journal_segment_allocator;

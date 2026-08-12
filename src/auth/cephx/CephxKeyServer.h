@@ -15,21 +15,31 @@
 #ifndef CEPH_KEYSSERVER_H
 #define CEPH_KEYSSERVER_H
 
+#include <cstdint>
+#include <list>
+#include <map>
+#include <string>
+
 #include "auth/KeyRing.h"
 #include "CephxProtocol.h"
+#include "common/ceph_json.h"
 #include "common/ceph_mutex.h"
+#include "common/Formatter.h"
 #include "include/common_fwd.h"
+#include "include/encoding.h"
+#include "include/types.h" // for version_t
 
 struct KeyServerData {
-  version_t version;
+  version_t version{0};
 
   /* for each entity */
   std::map<EntityName, EntityAuth> secrets;
-  KeyRing *extra_secrets;
+  KeyRing *extra_secrets = nullptr;
 
   /* for each service type */
-  version_t rotating_ver;
+  version_t rotating_ver{0};
   std::map<uint32_t, RotatingSecrets> rotating_secrets;
+  KeyServerData() {}
 
   explicit KeyServerData(KeyRing *extra)
     : version(0),
@@ -70,7 +80,19 @@ struct KeyServerData {
     decode(rotating_ver, iter);
     decode(rotating_secrets, iter);
   }
-
+  void dump(ceph::Formatter *f) const {
+    f->dump_unsigned("version", version);
+    f->dump_unsigned("rotating_version", rotating_ver);
+    encode_json("secrets", secrets, f);
+    encode_json("rotating_secrets", rotating_secrets, f);
+  }
+  static std::list<KeyServerData> generate_test_instances() {
+    std::list<KeyServerData> ls;
+    ls.emplace_back();
+    ls.emplace_back();
+    ls.back().version = 1;
+    return ls;
+  }
   bool contains(const EntityName& name) const {
     return (secrets.find(name) != secrets.end());
   }
@@ -159,8 +181,23 @@ struct KeyServerData {
 	decode(auth, bl);
       }
     }
+    void dump(ceph::Formatter *f) const {
+      f->dump_unsigned("op", op);
+      f->dump_object("name", name);
+      f->dump_object("auth", auth);
+    }
+    static std::list<Incremental> generate_test_instances() {
+      std::list<Incremental> ls;
+      ls.emplace_back();
+      ls.back().op = AUTH_INC_DEL;
+      ls.emplace_back();
+      ls.back().op = AUTH_INC_ADD;
+      ls.emplace_back();
+      ls.back().op = AUTH_INC_SET_ROTATING;
+      return ls;
+    }
   };
-
+  
   void apply_incremental(Incremental& inc) {
     switch (inc.op) {
     case AUTH_INC_ADD:
@@ -188,8 +225,6 @@ WRITE_CLASS_ENCODER(KeyServerData)
 WRITE_CLASS_ENCODER(KeyServerData::Incremental)
 
 
-
-
 class KeyServer : public KeyStore {
   CephContext *cct;
   KeyServerData data;
@@ -205,7 +240,9 @@ class KeyServer : public KeyStore {
   bool _get_service_caps(const EntityName& name, uint32_t service_id,
 	AuthCapsInfo& caps) const;
 public:
+  KeyServer() : lock{ceph::make_mutex("KeyServer::lock")} {}
   KeyServer(CephContext *cct_, KeyRing *extra_secrets);
+  KeyServer& operator=(const KeyServer&) = delete;
   bool generate_secret(CryptoKey& secret);
 
   bool get_secret(const EntityName& name, CryptoKey& secret) const override;
@@ -248,6 +285,8 @@ public:
     using ceph::decode;
     decode(data, bl);
   }
+  void dump(ceph::Formatter *f) const;
+  static std::list<KeyServer> generate_test_instances();
   bool contains(const EntityName& name) const;
   int encode_secrets(ceph::Formatter *f, std::stringstream *ds) const;
   void encode_formatted(std::string label, ceph::Formatter *f, ceph::buffer::list &bl);

@@ -65,3 +65,14 @@ void RGWObjTags::dump(Formatter *f) const
   f->close_section();
 }
 
+std::list<RGWObjTags> RGWObjTags::generate_test_instances()
+{
+  std::list<RGWObjTags> o;
+  RGWObjTags r;
+  r.add_tag("key1","val1");
+  r.add_tag("key2","val2");
+  o.push_back(std::move(r));
+  o.emplace_back();
+  return o;
+}
+

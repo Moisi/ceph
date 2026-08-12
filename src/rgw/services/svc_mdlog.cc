@@ -1,8 +1,9 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab ft=cpp
 
+#include <fmt/format.h>
+
 #include "svc_mdlog.h"
-#include "svc_rados.h"
 #include "svc_zone.h"
 #include "svc_sys_obj.h"
 
@@ -10,7 +11,8 @@
 #include "rgw_mdlog.h"
 #include "rgw_coroutine.h"
 #include "rgw_cr_rados.h"
-#include "rgw_zone.h"
+
+#include "rgw/rgw_zone.h"
 
 #include "common/errno.h"
 
@@ -23,19 +25,23 @@ using namespace std;
 using Svc = RGWSI_MDLog::Svc;
 using Cursor = RGWPeriodHistory::Cursor;
 
-RGWSI_MDLog::RGWSI_MDLog(CephContext *cct, bool _run_sync) : RGWServiceInstance(cct), run_sync(_run_sync) {
+RGWSI_MDLog::RGWSI_MDLog(CephContext *cct, bool _run_sync, rgw::sal::ConfigStore* _cfgstore) : RGWServiceInstance(cct),
+              run_sync(_run_sync), cfgstore(_cfgstore) {
 }
 
 RGWSI_MDLog::~RGWSI_MDLog() {
 }
 
-int RGWSI_MDLog::init(RGWSI_RADOS *_rados_svc, RGWSI_Zone *_zone_svc, RGWSI_SysObj *_sysobj_svc, RGWSI_Cls *_cls_svc)
+int RGWSI_MDLog::init(librados::Rados* rados_, RGWSI_Zone *_zone_svc,
+		      RGWSI_SysObj *_sysobj_svc, RGWSI_Cls *_cls_svc,
+		      RGWAsyncRadosProcessor* async_processor_)
 {
   svc.zone = _zone_svc;
   svc.sysobj = _sysobj_svc;
   svc.mdlog = this;
-  svc.rados = _rados_svc;
+  rados = rados_;
   svc.cls = _cls_svc;
+  async_processor = async_processor_;
 
   return 0;
 }
@@ -53,7 +59,7 @@ int RGWSI_MDLog::do_start(optional_yield y, const DoutPrefixProvider *dpp)
   if (run_sync &&
       svc.zone->need_to_sync()) {
     // initialize the log period history
-    svc.mdlog->init_oldest_log_period(y, dpp);
+    svc.mdlog->init_oldest_log_period(y, dpp, cfgstore);
   }
   return 0;
 }
@@ -133,8 +139,15 @@ public:
     : RGWSimpleCoroutine(_svc->ctx()), dpp(_dpp), async_rados(_async_rados), svc(_svc),
       obj(_obj), result(_result),
       empty_on_enoent(empty_on_enoent), objv_tracker(objv_tracker) {}
+
   ~SysObjReadCR() override {
-    request_cleanup();
+    try {
+      request_cleanup();
+    } catch (const boost::container::length_error_t& e) {
+      ldpp_dout(dpp, 0) << "ERROR: " << __func__ <<
+	": reference counted object mismatched, \"" << e.what() <<
+	"\"" << dendl;
+    }
   }
 
   void request_cleanup() override {
@@ -209,7 +222,13 @@ public:
   }
 
   ~SysObjWriteCR() override {
-    request_cleanup();
+    try {
+      request_cleanup();
+    } catch (const boost::container::length_error_t& e) {
+      ldpp_dout(dpp, 0) << "ERROR: " << __func__ <<
+	": reference counted object mismatched, \"" << e.what() <<
+	"\"" << dendl;
+    }
   }
 
   void request_cleanup() override {
@@ -248,11 +267,12 @@ class ReadHistoryCR : public RGWCoroutine {
   ReadHistoryCR(const DoutPrefixProvider *dpp, 
                 const Svc& svc,
                 Cursor *cursor,
-                RGWObjVersionTracker *objv_tracker)
+                RGWObjVersionTracker *objv_tracker,
+		RGWAsyncRadosProcessor* async_processor)
     : RGWCoroutine(svc.zone->ctx()), dpp(dpp), svc(svc),
       cursor(cursor),
       objv_tracker(objv_tracker),
-      async_processor(svc.rados->get_async_processor())
+      async_processor(async_processor)
   {}
 
   int operate(const DoutPrefixProvider *dpp) {
@@ -298,10 +318,11 @@ class WriteHistoryCR : public RGWCoroutine {
   WriteHistoryCR(const DoutPrefixProvider *dpp, 
                  Svc& svc,
                  const Cursor& cursor,
-                 RGWObjVersionTracker *objv)
+                 RGWObjVersionTracker *objv,
+		 RGWAsyncRadosProcessor* async_processor)
     : RGWCoroutine(svc.zone->ctx()), dpp(dpp), svc(svc),
       cursor(cursor), objv(objv),
-      async_processor(svc.rados->get_async_processor())
+      async_processor(async_processor)
   {}
 
   int operate(const DoutPrefixProvider *dpp) {
@@ -339,18 +360,22 @@ class TrimHistoryCR : public RGWCoroutine {
   RGWObjVersionTracker *objv; //< to prevent racing updates
   Cursor next; //< target cursor for oldest log period
   Cursor existing; //< existing cursor read from disk
+  RGWAsyncRadosProcessor* async_processor;
 
  public:
-  TrimHistoryCR(const DoutPrefixProvider *dpp, const Svc& svc, Cursor cursor, RGWObjVersionTracker *objv)
+  TrimHistoryCR(const DoutPrefixProvider *dpp, const Svc& svc, Cursor cursor,
+		RGWObjVersionTracker *objv,
+		RGWAsyncRadosProcessor* async_processor)
     : RGWCoroutine(svc.zone->ctx()), dpp(dpp), svc(svc),
-      cursor(cursor), objv(objv), next(cursor) {
+      cursor(cursor), objv(objv), next(cursor),
+      async_processor(async_processor) {
     next.next(); // advance past cursor
   }
 
   int operate(const DoutPrefixProvider *dpp) {
     reenter(this) {
       // read an existing history, and write the new history if it's newer
-      yield call(new ReadHistoryCR(dpp, svc, &existing, objv));
+      yield call(new ReadHistoryCR(dpp, svc, &existing, objv, async_processor));
       if (retcode < 0) {
         return set_cr_error(retcode);
       }
@@ -361,7 +386,7 @@ class TrimHistoryCR : public RGWCoroutine {
         return set_cr_error(-ECANCELED);
       }
       // overwrite with updated history
-      yield call(new WriteHistoryCR(dpp, svc, next, objv));
+      yield call(new WriteHistoryCR(dpp, svc, next, objv, async_processor));
       if (retcode < 0) {
         return set_cr_error(retcode);
       }
@@ -375,7 +400,7 @@ class TrimHistoryCR : public RGWCoroutine {
 
 // traverse all the way back to the beginning of the period history, and
 // return a cursor to the first period in a fully attached history
-Cursor RGWSI_MDLog::find_oldest_period(const DoutPrefixProvider *dpp, optional_yield y)
+Cursor RGWSI_MDLog::find_oldest_period(const DoutPrefixProvider *dpp, optional_yield y, rgw::sal::ConfigStore* cfgstore)
 {
   auto cursor = period_history->get_current();
 
@@ -391,7 +416,7 @@ Cursor RGWSI_MDLog::find_oldest_period(const DoutPrefixProvider *dpp, optional_y
       }
       // pull the predecessor and add it to our history
       RGWPeriod period;
-      int r = period_puller->pull(dpp, predecessor, period, y);
+      int r = period_puller->pull(dpp, predecessor, period, y, cfgstore);
       if (r < 0) {
         return cursor;
       }
@@ -409,7 +434,7 @@ Cursor RGWSI_MDLog::find_oldest_period(const DoutPrefixProvider *dpp, optional_y
   return cursor;
 }
 
-Cursor RGWSI_MDLog::init_oldest_log_period(optional_yield y, const DoutPrefixProvider *dpp)
+Cursor RGWSI_MDLog::init_oldest_log_period(optional_yield y, const DoutPrefixProvider *dpp, rgw::sal::ConfigStore* cfgstore)
 {
   // read the mdlog history
   RGWMetadataLogHistory state;
@@ -419,7 +444,7 @@ Cursor RGWSI_MDLog::init_oldest_log_period(optional_yield y, const DoutPrefixPro
   if (ret == -ENOENT) {
     // initialize the mdlog history and write it
     ldpp_dout(dpp, 10) << "initializing mdlog history" << dendl;
-    auto cursor = find_oldest_period(dpp, y);
+    auto cursor = find_oldest_period(dpp, y, cfgstore);
     if (!cursor) {
       return cursor;
     }
@@ -446,7 +471,7 @@ Cursor RGWSI_MDLog::init_oldest_log_period(optional_yield y, const DoutPrefixPro
   if (cursor) {
     return cursor;
   } else {
-    cursor = find_oldest_period(dpp, y);
+    cursor = find_oldest_period(dpp, y, cfgstore);
     state.oldest_realm_epoch = cursor.get_epoch();
     state.oldest_period_id = cursor.get_period().get_id();
     ldpp_dout(dpp, 10) << "rewriting mdlog history" << dendl;
@@ -461,7 +486,7 @@ Cursor RGWSI_MDLog::init_oldest_log_period(optional_yield y, const DoutPrefixPro
 
   // pull the oldest period by id
   RGWPeriod period;
-  ret = period_puller->pull(dpp, state.oldest_period_id, period, y);
+  ret = period_puller->pull(dpp, state.oldest_period_id, period, y, cfgstore);
   if (ret < 0) {
     ldpp_dout(dpp, 1) << "failed to read period id=" << state.oldest_period_id
         << " for mdlog history: " << cpp_strerror(ret) << dendl;
@@ -475,7 +500,7 @@ Cursor RGWSI_MDLog::init_oldest_log_period(optional_yield y, const DoutPrefixPro
     return Cursor{-EINVAL};
   }
   // attach the period to our history
-  return period_history->attach(dpp, std::move(period), y);
+  return period_history->attach(dpp, std::move(period), y, cfgstore);
 }
 
 Cursor RGWSI_MDLog::read_oldest_log_period(optional_yield y, const DoutPrefixProvider *dpp) const
@@ -498,13 +523,13 @@ Cursor RGWSI_MDLog::read_oldest_log_period(optional_yield y, const DoutPrefixPro
 RGWCoroutine* RGWSI_MDLog::read_oldest_log_period_cr(const DoutPrefixProvider *dpp, 
         Cursor *period, RGWObjVersionTracker *objv) const
 {
-  return new mdlog::ReadHistoryCR(dpp, svc, period, objv);
+  return new mdlog::ReadHistoryCR(dpp, svc, period, objv, async_processor);
 }
 
 RGWCoroutine* RGWSI_MDLog::trim_log_period_cr(const DoutPrefixProvider *dpp, 
         Cursor period, RGWObjVersionTracker *objv) const
 {
-  return new mdlog::TrimHistoryCR(dpp, svc, period, objv);
+  return new mdlog::TrimHistoryCR(dpp, svc, period, objv, async_processor);
 }
 
 RGWMetadataLog* RGWSI_MDLog::get_log(const std::string& period)
@@ -516,10 +541,28 @@ RGWMetadataLog* RGWSI_MDLog::get_log(const std::string& period)
   return &insert.first->second;
 }
 
-int RGWSI_MDLog::add_entry(const DoutPrefixProvider *dpp, const string& hash_key, const string& section, const string& key, bufferlist& bl)
+int RGWSI_MDLog::add_entry(const DoutPrefixProvider *dpp, const string& hash_key, const string& section, const string& key, bufferlist& bl, optional_yield y)
 {
   ceph_assert(current_log); // must have called init()
-  return current_log->add_entry(dpp, hash_key, section, key, bl);
+  return current_log->add_entry(dpp, hash_key, section, key, bl, y);
+}
+
+int RGWSI_MDLog::complete_entry(const DoutPrefixProvider* dpp, optional_yield y,
+                                const std::string& section, const std::string& key,
+                                const RGWObjVersionTracker* objv)
+{
+  RGWMetadataLogData entry;
+  if (objv) {
+    entry.read_version = objv->read_version;
+    entry.write_version = objv->write_version;
+  }
+  entry.status = MDLOG_STATUS_COMPLETE;
+
+  bufferlist bl;
+  encode(entry, bl);
+
+  const std::string hash_key = fmt::format("{}:{}", section, key);
+  return add_entry(dpp, hash_key, section, key, bl, y);
 }
 
 int RGWSI_MDLog::get_shard_id(const string& hash_key, int *shard_id)
@@ -529,8 +572,8 @@ int RGWSI_MDLog::get_shard_id(const string& hash_key, int *shard_id)
 }
 
 int RGWSI_MDLog::pull_period(const DoutPrefixProvider *dpp, const std::string& period_id, RGWPeriod& period,
-			     optional_yield y)
+			     optional_yield y, rgw::sal::ConfigStore* cfgstore)
 {
-  return period_puller->pull(dpp, period_id, period, y);
+  return period_puller->pull(dpp, period_id, period, y, cfgstore);
 }
 

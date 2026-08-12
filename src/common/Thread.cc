@@ -18,7 +18,7 @@
 #include <sys/syscall.h>   /* For SYS_xxx definitions */
 #endif
 
-#ifdef WITH_SEASTAR
+#ifdef WITH_CRIMSON
 #include "crimson/os/alienstore/alien_store.h"
 #endif
 
@@ -83,7 +83,7 @@ void *Thread::entry_wrapper()
   if (pid && cpuid >= 0)
     _set_affinity(cpuid);
 
-  ceph_pthread_setname(pthread_self(), thread_name.c_str());
+  ceph_pthread_setname(thread_name.c_str());
   return entry();
 }
 
@@ -203,27 +203,9 @@ int Thread::set_affinity(int id)
 // Functions for std::thread
 // =========================
 
-void set_thread_name(std::thread& t, const std::string& s) {
-  int r = ceph_pthread_setname(t.native_handle(), s.c_str());
-  if (r != 0) {
-    throw std::system_error(r, std::generic_category());
-  }
-}
-std::string get_thread_name(const std::thread& t) {
-  std::string s(256, '\0');
-
-  int r = ceph_pthread_getname(const_cast<std::thread&>(t).native_handle(),
-			       s.data(), s.length());
-  if (r != 0) {
-    throw std::system_error(r, std::generic_category());
-  }
-  s.resize(std::strlen(s.data()));
-  return s;
-}
-
 void kill(std::thread& t, int signal)
 {
-  auto r = pthread_kill(t.native_handle(), signal);
+  auto r = ceph_pthread_kill(t.native_handle(), signal);
   if (r != 0) {
     throw std::system_error(r, std::generic_category());
   }

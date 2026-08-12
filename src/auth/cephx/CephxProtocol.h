@@ -55,6 +55,15 @@ struct CephXServerChallenge {
     decode(struct_v, bl);
     decode(server_challenge, bl);
   }
+  void dump(ceph::Formatter *f) const {
+    f->dump_unsigned("server_challenge", server_challenge);
+  }
+  static std::list<CephXServerChallenge> generate_test_instances() {
+    std::list<CephXServerChallenge> ls;
+    ls.emplace_back();
+    ls.back().server_challenge = 1;
+    return ls;
+  }
 };
 WRITE_CLASS_ENCODER(CephXServerChallenge)
 
@@ -72,6 +81,15 @@ struct CephXRequestHeader {
     using ceph::decode;
     decode(request_type, bl);
   }
+  void dump(ceph::Formatter *f) const {
+    f->dump_unsigned("request_type", request_type);
+  }
+  static std::list<CephXRequestHeader> generate_test_instances() {
+    std::list<CephXRequestHeader> ls;
+    ls.emplace_back();
+    ls.back().request_type = 1;
+    return ls;
+  }
 };
 WRITE_CLASS_ENCODER(CephXRequestHeader)
 
@@ -88,6 +106,17 @@ struct CephXResponseHeader {
     using ceph::decode;
     decode(request_type, bl);
     decode(status, bl);
+  }
+  void dump(ceph::Formatter *f) const {
+    f->dump_unsigned("request_type", request_type);
+    f->dump_int("status", status);
+  }
+  static std::list<CephXResponseHeader> generate_test_instances() {
+    std::list<CephXResponseHeader> ls;
+    ls.emplace_back();
+    ls.back().request_type = 1;
+    ls.back().status = 0;
+    return ls;
   }
 };
 WRITE_CLASS_ENCODER(CephXResponseHeader)
@@ -112,6 +141,19 @@ struct CephXTicketBlob {
      decode(struct_v, bl);
      decode(secret_id, bl);
      decode(blob, bl);
+  }
+
+  void dump(ceph::Formatter *f) const {
+    f->dump_unsigned("secret_id", secret_id);
+    f->dump_unsigned("blob_len", blob.length());
+  }
+
+  static std::list<CephXTicketBlob> generate_test_instances() {
+    std::list<CephXTicketBlob> ls;
+    ls.emplace_back();
+    ls.back().secret_id = 123;
+    ls.back().blob.append(std::string_view("this is a blob"));
+    return ls;
   }
 };
 WRITE_CLASS_ENCODER(CephXTicketBlob)
@@ -152,6 +194,27 @@ struct CephXAuthenticate {
     //   old_ticket both on reconnects and renewals
     old_ticket_may_be_omitted = struct_v < 3;
   }
+  void dump(ceph::Formatter *f) const {
+    f->dump_unsigned("client_challenge", client_challenge);
+    f->dump_unsigned("key", key);
+    f->open_object_section("old_ticket");
+    old_ticket.dump(f);
+    f->close_section();
+    f->dump_unsigned("other_keys", other_keys);
+  }
+  static std::list<CephXAuthenticate> generate_test_instances() {
+    std::list<CephXAuthenticate> ls;
+    ls.emplace_back();
+    ls.back().client_challenge = 0;
+    ls.back().key = 0;
+    ls.emplace_back();
+    ls.back().client_challenge = 1;
+    ls.back().key = 2;
+    ls.back().old_ticket.secret_id = 3;
+    ls.back().old_ticket.blob.append(std::string_view("this is a blob"));
+    ls.back().other_keys = 4;
+    return ls;
+  }
 };
 WRITE_CLASS_ENCODER(CephXAuthenticate)
 
@@ -167,6 +230,17 @@ struct CephXChallengeBlob {
     using ceph::decode;
     decode(server_challenge, bl);
     decode(client_challenge, bl);
+  }
+  void dump(ceph::Formatter *f) const {
+    f->dump_unsigned("server_challenge", server_challenge);
+    f->dump_unsigned("client_challenge", client_challenge);
+  }
+  static std::list<CephXChallengeBlob> generate_test_instances() {
+    std::list<CephXChallengeBlob> ls;
+    ls.emplace_back();
+    ls.back().server_challenge = 123;
+    ls.back().client_challenge = 456;
+    return ls;
   }
 };
 WRITE_CLASS_ENCODER(CephXChallengeBlob)
@@ -218,6 +292,17 @@ struct CephXServiceTicketRequest {
     decode(struct_v, bl);
     decode(keys, bl);
   }
+
+  void dump(ceph::Formatter *f) const {
+    f->dump_unsigned("keys", keys);
+  }
+
+  static std::list<CephXServiceTicketRequest> generate_test_instances() {
+    std::list<CephXServiceTicketRequest> ls;
+    ls.emplace_back();
+    ls.back().keys = 123;
+    return ls;
+  }
 };
 WRITE_CLASS_ENCODER(CephXServiceTicketRequest)
 
@@ -250,6 +335,19 @@ struct CephXAuthorizeReply {
     if (struct_v >= 2) {
       decode(connection_secret, bl);
     }
+  }
+  void dump(ceph::Formatter *f) const {
+    f->dump_unsigned("nonce_plus_one", nonce_plus_one);
+    f->dump_string("connection_secret", connection_secret);
+  }
+  static std::list<CephXAuthorizeReply> generate_test_instances() {
+    std::list<CephXAuthorizeReply> ls;
+    ls.emplace_back();
+    ls.back().nonce_plus_one = 0;
+    ls.emplace_back();
+    ls.back().nonce_plus_one = 123;
+    ls.back().connection_secret = "secret";
+    return ls;
   }
 };
 WRITE_CLASS_ENCODER(CephXAuthorizeReply)
@@ -353,6 +451,19 @@ struct CephXServiceTicket {
     decode(session_key, bl);
     decode(validity, bl);
   }
+  void dump(ceph::Formatter *f) const {
+    session_key.dump(f);
+    validity.dump(f);
+  }
+  static std::list<CephXServiceTicket> generate_test_instances() {
+    std::list<CephXServiceTicket> ls;
+    ls.emplace_back();
+    ls.emplace_back();
+    ls.back().session_key.set_secret(
+      CEPH_CRYPTO_AES, bufferptr("1234567890123456", 16), utime_t(123, 456));
+    ls.back().validity = utime_t(123, 456);
+    return ls;
+  }
 };
 WRITE_CLASS_ENCODER(CephXServiceTicket)
 
@@ -375,11 +486,25 @@ struct CephXServiceTicketInfo {
     decode(ticket, bl);
     decode(session_key, bl);
   }
+  void dump(ceph::Formatter *f) const {
+    ticket.dump(f);
+    session_key.dump(f);
+  }
+  static std::list<CephXServiceTicketInfo> generate_test_instances() {
+    std::list<CephXServiceTicketInfo> ls;
+    ls.emplace_back();
+    ls.emplace_back();
+    ls.back().ticket.global_id = 1234;
+    ls.back().ticket.init_timestamps(utime_t(123, 456), utime_t(123, 456));
+    ls.back().session_key.set_secret(
+      CEPH_CRYPTO_AES, bufferptr("1234567890123456", 16), utime_t(123, 456));
+    return ls;
+  }
 };
 WRITE_CLASS_ENCODER(CephXServiceTicketInfo)
 
 struct CephXAuthorizeChallenge : public AuthAuthorizerChallenge {
-  uint64_t server_challenge;
+  uint64_t server_challenge = 0;
   void encode(ceph::buffer::list& bl) const {
     using ceph::encode;
     __u8 struct_v = 1;
@@ -392,11 +517,20 @@ struct CephXAuthorizeChallenge : public AuthAuthorizerChallenge {
     decode(struct_v, bl);
     decode(server_challenge, bl);
   }
+  void dump(ceph::Formatter *f) const {
+    f->dump_unsigned("server_challenge", server_challenge);
+  }
+  static std::list<CephXAuthorizeChallenge> generate_test_instances() {
+    std::list<CephXAuthorizeChallenge> ls;
+    ls.emplace_back();
+    ls.back().server_challenge = 1234;
+    return ls;
+  }
 };
 WRITE_CLASS_ENCODER(CephXAuthorizeChallenge)
 
 struct CephXAuthorize {
-  uint64_t nonce;
+  uint64_t nonce = 0;
   bool have_challenge = false;
   uint64_t server_challenge_plus_one = 0;
   void encode(ceph::buffer::list& bl) const {
@@ -416,6 +550,20 @@ struct CephXAuthorize {
       decode(have_challenge, bl);
       decode(server_challenge_plus_one, bl);
     }
+  }
+  void dump(ceph::Formatter *f) const {
+    f->dump_unsigned("nonce", nonce);
+    f->dump_unsigned("have_challenge", have_challenge);
+    f->dump_unsigned("server_challenge_plus_one", server_challenge_plus_one);
+  }
+  static std::list<CephXAuthorize> generate_test_instances() {
+    std::list<CephXAuthorize> ls;
+    ls.emplace_back();
+    ls.emplace_back();
+    ls.back().nonce = 1234;
+    ls.back().have_challenge = true;
+    ls.back().server_challenge_plus_one = 1234;
+    return ls;
   }
 };
 WRITE_CLASS_ENCODER(CephXAuthorize)

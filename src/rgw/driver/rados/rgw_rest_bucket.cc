@@ -3,6 +3,7 @@
 
 #include "rgw_op.h"
 #include "driver/rados/rgw_bucket.h"
+#include "rgw_process_env.h"
 #include "rgw_rest_bucket.h"
 #include "rgw_sal.h"
 
@@ -45,6 +46,14 @@ void RGWOp_Bucket_Info::execute(optional_yield y)
   RESTArgs::get_string(s, "bucket", bucket, &bucket);
   RESTArgs::get_bool(s, "stats", false, &fetch_stats);
 
+  uint32_t max_entries;
+  std::string marker;
+  RESTArgs::get_uint32(s, "max-entries", 0, &max_entries);
+  RESTArgs::get_string(s, "marker", marker, &marker);
+
+  op_state.max_entries = max_entries;
+  op_state.marker = marker;
+
   op_state.set_user_id(uid);
   op_state.set_bucket_name(bucket);
   op_state.set_fetch_stats(fetch_stats);
@@ -79,7 +88,7 @@ void RGWOp_Get_Policy::execute(optional_yield y)
   op_state.set_bucket_name(bucket);
   op_state.set_object(object);
 
-  op_ret = RGWBucketAdminOp::get_policy(driver, op_state, flusher, this);
+  op_ret = RGWBucketAdminOp::get_policy(driver, op_state, flusher, this, y);
 }
 
 class RGWOp_Check_Bucket_Index : public RGWRESTOp {
@@ -140,6 +149,7 @@ void RGWOp_Bucket_Link::execute(optional_yield y)
   RGWBucketAdminOpState op_state;
 
   RESTArgs::get_string(s, "uid", uid_str, &uid_str);
+  RESTArgs::get_string(s, "account-id", op_state.account_id, &op_state.account_id);
   RESTArgs::get_string(s, "bucket", bucket, &bucket);
   RESTArgs::get_string(s, "bucket-id", bucket_id, &bucket_id);
   RESTArgs::get_string(s, "new-bucket-name", new_bucket_name, &new_bucket_name);
@@ -150,13 +160,13 @@ void RGWOp_Bucket_Link::execute(optional_yield y)
   op_state.set_bucket_id(bucket_id);
   op_state.set_new_bucket_name(new_bucket_name);
 
-  bufferlist data;
-  op_ret = driver->forward_request_to_master(s, s->user.get(), nullptr, data, nullptr, s->info, y);
+  op_ret = rgw_forward_request_to_master(this, *s->penv.site, s->user->get_id(),
+                                         nullptr, nullptr, s->info, s->err, y);
   if (op_ret < 0) {
     ldpp_dout(this, 0) << "forward_request_to_master returned ret=" << op_ret << dendl;
     return;
   }
-  op_ret = RGWBucketAdminOp::link(driver, op_state, s);
+  op_ret = RGWBucketAdminOp::link(driver, op_state, s, y);
 }
 
 class RGWOp_Bucket_Unlink : public RGWRESTOp {
@@ -183,18 +193,19 @@ void RGWOp_Bucket_Unlink::execute(optional_yield y)
   RESTArgs::get_string(s, "uid", uid_str, &uid_str);
   rgw_user uid(uid_str);
 
+  RESTArgs::get_string(s, "account-id", op_state.account_id, &op_state.account_id);
   RESTArgs::get_string(s, "bucket", bucket, &bucket);
 
   op_state.set_user_id(uid);
   op_state.set_bucket_name(bucket);
 
-  bufferlist data;
-  op_ret = driver->forward_request_to_master(s, s->user.get(), nullptr, data, nullptr, s->info, y);
+  op_ret = rgw_forward_request_to_master(this, *s->penv.site, s->user->get_id(),
+                                         nullptr, nullptr, s->info, s->err, y);
   if (op_ret < 0) {
     ldpp_dout(this, 0) << "forward_request_to_master returned ret=" << op_ret << dendl;
     return;
   }
-  op_ret = RGWBucketAdminOp::unlink(driver, op_state, s);
+  op_ret = RGWBucketAdminOp::unlink(driver, op_state, s, y);
 }
 
 class RGWOp_Bucket_Remove : public RGWRESTOp {
@@ -213,25 +224,27 @@ public:
 
 void RGWOp_Bucket_Remove::execute(optional_yield y)
 {
-  std::string bucket_name;
-  bool delete_children;
-  std::unique_ptr<rgw::sal::Bucket> bucket;
+  std::string bucket_name, tenant;
+  bool delete_children, bypass_gc;
 
   RESTArgs::get_string(s, "bucket", bucket_name, &bucket_name);
+  RESTArgs::get_string(s, "tenant", tenant, &tenant);
   RESTArgs::get_bool(s, "purge-objects", false, &delete_children);
+  RESTArgs::get_bool(s, "bypass-gc", false, &bypass_gc);
 
-  /* FIXME We're abusing the owner of the bucket to pass the user, so that it can be forwarded to
-   * the master.  This user is actually the OP caller, not the bucket owner. */
-  op_ret = driver->get_bucket(s, s->user.get(), string(), bucket_name, &bucket, y);
-  if (op_ret < 0) {
-    ldpp_dout(this, 0) << "get_bucket returned ret=" << op_ret << dendl;
-    if (op_ret == -ENOENT) {
-      op_ret = -ERR_NO_SUCH_BUCKET;
-    }
-    return;
+  RGWBucketAdminOpState op_state;
+  op_state.set_bucket_name(bucket_name);
+  op_state.set_tenant(tenant);
+  op_state.set_delete_children(delete_children);
+
+  // Check if the request is being forwarded by looking for the "rgwx-zonegroup" argument
+  // As this is an admin endpoint, checking by system_request is not sufficient
+  const bool is_forwarded = s->info.args.exists(RGW_SYS_PARAM_PREFIX "zonegroup");
+
+  op_ret = RGWBucketAdminOp::remove_bucket(driver, *s->penv.site, op_state, y, s, bypass_gc, true, is_forwarded);
+  if (op_ret == -ENOENT) {
+    op_ret = -ERR_NO_SUCH_BUCKET;
   }
-
-  op_ret = bucket->remove_bucket(s, delete_children, true, &s->info, s->yield);
 }
 
 class RGWOp_Set_Bucket_Quota : public RGWRESTOp {
@@ -289,7 +302,8 @@ void RGWOp_Set_Bucket_Quota::execute(optional_yield y)
   }
   if (use_http_params) {
     std::unique_ptr<rgw::sal::Bucket> bucket;
-    op_ret = driver->get_bucket(s, nullptr, uid.tenant, bucket_name, &bucket, s->yield);
+    op_ret = driver->load_bucket(s, rgw_bucket(uid.tenant, bucket_name),
+                                 &bucket, s->yield);
     if (op_ret < 0) {
       return;
     }
@@ -310,7 +324,7 @@ void RGWOp_Set_Bucket_Quota::execute(optional_yield y)
   op_state.set_bucket_name(bucket_name);
   op_state.set_quota(quota);
 
-  op_ret = RGWBucketAdminOp::set_quota(driver, op_state, s);
+  op_ret = RGWBucketAdminOp::set_quota(driver, op_state, s, y);
 }
 
 class RGWOp_Sync_Bucket : public RGWRESTOp {
@@ -342,7 +356,7 @@ void RGWOp_Sync_Bucket::execute(optional_yield y)
   op_state.set_tenant(tenant);
   op_state.set_sync_bucket(sync_bucket);
 
-  op_ret = RGWBucketAdminOp::sync_bucket(driver, op_state, s);
+  op_ret = RGWBucketAdminOp::sync_bucket(driver, op_state, s, y);
 }
 
 class RGWOp_Object_Remove: public RGWRESTOp {
@@ -372,7 +386,7 @@ void RGWOp_Object_Remove::execute(optional_yield y)
   op_state.set_bucket_name(bucket);
   op_state.set_object(object);
 
-  op_ret = RGWBucketAdminOp::remove_object(driver, op_state, s);
+  op_ret = RGWBucketAdminOp::remove_object(driver, op_state, s, y);
 }
 
 

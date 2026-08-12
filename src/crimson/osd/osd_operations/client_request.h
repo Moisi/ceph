@@ -4,6 +4,7 @@
 #pragma once
 
 #include <seastar/core/future.hh>
+#include <seastar/core/sleep.hh>
 
 #include <boost/intrusive/list.hpp>
 #include <boost/intrusive_ptr.hpp>
@@ -11,12 +12,12 @@
 #include "osd/osd_op_util.h"
 #include "crimson/net/Connection.h"
 #include "crimson/osd/object_context.h"
+#include "crimson/osd/object_context_loader.h"
 #include "crimson/osd/osdmap_gate.h"
 #include "crimson/osd/osd_operation.h"
-#include "crimson/osd/osd_operations/client_request_common.h"
-#include "crimson/osd/osd_operations/common/pg_pipeline.h"
 #include "crimson/osd/pg_activation_blocker.h"
 #include "crimson/osd/pg_map.h"
+#include "crimson/osd/scrub/pg_scrubber.h"
 #include "crimson/common/type_helpers.h"
 #include "crimson/common/utility.h"
 #include "messages/MOSDOp.h"
@@ -26,34 +27,33 @@ class PG;
 class OSD;
 class ShardServices;
 
-class ClientRequest final : public PhasedOperationT<ClientRequest>,
-                            private CommonClientRequest {
-  // Initially set to primary core, updated to pg core after move,
-  // used by put_historic
-  ShardServices *put_historic_shard_services = nullptr;
+class ClientRequest final
+  : public PhasedOperationT<ClientRequest>,
+    public RemoteOperation
+{
+  // Initially set to primary core, updated to pg core after with_pg()
+  ShardServices *shard_services = nullptr;
 
-  crimson::net::ConnectionFRef conn;
   // must be after conn due to ConnectionPipeline's life-time
   Ref<MOSDOp> m;
   OpInfo op_info;
   seastar::promise<> on_complete;
   unsigned instance_id = 0;
+  std::chrono::time_point<std::chrono::steady_clock> begin_time;
 
 public:
-  class PGPipeline : public CommonPGPipeline {
-    struct AwaitMap : OrderedExclusivePhaseT<AwaitMap> {
-      static constexpr auto type_name = "ClientRequest::PGPipeline::await_map";
-    } await_map;
-    struct WaitRepop : OrderedConcurrentPhaseT<WaitRepop> {
-      static constexpr auto type_name = "ClientRequest::PGPipeline::wait_repop";
-    } wait_repop;
-    struct SendReply : OrderedExclusivePhaseT<SendReply> {
-      static constexpr auto type_name = "ClientRequest::PGPipeline::send_reply";
-    } send_reply;
-    friend class ClientRequest;
-    friend class LttngBackend;
-    friend class HistoricBackend;
-  };
+  epoch_t get_epoch_sent_at() const {
+    return m->get_map_epoch();
+  }
+
+  bool may_write() const { return op_info.may_write(); }
+  bool may_cache() const { return op_info.may_cache(); }
+  bool may_read() const { return op_info.may_read(); }
+  template <typename T>
+  T* get_req() const {
+    static_assert(std::is_same_v<T, MOSDOp>);
+    return m.get();
+  }
 
   /**
    * instance_handle_t
@@ -77,13 +77,13 @@ public:
     ConnectionPipeline::AwaitActive::BlockingEvent,
     ConnectionPipeline::AwaitMap::BlockingEvent,
     OSD_OSDMapGate::OSDMapBlocker::BlockingEvent,
-    ConnectionPipeline::GetPG::BlockingEvent,
+    ConnectionPipeline::GetPGMapping::BlockingEvent,
+    PerShardPipeline::CreateOrWaitPG::BlockingEvent,
     PGMap::PGCreationBlockingEvent,
     CompletionEvent
   > tracking_events;
 
-  class instance_handle_t : public boost::intrusive_ref_counter<
-    instance_handle_t, boost::thread_unsafe_counter> {
+  class instance_handle_t : public boost::intrusive_ref_counter<instance_handle_t> {
   public:
     // intrusive_ptr because seastar::lw_shared_ptr includes a cpu debug check
     // that we will fail since the core on which we allocate the request may not
@@ -91,27 +91,29 @@ public:
     // don't leave any references on the source core, so we just bypass it by using
     // intrusive_ptr instead.
     using ref_t = boost::intrusive_ptr<instance_handle_t>;
+    std::optional<ObjectContextLoader::Orderer> obc_orderer;
     PipelineHandle handle;
 
     std::tuple<
-      PGPipeline::AwaitMap::BlockingEvent,
+      CommonPGPipeline::WaitPGReady::BlockingEvent,
       PG_OSDMapGate::OSDMapBlocker::BlockingEvent,
-      PGPipeline::WaitForActive::BlockingEvent,
       PGActivationBlocker::BlockingEvent,
-      PGPipeline::RecoverMissing::BlockingEvent,
-      PGPipeline::GetOBC::BlockingEvent,
-      PGPipeline::Process::BlockingEvent,
-      PGPipeline::WaitRepop::BlockingEvent,
-      PGPipeline::SendReply::BlockingEvent,
-      CompletionEvent
+      CommonPGPipeline::GetOBC::BlockingEvent,
+      CommonOBCPipeline::Process::BlockingEvent,
+      scrub::PGScrubber::BlockingEvent,
+      CommonOBCPipeline::WaitRepop::BlockingEvent,
+      CommonOBCPipeline::SendReply::BlockingEvent
       > pg_tracking_events;
+
+    template <class BlockingEventT>
+    typename BlockingEventT::template Trigger<ClientRequest>
+    get_trigger(ClientRequest &op) {
+      return {std::get<BlockingEventT>(pg_tracking_events), op};
+    }
 
     template <typename BlockingEventT, typename InterruptorT=void, typename F>
     auto with_blocking_event(F &&f, ClientRequest &op) {
-      auto ret = std::forward<F>(f)(
-	typename BlockingEventT::template Trigger<ClientRequest>{
-	  std::get<BlockingEventT>(pg_tracking_events), op
-	});
+      auto ret = std::forward<F>(f)(get_trigger<BlockingEventT>(op));
       if constexpr (std::is_same_v<InterruptorT, void>) {
 	return ret;
       } else {
@@ -129,6 +131,12 @@ public:
 	    return handle.template enter<ClientRequest>(
 	      stage, std::move(trigger));
 	  }, op);
+    }
+
+    template <typename StageT>
+    void enter_stage_sync(StageT &stage, ClientRequest &op) {
+      handle.template enter_sync<ClientRequest>(
+          stage, get_trigger<typename StageT::BlockingEvent>(op));
     }
 
     template <
@@ -155,6 +163,21 @@ public:
     instance_handle = new instance_handle_t;
   }
   auto get_instance_handle() { return instance_handle; }
+  auto get_instance_handle() const { return instance_handle; }
+
+  std::set<snapid_t> snaps_need_to_recover() {
+    std::set<snapid_t> ret;
+    auto target = m->get_hobj();
+    if (!target.is_head()) {
+      ret.insert(target.snap);
+    }
+    for (auto &op : m->ops) {
+      if (op.op.op == CEPH_OSD_OP_ROLLBACK) {
+	ret.insert((snapid_t)op.op.snap.snapid);
+      }
+    }
+    return ret;
+  }
 
   using ordering_hook_t = boost::intrusive::list_member_hook<>;
   ordering_hook_t ordering_hook;
@@ -179,10 +202,10 @@ public:
       list.erase(list_t::s_iterator_to(request));
       intrusive_ptr_release(&request);
     }
-    void requeue(ShardServices &shard_services, Ref<PG> pg);
-    void clear_and_cancel();
+    void requeue(Ref<PG> pg);
+    void clear_and_cancel(PG &pg);
   };
-  void complete_request();
+  void complete_request(PG &pg);
 
   static constexpr OperationTypeCode type = OperationTypeCode::client_request;
 
@@ -198,37 +221,47 @@ public:
   spg_t get_pgid() const {
     return m->get_spg();
   }
-  ConnectionPipeline &get_connection_pipeline();
   PipelineHandle &get_handle() { return instance_handle->handle; }
   epoch_t get_epoch() const { return m->get_min_epoch(); }
 
-  seastar::future<> with_pg_int(
-    ShardServices &shard_services, Ref<PG> pg);
-public:
-  bool same_session_and_pg(const ClientRequest& other_op) const;
+  ConnectionPipeline &get_connection_pipeline();
 
+  PerShardPipeline &get_pershard_pipeline(ShardServices &);
+
+  interruptible_future<> with_pg_process_interruptible(
+    Ref<PG> pgref, const unsigned instance_id, instance_handle_t &ihref);
+
+  seastar::future<> with_pg_process(Ref<PG> pg);
+
+public:
   seastar::future<> with_pg(
     ShardServices &shard_services, Ref<PG> pgref);
+
 private:
   template <typename FuncT>
   interruptible_future<> with_sequencer(FuncT&& func);
-  auto reply_op_error(const Ref<PG>& pg, int err);
+  interruptible_future<> reply_op_error(const Ref<PG>& pg, int err);
 
   interruptible_future<> do_process(
     instance_handle_t &ihref,
-    Ref<PG>& pg,
-    crimson::osd::ObjectContextRef obc);
+    Ref<PG> pg,
+    crimson::osd::ObjectContextRef obc,
+    unsigned this_instance_id);
   ::crimson::interruptible::interruptible_future<
     ::crimson::osd::IOInterruptCondition> process_pg_op(
-    Ref<PG> &pg);
+    Ref<PG> pg);
+  interruptible_future<>
+  recover_missing_snaps(
+    Ref<PG> pg,
+    std::set<snapid_t> &snaps);
   ::crimson::interruptible::interruptible_future<
     ::crimson::osd::IOInterruptCondition> process_op(
       instance_handle_t &ihref,
-      Ref<PG> &pg);
+      Ref<PG> pg,
+      unsigned this_instance_id);
   bool is_pg_op() const;
 
-  ConnectionPipeline &cp();
-  PGPipeline &pp(PG &pg);
+  CommonPGPipeline &client_pp(PG &pg);
 
   template <typename Errorator>
   using interruptible_errorator =
@@ -236,7 +269,11 @@ private:
       ::crimson::osd::IOInterruptCondition,
       Errorator>;
 
-  bool is_misdirected(const PG& pg) const;
+  bool is_misdirected_replica_read(const PG& pg) const;
+
+  const SnapContext get_snapc(
+    PG &pg,
+    crimson::osd::ObjectContextRef obc) const;
 
 public:
 
@@ -252,6 +289,18 @@ public:
   };
 
   void put_historic() const;
+  static interruptible_future<> maybe_inject_delay() {
+    if (common::local_conf()->osd_debug_inject_dispatch_delay_probability > 0) {
+      if (rand() % 10000 <
+        common::local_conf()->osd_debug_inject_dispatch_delay_probability * 10000) {
+        auto delay_duration = std::chrono::duration<double>(
+          common::local_conf()->osd_debug_inject_dispatch_delay_duration);
+        auto a_while = std::chrono::duration_cast<std::chrono::seconds>(delay_duration);
+        return seastar::sleep(a_while);
+      }
+    }
+    return seastar::now();
+  }
 };
 
 }

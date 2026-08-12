@@ -9,6 +9,7 @@
 #include "test/librbd/mock/io/MockObjectDispatch.h"
 #include "common/Cond.h"
 #include "common/ceph_mutex.h"
+#include "common/debug.h"
 #include "common/WorkQueue.h"
 #include "cls/journal/cls_journal_types.h"
 #include "journal/Journaler.h"
@@ -28,6 +29,7 @@
 #include "gtest/gtest.h"
 #include <functional>
 #include <list>
+#include <shared_mutex> // for std::shared_lock
 #include <boost/scope_exit.hpp>
 
 #define dout_context g_ceph_context
@@ -460,7 +462,7 @@ public:
     bl.append_zero(length);
 
     std::shared_lock owner_locker{mock_image_ctx.owner_lock};
-    return mock_journal->append_write_event(0, length, bl, false);
+    return mock_journal->append_write_event({{0, length}}, bl, false);
   }
 
   uint64_t when_append_compare_and_write_event(

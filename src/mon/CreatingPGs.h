@@ -83,8 +83,22 @@ struct creating_pgs_t {
       f->dump_object("pg_history", history);
       f->dump_object("past_intervals", past_intervals);
     }
+    static std::list<pg_create_info> generate_test_instances() {
+      std::list<pg_create_info> o;
+      o.emplace_back();
+      o.back().create_epoch = 10;
+      o.emplace_back();
+      o.back().create_epoch = 1;
+      o.back().create_stamp = utime_t(2, 3);
+      o.back().up = {1, 2, 3};
+      o.back().up_primary = 1;
+      o.back().acting = {1, 2, 3};
+      o.back().acting_primary = 1;
+      return o;
+    }
 
-    pg_create_info() {}
+    pg_create_info() 
+      : create_epoch(0) {}
     pg_create_info(epoch_t e, utime_t t)
       : create_epoch(e),
 	create_stamp(t) {
@@ -215,18 +229,20 @@ struct creating_pgs_t {
     }
     f->close_section();
   }
-  static void generate_test_instances(std::list<creating_pgs_t*>& o) {
-    auto c = new creating_pgs_t;
-    c->last_scan_epoch = 17;
-    c->pgs.emplace(pg_t{42, 2}, pg_create_info(31, utime_t{891, 113}));
-    c->pgs.emplace(pg_t{44, 2}, pg_create_info(31, utime_t{891, 113}));
-    c->created_pools = {0, 1};
+  static std::list<creating_pgs_t> generate_test_instances() {
+    std::list<creating_pgs_t> o;
+    auto c = creating_pgs_t{};
+    c.last_scan_epoch = 17;
+    c.pgs.emplace(pg_t{42, 2}, pg_create_info(31, utime_t{891, 113}));
+    c.pgs.emplace(pg_t{44, 2}, pg_create_info(31, utime_t{891, 113}));
+    c.created_pools = {0, 1};
     o.push_back(c);
-    c = new creating_pgs_t;
-    c->last_scan_epoch = 18;
-    c->pgs.emplace(pg_t{42, 3}, pg_create_info(31, utime_t{891, 113}));
-    c->created_pools = {};
+    c = creating_pgs_t{};
+    c.last_scan_epoch = 18;
+    c.pgs.emplace(pg_t{42, 3}, pg_create_info(31, utime_t{891, 113}));
+    c.created_pools = {};
     o.push_back(c);
+    return o;
   }
 };
 WRITE_CLASS_ENCODER_FEATURES(creating_pgs_t::pg_create_info)

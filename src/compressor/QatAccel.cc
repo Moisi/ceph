@@ -19,6 +19,7 @@
 #include "common/dout.h"
 #include "common/errno.h"
 #include "QatAccel.h"
+#include "zlib.h"
 
 // -----------------------------------------------------------------------------
 #define dout_context g_ceph_context
@@ -33,6 +34,7 @@ static std::ostream& _prefix(std::ostream* _dout)
 // -----------------------------------------------------------------------------
 // default window size for Zlib 1.2.8, negated for raw deflate
 #define ZLIB_DEFAULT_WIN_SIZE -15
+#define GZIP_WRAPPER 16
 
 /* Estimate data expansion after decompression */
 static const unsigned int expansion_ratio[] = {5, 20, 50, 100, 200, 1000, 10000};
@@ -42,36 +44,32 @@ void QzSessionDeleter::operator() (struct QzSession_S *session) {
   delete session;
 }
 
-static bool get_qz_params(const std::string &alg, QzSessionParams_T &params) {
-  int rc;
-  rc = qzGetDefaults(&params);
-  if (rc != QZ_OK)
-    return false;
-  params.direction = QZ_DIR_BOTH;
-  params.is_busy_polling = true;
-  if (alg == "zlib") {
-    params.comp_algorithm = QZ_DEFLATE;
-    params.data_fmt = QZ_DEFLATE_RAW;
-    params.comp_lvl = g_ceph_context->_conf->compressor_zlib_level;
-  }
-  else {
-    // later, there also has lz4.
-    return false;
-  }
-
-  rc = qzSetDefaults(&params);
-  if (rc != QZ_OK)
-      return false;
-  return true;
+QzPollingMode_T busy_polling(bool isSet) {
+  return isSet ? QZ_BUSY_POLLING : QZ_PERIODICAL_POLLING;
 }
 
-static bool setup_session(QatAccel::session_ptr &session, QzSessionParams_T &params) {
+static bool setup_session(const std::string &alg, QatAccel::session_ptr &session) {
   int rc;
   rc = qzInit(session.get(), QZ_SW_BACKUP_DEFAULT);
   if (rc != QZ_OK && rc != QZ_DUPLICATE)
     return false;
-  rc = qzSetupSession(session.get(), &params);
-  if (rc != QZ_OK) {
+  if (alg == "zlib") {
+    QzSessionParamsDeflate_T params;
+    rc = qzGetDefaultsDeflate(&params);
+    if (rc != QZ_OK)
+      return false;
+
+    params.data_fmt = QZ_DEFLATE_GZIP_EXT;
+    params.common_params.comp_algorithm = QZ_DEFLATE;
+    params.common_params.comp_lvl = g_ceph_context->_conf->compressor_zlib_level;
+    params.common_params.direction = QZ_DIR_BOTH;
+    params.common_params.polling_mode = busy_polling(g_ceph_context->_conf.get_val<bool>("qat_compressor_busy_polling"));
+    rc = qzSetupSessionDeflate(session.get(), &params);
+    if (rc != QZ_OK)
+      return false;
+  }
+  else {
+    // later, there also has lz4.
     return false;
   }
   return true;
@@ -113,10 +111,9 @@ QatAccel::session_ptr QatAccel::get_session() {
 
   // If there are no available session to use, we try allocate a new
   // session.
-  QzSessionParams_T params = {(QzHuffmanHdr_T)0,};
   session_ptr session(new struct QzSession_S());
   memset(session.get(), 0, sizeof(struct QzSession_S));
-  if (get_qz_params(alg_name, params) && setup_session(session, params)) {
+  if (setup_session(alg_name, session)) {
     return session;
   } else {
     return nullptr;
@@ -147,16 +144,20 @@ bool QatAccel::init(const std::string &alg) {
   }
 
   alg_name = alg;
+  windowBits = GZIP_WRAPPER + MAX_WBITS;
+
   return true;
 }
 
 int QatAccel::compress(const bufferlist &in, bufferlist &out, std::optional<int32_t> &compressor_message) {
+  dout(20) << "QAT compress" << dendl;
   auto s = get_session(); // get a session from the pool
   if (!s) {
     return -1; // session initialization failed
   }
   auto session = cached_session_t{this, std::move(s)}; // returns to the session pool on destruction
-  compressor_message = ZLIB_DEFAULT_WIN_SIZE;
+  compressor_message = windowBits;
+
   int begin = 1;
   for (auto &i : in.buffers()) {
     const unsigned char* c_in = (unsigned char*) i.c_str();
@@ -165,7 +166,15 @@ int QatAccel::compress(const bufferlist &in, bufferlist &out, std::optional<int3
 
     bufferptr ptr = buffer::create_small_page_aligned(out_len);
     unsigned char* c_out = (unsigned char*)ptr.c_str() + begin;
-    int rc = qzCompress(session.get(), c_in, &len, c_out, &out_len, 1);
+    QzSession_T *sess = session.get();
+    int rc = qzCompress(sess, c_in, &len, c_out, &out_len, 1);
+    if(sess->hw_session_stat != QZ_OK) {
+      if(sess->hw_session_stat == QZ_NO_HW) {
+        dout(1) << "QAT compressor NOT OK - Using SW: No QAT HW detected" << dendl;
+      } else {
+        dout(1) << "QAT compressor NOT OK - session state=" << sess->hw_session_stat << dendl;
+      }
+    }
     if (rc != QZ_OK)
       return -1;
     if (begin) {
@@ -190,6 +199,7 @@ int QatAccel::decompress(bufferlist::const_iterator &p,
 		 size_t compressed_len,
 		 bufferlist &dst,
 		 std::optional<int32_t> compressor_message) {
+  dout(20) << "QAT decompress" << dendl;
   auto s = get_session(); // get a session from the pool
   if (!s) {
     return -1; // session initialization failed
@@ -199,28 +209,39 @@ int QatAccel::decompress(bufferlist::const_iterator &p,
 
   int rc = 0;
   bufferlist tmp;
-  size_t remaining = std::min<size_t>(p.get_remaining(), compressed_len);
+  unsigned int ratio_idx = 0;
+  const char* c_in = nullptr;
+  p.copy_all(tmp);
+  c_in = tmp.c_str();
+  unsigned int len = std::min<unsigned int>(tmp.length(), compressed_len);
 
-  while (remaining) {
-    unsigned int ratio_idx = 0;
-    const char* c_in = nullptr;
-    unsigned int len = p.get_ptr_and_advance(remaining, &c_in);
-    remaining -= len;
-    len -= begin;
-    c_in += begin;
-    begin = 0;
+  len -= begin;
+  c_in += begin;
+  begin = 0;
+
+  bufferptr ptr;
+  do {
     unsigned int out_len = QZ_HW_BUFF_SZ;
-
-    bufferptr ptr;
+    unsigned int len_current = len;
     do {
-      while (out_len <= len * expansion_ratio[ratio_idx]) {
+      while (out_len <= len_current * expansion_ratio[ratio_idx]) {
         out_len *= 2;
       }
 
       ptr = buffer::create_small_page_aligned(out_len);
-      rc = qzDecompress(session.get(), (const unsigned char*)c_in, &len, (unsigned char*)ptr.c_str(), &out_len);
+      QzSession_T *sess = session.get();
+      rc = qzDecompress(sess, (const unsigned char*)c_in, &len_current, (unsigned char*)ptr.c_str(), &out_len);
+      if(sess->hw_session_stat != QZ_OK) {
+        if(sess->hw_session_stat == QZ_NO_HW) {
+          dout(1) << "QAT decompress NOT OK - Using SW: No QAT HW detected" << dendl;
+        } else {
+          dout(1) << "QAT decompress NOT OK - session state=" << sess->hw_session_stat << dendl;
+        }
+      }
       ratio_idx++;
     } while (rc == QZ_BUF_ERROR && ratio_idx < std::size(expansion_ratio));
+    c_in += len_current;
+    len -= len_current;
 
     if (rc == QZ_OK) {
       dst.append(ptr, 0, out_len);
@@ -234,7 +255,7 @@ int QatAccel::decompress(bufferlist::const_iterator &p,
       dout(1) << "QAT compressor NOT OK" << dendl;
       return -1;
     }
-  }
 
+  } while (len != 0);
   return 0;
 }
